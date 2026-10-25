@@ -18,7 +18,7 @@ uv run stellarweaver doctor --offline
 
 20题与独立评分说明见 evals/README.md。`uv run python -m stellarweaver.evals run --provider fake`运行真实工具参考脚本，不能称模型能力测量。`score REPORT`会执行独立检查；`replay`完全不执行历史工具。修改评分规则需有复现与回归，保留已有原始结果和规则修订原因。
 
-CI文件配置Windows/Linux与Python3.12/3.13；本机通过不能冒充远端CI通过。故障夹具evals/fixtures与生成运行目录有意排除Ruff，避免格式化改变固定坏实现；src与tests仍全量检查。
+当前不配置 GitHub Actions，请手动运行上述检查；本机通过不能代替其他平台验证。故障夹具evals/fixtures与生成运行目录有意排除Ruff，避免格式化改变固定坏实现；src与tests仍全量检查。
 
 分发时运行 `uv build --offline` 并检查 sdist 与直接 wheel。显式清单保留源码、测试、文档、示例、评测夹具和 `.env.example`，排除真实环境文件、IDE/工具私有目录、数据库/私钥和本机验证结果。构建成功本身不能证明内容安全，`tests/integration/test_packaging.py` 使用合成敏感标记检查两种构建路径。
 

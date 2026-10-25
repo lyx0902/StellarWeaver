@@ -72,7 +72,7 @@ Windows的run_command先以CREATE_SUSPENDED创建主进程，再加入带KILL_ON
 
 新评测和收据记录原报告hash、实际catalog与评分源码hash、评分版本和来源包；旧报告保持不变。来源包只校验字节，不自动导入归档代码。详见[评测说明](../evals/README.md)。sdist/wheel显式排除IDE、密钥、数据库及本机验证结果，打包回归同时检查sdist构建链和直接wheel。
 
-Oracle在文件工具工作区外，不是恶意宿主代码的安全边界；更强评分隔离、DockerBackend、其他平台实测与重复/消融评测留作后续增强。CI配置已写但尚未推送触发，未宣称远端通过。
+Oracle在文件工具工作区外，不是恶意宿主代码的安全边界；更强评分隔离、DockerBackend、其他平台实测与重复/消融评测留作后续增强。当前已移除 GitHub Actions，检查由开发者手动运行；跨平台兼容性尚未通过完整验收。
 
 ## 已核验的参考与融入方式
 

@@ -53,7 +53,7 @@ uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --o
 
 - 没有重复20题多次采样，没有bash-only与结构化工具、关闭/开启repo-map或压缩的对比实验。
 - 鲁棒性故障注入单独由pytest报告，不混入20题成功率，当前报告recovery_rate保持null并指向故障测试。
-- 没有Linux/macOS实机结果；CI文件已建立但未提交、推送或触发GitHub运行。
+- 没有 Linux/macOS 实机验收结果；后续 GitHub Actions 曾运行但未全通过，现已按用户要求移除自动 workflow，改为手动检查。
 - 更强 oracle 隔离与 Docker 执行后端仍待实现。后续验收修复已加入 Windows Job Object，并通过父进程先退出、脱离控制台及重复取消的真实进程测试；范围限于受管的 CreateProcess 后代，外部 broker 代启不在范围内，也不是文件系统沙箱。此修复未重新运行真实模型评测。
 ## 验收修复后的来源补齐
 

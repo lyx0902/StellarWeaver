@@ -48,7 +48,7 @@ exclude = [
 [tool.hatch.build.targets.sdist]
 include = [
   "/src", "/tests", "/examples", "/evals", "/docs",
-  "/.github", "/README.md", "/CONTRIBUTING.md", "/pyproject.toml",
+  "/README.md", "/CONTRIBUTING.md", "/pyproject.toml",
   "/uv.lock", "/stellarweaver.example.toml", "/.env.example", "/.gitignore",
 ]
 exclude = [
