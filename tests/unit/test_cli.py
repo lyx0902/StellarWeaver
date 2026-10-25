@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -44,7 +45,8 @@ def test_help_and_version() -> None:
     assert "stellarweaver 0.1.0" in runner.invoke(app, ["--version"]).output
     assert runner.invoke(app, ["version"]).exit_code == 0
     assert "schema" in runner.invoke(app, ["version"]).output
-    assert "--policy-file" in runner.invoke(app, ["exec", "--help"]).output
+    exec_help = re.sub(r"\x1b\[[0-9;]*m", "", runner.invoke(app, ["exec", "--help"]).output)
+    assert "--policy-file" in exec_help
 
 
 def test_doctor_offline_redacts_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

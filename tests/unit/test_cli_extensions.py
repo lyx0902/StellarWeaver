@@ -1,6 +1,7 @@
 """Explicit extension inputs must reach the real CLI composition safely."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -131,5 +132,6 @@ def test_repeated_explicit_user_skill_dirs_are_discovered_and_one_body_loads_thr
 def test_extension_cli_options_are_available_on_all_execution_entries(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
     assert result.exit_code == 0, result.output
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
     for flag in ("--extensions", "--trust-workspace", "--skill-dir"):
-        assert flag in result.output
+        assert flag in output

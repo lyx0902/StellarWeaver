@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -439,4 +440,5 @@ def test_replay_reports_malformed_sessions_as_a_controlled_error(
 def test_m3_entrypoints_have_help(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
     assert result.exit_code == 0
-    assert "--data-dir" in result.output
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "--data-dir" in output
