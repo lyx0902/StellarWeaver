@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stellarweaver"
+version = "0.1.0"
+description = "An explicit, verifiable command-line coding agent"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.10,<3",
+  "typer>=0.16,<1",
+  "rich>=14,<15",
+  "prompt-toolkit>=3.0,<4",
+  "openai>=2,<3",
+  "platformdirs>=4,<5",
+  "pathspec>=0.12,<2",
+  "python-dotenv>=1,<2",
+  "mcp==1.26.0",
+  "jsonschema>=4.23,<5",
+]
+
+[project.scripts]
+stellarweaver = "stellarweaver.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<10",
+  "pytest-asyncio>=1,<2",
+  "ruff>=0.14,<1",
+  "mypy>=1.18,<2",
+  "httpx>=0.28,<1",
+  "types-jsonschema>=4.26.0.20261006",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stellarweaver"]
+exclude = [
+  "**/__pycache__", "**/*.pyc", "**/.env", "**/.env.*",
+  "**/*.sqlite", "**/*.sqlite3", "**/*.sqlite*", "**/*.db",
+  "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx",
+  "**/.idea", "**/.aws", "**/.codex", "**/.agents",
+]
+
+# An explicit source manifest avoids shipping local IDE state, credentials,
+# session databases and machine-specific evaluation output from this checkout.
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src", "/tests", "/examples", "/evals", "/docs",
+  "/.github", "/README.md", "/CONTRIBUTING.md", "/pyproject.toml",
+  "/uv.lock", "/stellarweaver.example.toml", "/.env.example", "/.gitignore",
+]
+exclude = [
+  "/.idea", "/.vscode", "/.vs", "/.agents", "/.codex", "/.aws",
+  "/.validation", "/.stellarweaver", "/docs/validation", "/evals/runs",
+  "**/__pycache__", "**/*.pyc", "**/.pytest_cache", "**/.mypy_cache",
+  "**/.ruff_cache", "**/.env", "**/.env.*", "!/.env.example",
+  "**/*.sqlite*", "**/*.db",
+  "**/session.sqlite3*", "**/*.pem", "**/*.key", "**/*.p12", "**/*.pfx",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live_model: explicitly requested real provider checks"]
+
+[tool.ruff]
+extend-exclude = ["CODING_AGENT_IMPLEMENTATION_SPEC.md", "docs/IMPLEMENTATION_SPEC.md", "evals/fixtures", ".validation", "evals/runs", "docs/validation"]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/stellarweaver"]

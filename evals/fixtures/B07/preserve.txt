@@ -1,0 +1,1 @@
+Existing user fixture content; preserve bytes.

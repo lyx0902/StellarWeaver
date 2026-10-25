@@ -1,0 +1,39 @@
+# Copy to stellarweaver.toml. Default CLI runs use the offline FakeModel.
+[model]
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+api_key_env = "STELLARWEAVER_API_KEY"
+# Explicit conservative working limit; this is not a claim about the model's maximum window.
+context_window_tokens = 100000
+max_output_tokens = 4096
+request_timeout_seconds = 90
+supports_streaming = true
+supports_tools = true
+
+[limits]
+max_model_calls = 30
+max_tool_calls = 100
+max_wall_seconds = 900
+max_input_tokens_total = 1000000
+max_output_tokens_total = 30000
+
+[execution]
+backend = "host"
+default_timeout_seconds = 60
+max_timeout_seconds = 300
+max_output_bytes_per_stream = 1048576
+
+[policy]
+preset = "ask"
+
+[context]
+trigger_ratio = 0.80
+target_ratio = 0.55
+reserve_tokens = 2048
+recent_complete_rounds = 6
+
+[retry]
+max_retries = 2
+base_delay_seconds = 0.5
+max_delay_seconds = 30.0

@@ -1,0 +1,59 @@
+# Python environments, caches and test output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Build and package output; keep pyproject.toml and uv.lock
+build/
+dist/
+*.egg-info/
+
+# Credentials and local configuration; keep the empty public template
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/stellarweaver.toml
+
+# Local IDE, assistant and OS state
+.idea/
+.vscode/
+.vs/
+/.agents/
+/.codex/
+/.aws/
+/.ssh/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# Agent sessions, databases, logs and generated evaluation workspaces
+.stellarweaver/
+*.sqlite*
+*.db
+*.db-*
+*.log
+/demo-workspace/
+/.validation/
+/evals/runs/
+
+# Raw validation output contains host paths and references local session data.
+# Keep a reviewed public summary; preserve raw evidence locally.
+/docs/validation/*
+!/docs/validation/README.md

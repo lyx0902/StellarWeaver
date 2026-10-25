@@ -1,0 +1,25 @@
+[
+  {
+    "tool_calls": [
+      {
+        "call_id": "files",
+        "name": "list_files",
+        "arguments_json": "{\"limit\":20}"
+      }
+    ],
+    "stop_reason": "tool_calls"
+  },
+  {
+    "tool_calls": [
+      {
+        "call_id": "readme",
+        "name": "read_file",
+        "arguments_json": "{\"path\":\"README.md\",\"end_line\":12}"
+      }
+    ],
+    "stop_reason": "tool_calls"
+  },
+  {
+    "text": "Offline scripted run completed list_files and read_file. No file was edited and no tests were run."
+  }
+]

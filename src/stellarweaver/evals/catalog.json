@@ -1,0 +1,788 @@
+[
+  {
+    "task_id": "B01",
+    "category": "bug",
+    "title": "Fix parse_size(value, default=20): accept integer strings 1..100; invalid, zero, negative or over 100 return default.",
+    "task_prompt": "Fix parse_size(value, default=20): accept integer strings 1..100; invalid, zero, negative or over 100 return default.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def parse_size(value, default=20):\n    try:\n        return min(int(value), 100)\n    except (ValueError, TypeError):\n        return default\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def parse_size(value, default=20):\n    try:\n        size = int(value)\n    except (ValueError, TypeError):\n        return default\n    return size if 1 <= size <= 100 else default\n"
+    },
+    "oracle": "from target import parse_size\nfor value, expected in [('1',1),('100',100),(' 42 ',42),('0',20),('-7',20),('101',20),('bad',20),('',20),(None,20)]:\n    assert parse_size(value)==expected, value\nassert parse_size('0',7)==7\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B02",
+    "category": "bug",
+    "title": "Fix binary_search(sorted_values, needle) to return an index or -1 for empty, first/last and absent values.",
+    "task_prompt": "Fix binary_search(sorted_values, needle) to return an index or -1 for empty, first/last and absent values.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def binary_search(values, needle):\n    low, high = 0, len(values) - 1\n    while low < high:\n        middle = (low + high) // 2\n        if values[middle] == needle:\n            return middle\n        if values[middle] < needle:\n            low = middle + 1\n        else:\n            high = middle - 1\n    return -1\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def binary_search(values, needle):\n    low, high = 0, len(values) - 1\n    while low <= high:\n        middle = (low + high) // 2\n        if values[middle] == needle:\n            return middle\n        if values[middle] < needle:\n            low = middle + 1\n        else:\n            high = middle - 1\n    return -1\n"
+    },
+    "oracle": "from target import binary_search\nfor values,needle,expected in [([],0,-1),([2],2,0),([1,3,5],1,0),([1,3,5],5,2),([1,3,5],3,1),([1,3,5],2,-1)]:\n    assert binary_search(values,needle)==expected\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B03",
+    "category": "bug",
+    "title": "Fix seconds(amount, unit) for s, m and h, including fractional amounts.",
+    "task_prompt": "Fix seconds(amount, unit) for s, m and h, including fractional amounts.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def seconds(amount, unit):\n    return amount * {'s': 1, 'm': 60, 'h': 60}[unit]\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def seconds(amount, unit):\n    return amount * {'s': 1, 'm': 60, 'h': 3600}[unit]\n"
+    },
+    "oracle": "from target import seconds\nfor amount,unit,expected in [(0,'s',0),(2,'s',2),(1.5,'m',90),(2,'h',7200),(0.5,'h',1800)]:\n    assert seconds(amount,unit)==expected\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B03",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B03",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B04",
+    "category": "bug",
+    "title": "Fix add_item(value, items=...) so omitted containers never share state; explicitly supplied lists still mutate.",
+    "task_prompt": "Fix add_item(value, items=...) so omitted containers never share state; explicitly supplied lists still mutate.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def add_item(value, items=[]):\n    items.append(value)\n    return items\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def add_item(value, items=None):\n    if items is None:\n        items = []\n    items.append(value)\n    return items\n"
+    },
+    "oracle": "from target import add_item\nassert add_item('a')==['a']\nassert add_item('b')==['b']\nitems=['x']; assert add_item('y',items) is items and items==['x','y']\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B04",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B04",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B05",
+    "category": "bug",
+    "title": "Fix read_text(path) for spaces and Chinese filenames, preserving UTF-8 text.",
+    "task_prompt": "Fix read_text(path) for spaces and Chinese filenames, preserving UTF-8 text.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "from pathlib import Path\ndef read_text(path):\n    return Path(str(path).split()[0]).read_text(encoding='utf-8')\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "from pathlib import Path\ndef read_text(path):\n    return Path(path).read_text(encoding='utf-8')\n"
+    },
+    "oracle": "from target import read_text\nfrom pathlib import Path\nimport tempfile\nwith tempfile.TemporaryDirectory(prefix='with space ') as directory:\n    path=Path(directory)/'中文 name.txt'; path.write_text('你好\\nvalue',encoding='utf-8')\n    assert read_text(str(path))=='你好\\nvalue'\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B05",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B05",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B06",
+    "category": "bug",
+    "title": "Fix run(action): return 0 on success; on an Exception report its text to stderr and return 1.",
+    "task_prompt": "Fix run(action): return 0 on success; on an Exception report its text to stderr and return 1.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def run(action):\n    try:\n        action()\n    except Exception:\n        return 0\n    return 0\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "import sys\ndef run(action):\n    try:\n        action()\n    except Exception as error:\n        print(str(error), file=sys.stderr)\n        return 1\n    return 0\n"
+    },
+    "oracle": "from target import run\nimport contextlib, io\nassert run(lambda:None)==0\ndef fail(): raise ValueError('expected failure')\nstream=io.StringIO()\nwith contextlib.redirect_stderr(stream): assert run(fail)==1\nassert 'expected failure' in stream.getvalue()\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B06",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B06",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B07",
+    "category": "bug",
+    "title": "Fix user_name(record): missing, null, empty, whitespace or non-string name returns guest; trim a valid string.",
+    "task_prompt": "Fix user_name(record): missing, null, empty, whitespace or non-string name returns guest; trim a valid string.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def user_name(record):\n    return record['name'].strip()\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def user_name(record):\n    value = record.get('name')\n    return value.strip() if isinstance(value, str) and value.strip() else 'guest'\n"
+    },
+    "oracle": "from target import user_name\nfor record,expected in [({},'guest'),({'name':None},'guest'),({'name':''},'guest'),({'name':'  '},'guest'),({'name':12},'guest'),({'name':' Alice '},'Alice')]:\n    assert user_name(record)==expected\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B07",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B07",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "B08",
+    "category": "bug",
+    "title": "Fix cached_text(path): changed UTF-8 file content must invalidate cached results even at unchanged byte length.",
+    "task_prompt": "Fix cached_text(path): changed UTF-8 file content must invalidate cached results even at unchanged byte length.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "from pathlib import Path\n_cache = {}\ndef cached_text(path):\n    key = str(path)\n    if key not in _cache:\n        _cache[key] = Path(path).read_text(encoding='utf-8')\n    return _cache[key]\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "from pathlib import Path\n_cache = {}\ndef cached_text(path):\n    content = Path(path).read_text(encoding='utf-8')\n    key = (str(path), content)\n    if key not in _cache:\n        _cache[key] = content\n    return _cache[key]\n"
+    },
+    "oracle": "from target import cached_text\nfrom pathlib import Path\nimport tempfile\nwith tempfile.TemporaryDirectory() as directory:\n    path=Path(directory)/'cache.txt'; path.write_text('first',encoding='utf-8')\n    assert cached_text(path)=='first'\n    path.write_text('other',encoding='utf-8'); assert cached_text(path)=='other'\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/B08",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B08",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "F01",
+    "category": "feature",
+    "title": "Add parse_int(value, default=None): valid integer conversion unchanged; invalid returns explicit default, otherwise raises ValueError.",
+    "task_prompt": "Add parse_int(value, default=None): valid integer conversion unchanged; invalid returns explicit default, otherwise raises ValueError.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def parse_int(value):\n    return int(value)\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def parse_int(value, default=None):\n    try:\n        return int(value)\n    except (TypeError, ValueError):\n        if default is None:\n            raise ValueError('invalid integer') from None\n        return default\n"
+    },
+    "oracle": "from target import parse_int\nassert parse_int('12')==12 and parse_int('bad',7)==7 and parse_int(None,0)==0\ntry: parse_int('bad')\nexcept ValueError: pass\nelse: raise AssertionError('must reject without default')\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/F01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "F02",
+    "category": "feature",
+    "title": "Add --limit to target.py CLI main(argv=None): default 10, integers 1..100; print 0..limit-1 separated by spaces, invalid exits 2.",
+    "task_prompt": "Add --limit to target.py CLI main(argv=None): default 10, integers 1..100; print 0..limit-1 separated by spaces, invalid exits 2.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "import argparse\ndef main(argv=None):\n    parser = argparse.ArgumentParser()\n    parser.parse_args(argv)\n    print(' '.join(map(str, range(10))))\nif __name__ == '__main__':\n    main()\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "import argparse\ndef main(argv=None):\n    parser = argparse.ArgumentParser()\n    parser.add_argument('--limit', type=int, default=10)\n    args = parser.parse_args(argv)\n    if not 1 <= args.limit <= 100:\n        parser.error('limit must be 1..100')\n    print(' '.join(map(str, range(args.limit))))\nif __name__ == '__main__':\n    main()\n"
+    },
+    "oracle": "import subprocess,sys\nfrom pathlib import Path\ncommand=[sys.executable,'-B',str(Path('target.py').resolve())]\nfor flags,code,text in [([],0,'0 1 2 3 4 5 6 7 8 9'),(['--limit','2'],0,'0 1'),(['--limit','0'],2,''),(['--limit','101'],2,''),(['--limit','bad'],2,'')]:\n    result=subprocess.run(command+flags,capture_output=True,text=True,timeout=10)\n    assert result.returncode==code\n    if code==0: assert result.stdout.strip()==text\nassert '--limit' in subprocess.run(command+['--help'],capture_output=True,text=True,timeout=10).stdout\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/F02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "F03",
+    "category": "feature",
+    "title": "Implement export_csv(rows,path) for dictionaries name/value: UTF-8, header name,value, correct commas, quotes and newline escaping.",
+    "task_prompt": "Implement export_csv(rows,path) for dictionaries name/value: UTF-8, header name,value, correct commas, quotes and newline escaping.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def export_csv(rows, path):\n    raise NotImplementedError('CSV export')\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "import csv\ndef export_csv(rows, path):\n    with open(path, 'w', encoding='utf-8', newline='') as stream:\n        writer = csv.DictWriter(stream, fieldnames=['name', 'value'])\n        writer.writeheader()\n        writer.writerows(rows)\n"
+    },
+    "oracle": "from target import export_csv\nimport csv,tempfile\nfrom pathlib import Path\nrows=[{'name':'中文, quoted \"x\"','value':'a\\nb'},{'name':'plain','value':'7'}]\nwith tempfile.TemporaryDirectory() as directory:\n    path=Path(directory)/'out.csv'; export_csv(rows,path)\n    with path.open(encoding='utf-8',newline='') as stream:\n        reader=csv.DictReader(stream); assert reader.fieldnames==['name','value']; assert list(reader)==rows\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/F03",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F03",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "F04",
+    "category": "feature",
+    "title": "Add ordered(items, sort=False): keep legacy input order, optional stable ascending sort by name; never mutate input.",
+    "task_prompt": "Add ordered(items, sort=False): keep legacy input order, optional stable ascending sort by name; never mutate input.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "files": {
+      "target.py": "def ordered(items):\n    return list(items)\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "target.py": "def ordered(items, sort=False):\n    return sorted(items, key=lambda item: item['name']) if sort else list(items)\n"
+    },
+    "oracle": "from target import ordered\nitems=[{'name':'b','id':0},{'name':'a','id':1},{'name':'a','id':2}]\nassert ordered(items)==items and ordered(items) is not items\nassert [item['id'] for item in ordered(items,sort=True)]==[1,2,0]\nassert [item['id'] for item in items]==[0,1,2]\n",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/F04",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F04",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "X01",
+    "category": "cross-file",
+    "title": "Pass options.limit through target.render to business.select_items: default 3, explicit positive limit respected. Update both layers.",
+    "task_prompt": "Pass options.limit through target.render to business.select_items: default 3, explicit positive limit respected. Update both layers.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: business.py, target.py.",
+    "files": {
+      "business.py": "def select_items(items):\n    return items[:3]\n",
+      "target.py": "from business import select_items\ndef render(items, options):\n    return ','.join(select_items(items))\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "business.py": "def select_items(items, limit=3):\n    return items[:limit]\n",
+      "target.py": "from business import select_items\ndef render(items, options):\n    return ','.join(select_items(items, options.get('limit', 3)))\n"
+    },
+    "oracle": "from business import select_items\nfrom target import render\nassert select_items(['a','b','c'],2)==['a','b']\nassert render(['a','b','c','d'],{})=='a,b,c'\nassert render(['a','b','c','d'],{'limit':1})=='a'\n",
+    "allowed_paths": [
+      "business.py",
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/X01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    }
+  },
+  {
+    "task_id": "X02",
+    "category": "cross-file",
+    "title": "Rename internal helper normalize to normalize_name in helpers.py and update every target import/call; preserve greeting behavior.",
+    "task_prompt": "Rename internal helper normalize to normalize_name in helpers.py and update every target import/call; preserve greeting behavior.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: helpers.py, target.py.",
+    "files": {
+      "helpers.py": "def normalize(value):\n    return value.strip().lower()\n",
+      "target.py": "from helpers import normalize\ndef greet(value):\n    return 'hello ' + normalize(value)\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "helpers.py": "def normalize_name(value):\n    return value.strip().lower()\n",
+      "target.py": "from helpers import normalize_name\ndef greet(value):\n    return 'hello ' + normalize_name(value)\n"
+    },
+    "oracle": "from helpers import normalize_name\nfrom target import greet\nassert normalize_name(' X ')=='x' and greet(' ALICE ')=='hello alice'\nimport helpers\nassert not hasattr(helpers,'normalize')\n",
+    "allowed_paths": [
+      "helpers.py",
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/X02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    }
+  },
+  {
+    "task_id": "X03",
+    "category": "cross-file",
+    "title": "Introduce business.InputError(ValueError); parse positive integers raises it for invalid data, target.display returns error: message instead of traceback.",
+    "task_prompt": "Introduce business.InputError(ValueError); parse positive integers raises it for invalid data, target.display returns error: message instead of traceback.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: business.py, target.py.",
+    "files": {
+      "business.py": "def parse(value):\n    return int(value)\n",
+      "target.py": "from business import parse\ndef display(value):\n    return str(parse(value))\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "business.py": "class InputError(ValueError):\n    pass\ndef parse(value):\n    try:\n        number = int(value)\n    except (TypeError, ValueError):\n        raise InputError('invalid positive integer') from None\n    if number < 1:\n        raise InputError('invalid positive integer')\n    return number\n",
+      "target.py": "from business import InputError, parse\ndef display(value):\n    try:\n        return str(parse(value))\n    except InputError as error:\n        return 'error: ' + str(error)\n"
+    },
+    "oracle": "from business import InputError,parse\nfrom target import display\nassert issubclass(InputError,ValueError) and display('3')=='3'\nfor value in ['bad','0','-1',None]:\n    try: parse(value)\n    except InputError: pass\n    else: raise AssertionError('expected InputError')\n    assert display(value).startswith('error: ')\n",
+    "allowed_paths": [
+      "business.py",
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/X03",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X03",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    }
+  },
+  {
+    "task_id": "X04",
+    "category": "cross-file",
+    "title": "Extend parsed/stored/rendered user record with optional active boolean default True; store.save preserves it, target.render_user emits name:active or name:inactive.",
+    "task_prompt": "Extend parsed/stored/rendered user record with optional active boolean default True; store.save preserves it, target.render_user emits name:active or name:inactive.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: storage.py, target.py.",
+    "files": {
+      "storage.py": "records = []\ndef save(record):\n    records.append({'name': record['name']})\n    return records[-1]\n",
+      "target.py": "from storage import save\ndef parse_user(data):\n    return {'name': data['name']}\ndef render_user(data):\n    record = save(parse_user(data))\n    return record['name']\n",
+      "test_visible.py": "import unittest\nclass Smoke(unittest.TestCase):\n    def test_import(self):\n        import target\n        self.assertIsNotNone(target)\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "storage.py": "records = []\ndef save(record):\n    records.append({'name': record['name'], 'active': record.get('active', True)})\n    return records[-1]\n",
+      "target.py": "from storage import save\ndef parse_user(data):\n    return {'name': data['name'], 'active': data.get('active', True)}\ndef render_user(data):\n    record = save(parse_user(data))\n    return record['name'] + (':active' if record['active'] else ':inactive')\n"
+    },
+    "oracle": "from storage import records,save\nfrom target import parse_user,render_user\nassert parse_user({'name':'a'})=={'name':'a','active':True}\nassert render_user({'name':'a','active':False})=='a:inactive' and records[-1]['active'] is False\nassert render_user({'name':'b'})=='b:active'\nassert save({'name':'c','active':False})['active'] is False\n",
+    "allowed_paths": [
+      "storage.py",
+      "target.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/X04",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X04",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    }
+  },
+  {
+    "task_id": "T01",
+    "category": "test",
+    "title": "Add test_boundary.py unittest regression covering validator valid_limit rejects zero; production target.py must remain unchanged.",
+    "task_prompt": "Add test_boundary.py unittest regression covering validator valid_limit rejects zero; production target.py must remain unchanged.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: test_boundary.py.",
+    "files": {
+      "target.py": "def valid_limit(value):\n    return isinstance(value, int) and 1 <= value <= 100\n",
+      "test_visible.py": "import unittest\nfrom target import valid_limit\nclass TestHappy(unittest.TestCase):\n    def test_positive(self): self.assertTrue(valid_limit(3))\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "test_boundary.py": "import unittest\nfrom target import valid_limit\nclass TestBoundary(unittest.TestCase):\n    def test_zero(self): self.assertFalse(valid_limit(0))\n    def test_upper(self): self.assertTrue(valid_limit(100))\n"
+    },
+    "oracle": "# Mutation oracle executed separately by harness.\n",
+    "allowed_paths": [
+      "test_boundary.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/T01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task T01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "T02",
+    "category": "test",
+    "title": "Add test_state.py unittest regression proving two add_item calls without an explicit list do not share state; production target.py unchanged.",
+    "task_prompt": "Add test_state.py unittest regression proving two add_item calls without an explicit list do not share state; production target.py unchanged.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: test_state.py.",
+    "files": {
+      "target.py": "def add_item(value, items=None):\n    if items is None:\n        items = []\n    items.append(value)\n    return items\n",
+      "test_visible.py": "import unittest\nfrom target import add_item\nclass TestHappy(unittest.TestCase):\n    def test_one(self): self.assertEqual(add_item(1),[1])\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {
+      "test_state.py": "import unittest\nfrom target import add_item\nclass TestState(unittest.TestCase):\n    def test_independent(self):\n        self.assertEqual(add_item(1),[1])\n        self.assertEqual(add_item(2),[2])\n"
+    },
+    "oracle": "# Mutation oracle executed separately by harness.\n",
+    "allowed_paths": [
+      "test_state.py"
+    ],
+    "facts": [],
+    "fixture_repo": "evals/fixtures/T02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task T02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    }
+  },
+  {
+    "task_id": "Q01",
+    "category": "understanding",
+    "title": "Explain configuration priority and cite verified source path and function: CLI overrides environment, environment overrides file, otherwise default. Do not edit.",
+    "task_prompt": "Explain configuration priority and cite verified source path and function: CLI overrides environment, environment overrides file, otherwise default. Do not edit.\nRead relevant source files with read_file and cite verified symbols, paths and facts. Do not edit or execute commands.",
+    "files": {
+      "config.py": "def resolve(cli, environment, file_value, default=20):\n    for candidate in (cli, environment, file_value, default):\n        if candidate is not None:\n            return candidate\n",
+      "target.py": "from config import resolve\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {},
+    "oracle": "",
+    "allowed_paths": [],
+    "facts": [
+      "config.py",
+      "resolve",
+      "CLI",
+      "environment",
+      "file",
+      "default"
+    ],
+    "fixture_repo": "evals/fixtures/Q01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task Q01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": false,
+      "require_multi_file": false,
+      "required_sources": [
+        "config.py"
+      ]
+    }
+  },
+  {
+    "task_id": "Q02",
+    "category": "understanding",
+    "title": "Explain how business.InputError travels through parse into target.main, where stderr receives the error and exit status 2 is returned. Cite verified source paths and symbols. Do not edit.",
+    "task_prompt": "Explain how business.InputError travels through parse into target.main, where stderr receives the error and exit status 2 is returned. Cite verified source paths and symbols. Do not edit.\nRead relevant source files with read_file and cite verified symbols, paths and facts. Do not edit or execute commands.",
+    "files": {
+      "business.py": "class InputError(ValueError): pass\ndef parse(value):\n    try: return int(value)\n    except ValueError: raise InputError('invalid integer') from None\n",
+      "target.py": "import sys\nfrom business import InputError, parse\ndef main(value):\n    try: return parse(value), 0\n    except InputError as error:\n        print(str(error), file=sys.stderr)\n        return None, 2\n",
+      "preserve.txt": "Existing user fixture content; preserve bytes.\n"
+    },
+    "reference": {},
+    "oracle": "",
+    "allowed_paths": [],
+    "facts": [
+      "business.py",
+      "InputError",
+      "parse",
+      "target.py",
+      "main",
+      "stderr",
+      "2"
+    ],
+    "fixture_repo": "evals/fixtures/Q02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task Q02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": false,
+      "require_multi_file": false,
+      "required_sources": [
+        "business.py",
+        "target.py"
+      ]
+    }
+  }
+]

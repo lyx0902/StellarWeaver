@@ -1,0 +1,673 @@
+[
+  {
+    "task_id": "B01",
+    "category": "bug",
+    "title": "Fix parse_size(value, default=20): accept integer strings 1..100; invalid, zero, negative or over 100 return default.",
+    "task_prompt": "Fix parse_size(value, default=20): accept integer strings 1..100; invalid, zero, negative or over 100 return default.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "9b24f38330d1dd848d2a45abb7d854aed0a1692fbc4d0afad9f517d7457c519b",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B02",
+    "category": "bug",
+    "title": "Fix binary_search(sorted_values, needle) to return an index or -1 for empty, first/last and absent values.",
+    "task_prompt": "Fix binary_search(sorted_values, needle) to return an index or -1 for empty, first/last and absent values.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "4cdf6b71e9d3c61ddaac932dabe8842ac2d93fe51b3f61c1e7f4702db4c9ad1d",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B03",
+    "category": "bug",
+    "title": "Fix seconds(amount, unit) for s, m and h, including fractional amounts.",
+    "task_prompt": "Fix seconds(amount, unit) for s, m and h, including fractional amounts.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B03",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B03",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "56f356040b83dd2bdbdcef184369308b150860772dd5efe2a43791ff30d05d7c",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B04",
+    "category": "bug",
+    "title": "Fix add_item(value, items=...) so omitted containers never share state; explicitly supplied lists still mutate.",
+    "task_prompt": "Fix add_item(value, items=...) so omitted containers never share state; explicitly supplied lists still mutate.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B04",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B04",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "275013fe79711174f59fe0418da73480ae30160ace9557b0e3c956c2aa1b9bd6",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B05",
+    "category": "bug",
+    "title": "Fix read_text(path) for spaces and Chinese filenames, preserving UTF-8 text.",
+    "task_prompt": "Fix read_text(path) for spaces and Chinese filenames, preserving UTF-8 text.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B05",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B05",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "0648fc26bb811336236edb29eaccbbc13be14cb03475fa6d6b64f172d9dc049b",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B06",
+    "category": "bug",
+    "title": "Fix run(action): return 0 on success; on an Exception report its text to stderr and return 1.",
+    "task_prompt": "Fix run(action): return 0 on success; on an Exception report its text to stderr and return 1.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B06",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B06",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "7ea614a746c980adf1557d31c04e4119819393efc013a74ff16ceaddb7a5164c",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B07",
+    "category": "bug",
+    "title": "Fix user_name(record): missing, null, empty, whitespace or non-string name returns guest; trim a valid string.",
+    "task_prompt": "Fix user_name(record): missing, null, empty, whitespace or non-string name returns guest; trim a valid string.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B07",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B07",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "b94b2bd353eee17173a2ee4de3eba2e72b5ee1ced752a9f3d637f2a024e525b4",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "B08",
+    "category": "bug",
+    "title": "Fix cached_text(path): changed UTF-8 file content must invalidate cached results even at unchanged byte length.",
+    "task_prompt": "Fix cached_text(path): changed UTF-8 file content must invalidate cached results even at unchanged byte length.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/B08",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task B08",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "7d724ea098b83b52bc4e488e40a7c0042d1930fdc3165b38e318a52ac77d16c9",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "F01",
+    "category": "feature",
+    "title": "Add parse_int(value, default=None): valid integer conversion unchanged; invalid returns explicit default, otherwise raises ValueError.",
+    "task_prompt": "Add parse_int(value, default=None): valid integer conversion unchanged; invalid returns explicit default, otherwise raises ValueError.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/F01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "a7ba16d1da3d7cdddcb7764bf49f8908373263fdc301b07a552ba6c1ba5d6da1",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "F02",
+    "category": "feature",
+    "title": "Add --limit to target.py CLI main(argv=None): default 10, integers 1..100; print 0..limit-1 separated by spaces, invalid exits 2.",
+    "task_prompt": "Add --limit to target.py CLI main(argv=None): default 10, integers 1..100; print 0..limit-1 separated by spaces, invalid exits 2.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/F02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "dc3f10e107ad1f2af018a81362c25bf5d1175df952096da691e69146271cd725",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "F03",
+    "category": "feature",
+    "title": "Implement export_csv(rows,path) for dictionaries name/value: UTF-8, header name,value, correct commas, quotes and newline escaping.",
+    "task_prompt": "Implement export_csv(rows,path) for dictionaries name/value: UTF-8, header name,value, correct commas, quotes and newline escaping.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/F03",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F03",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "1ad74f67b613b4be77496ea401b1f8e6ecf583a11381a4d850050bc8a23fbcd6",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "F04",
+    "category": "feature",
+    "title": "Add ordered(items, sort=False): keep legacy input order, optional stable ascending sort by name; never mutate input.",
+    "task_prompt": "Add ordered(items, sort=False): keep legacy input order, optional stable ascending sort by name; never mutate input.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: target.py.",
+    "allowed_paths": [
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/F04",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task F04",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "eba3ade09cdc1d5359a6046e158521139132852a78bd73a7fc0c1732a0acbad9",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "X01",
+    "category": "cross-file",
+    "title": "Pass options.limit through target.render to business.select_items: default 3, explicit positive limit respected. Update both layers.",
+    "task_prompt": "Pass options.limit through target.render to business.select_items: default 3, explicit positive limit respected. Update both layers.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: business.py, target.py.",
+    "allowed_paths": [
+      "business.py",
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/X01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    },
+    "baseline_sha256": {
+      "business.py": "b634e020386760b7515f6d9c59cfec6cc4938afd59e9ec8cd87791a7602f5240",
+      "target.py": "eb66952d3e6dd3a72977fab3c93cce65c6cddc801e709035328a1ecbf7714f10",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "X02",
+    "category": "cross-file",
+    "title": "Rename internal helper normalize to normalize_name in helpers.py and update every target import/call; preserve greeting behavior.",
+    "task_prompt": "Rename internal helper normalize to normalize_name in helpers.py and update every target import/call; preserve greeting behavior.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: helpers.py, target.py.",
+    "allowed_paths": [
+      "helpers.py",
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/X02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    },
+    "baseline_sha256": {
+      "helpers.py": "ba41e733aade08724d345ac841856c8a1154581d34bf2db17d88caa2a721a964",
+      "target.py": "f57871273d0dc3c21caa45f561f97874c34c72ce251a9888df9c4ecddb0a8695",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "X03",
+    "category": "cross-file",
+    "title": "Introduce business.InputError(ValueError); parse positive integers raises it for invalid data, target.display returns error: message instead of traceback.",
+    "task_prompt": "Introduce business.InputError(ValueError); parse positive integers raises it for invalid data, target.display returns error: message instead of traceback.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: business.py, target.py.",
+    "allowed_paths": [
+      "business.py",
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/X03",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X03",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    },
+    "baseline_sha256": {
+      "business.py": "49f261ebd46b0be82f48dbf47f5ef95617a53cf0b8cd7d8cca2648400561b508",
+      "target.py": "0d744faf3c5efc45fa219a9d66dbea236cd11308c45f84960c6505c2fb147d73",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "X04",
+    "category": "cross-file",
+    "title": "Extend parsed/stored/rendered user record with optional active boolean default True; store.save preserves it, target.render_user emits name:active or name:inactive.",
+    "task_prompt": "Extend parsed/stored/rendered user record with optional active boolean default True; store.save preserves it, target.render_user emits name:active or name:inactive.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: storage.py, target.py.",
+    "allowed_paths": [
+      "storage.py",
+      "target.py"
+    ],
+    "fixture_repo": "evals/fixtures/X04",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task X04",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": true
+    },
+    "baseline_sha256": {
+      "storage.py": "f071a7319bcf4b82f68565f545deabf9936c23bdf1115828bda9c7e1d9d2c204",
+      "target.py": "4aeda3f42c7e32e9fdbc8855539b6a7e5602ceeea942d92d764327991b6b0966",
+      "test_visible.py": "02aae1f04ccf7a467f8d5e7f7db63912edafbce8d7ea318d8685faea8251ef1f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "T01",
+    "category": "test",
+    "title": "Add test_boundary.py unittest regression covering validator valid_limit rejects zero; production target.py must remain unchanged.",
+    "task_prompt": "Add test_boundary.py unittest regression covering validator valid_limit rejects zero; production target.py must remain unchanged.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: test_boundary.py.",
+    "allowed_paths": [
+      "test_boundary.py"
+    ],
+    "fixture_repo": "evals/fixtures/T01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task T01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "2194a2940df9c28afffafc7b4049fdcccdfbedc0b5f62720c62db81d624dbb79",
+      "test_visible.py": "7e6cc0485817f1b856cfbe2a4b2334059fcbfdf08eb62e20dd8a79b68dbba360",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "T02",
+    "category": "test",
+    "title": "Add test_state.py unittest regression proving two add_item calls without an explicit list do not share state; production target.py unchanged.",
+    "task_prompt": "Add test_state.py unittest regression proving two add_item calls without an explicit list do not share state; production target.py unchanged.\nInspect the relevant sources. Preserve public behavior except the requested change, preserve unrelated files and visible tests, and run the exact unittest check. Only allowed files: test_state.py.",
+    "allowed_paths": [
+      "test_state.py"
+    ],
+    "fixture_repo": "evals/fixtures/T02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task T02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": true,
+      "require_multi_file": false
+    },
+    "baseline_sha256": {
+      "target.py": "6288554ce7b03a969675a207a5aad5889fe5a29c2c937f8a0a92d08c57fccc4b",
+      "test_visible.py": "5577cbc21ff7359858cb4c03d69b055f3014aebd585f10ef2bc7e460a19c381f",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "Q01",
+    "category": "understanding",
+    "title": "Explain configuration priority and cite verified source path and function: CLI overrides environment, environment overrides file, otherwise default. Do not edit.",
+    "task_prompt": "Explain configuration priority and cite verified source path and function: CLI overrides environment, environment overrides file, otherwise default. Do not edit.\nRead relevant source files with read_file and cite verified symbols, paths and facts. Do not edit or execute commands.",
+    "allowed_paths": [],
+    "fixture_repo": "evals/fixtures/Q01",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task Q01",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": false,
+      "require_multi_file": false,
+      "required_sources": [
+        "config.py"
+      ]
+    },
+    "baseline_sha256": {
+      "config.py": "9c89b988863f8ec7e128086393f976f4eb7192468619a901df4cacda6d7ea87e",
+      "target.py": "18f08b1844ca3822f031aa771d3d1eb789607d6b113109f97c197a794b399eed",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  },
+  {
+    "task_id": "Q02",
+    "category": "understanding",
+    "title": "Explain how business.InputError travels through parse into target.main, where stderr receives the error and exit status 2 is returned. Cite verified source paths and symbols. Do not edit.",
+    "task_prompt": "Explain how business.InputError travels through parse into target.main, where stderr receives the error and exit status 2 is returned. Cite verified source paths and symbols. Do not edit.\nRead relevant source files with read_file and cite verified symbols, paths and facts. Do not edit or execute commands.",
+    "allowed_paths": [],
+    "fixture_repo": "evals/fixtures/Q02",
+    "policy_file": "generated exact paths and unittest argv per run",
+    "model_config": {
+      "provider": "explicit at runner",
+      "context_window_tokens": 32768,
+      "max_output_tokens": 2048
+    },
+    "limits": {
+      "max_model_calls": 12,
+      "max_tool_calls": 40,
+      "max_wall_seconds": 180
+    },
+    "oracle_entrypoint": "python -m stellarweaver.evals score REPORT --task Q02",
+    "scoring_rules": {
+      "independent_behavior": true,
+      "preserve_outside_allowed_paths": true,
+      "require_change": false,
+      "require_multi_file": false,
+      "required_sources": [
+        "business.py",
+        "target.py"
+      ]
+    },
+    "baseline_sha256": {
+      "business.py": "f6e560a9ea2ca263c77a1fbaf7165cb29913bf81544ca078ece2b26a03784a71",
+      "target.py": "e0278a3b788e855db329c8bf800b18ac057b3f807e19e3526328ee9feaa03d27",
+      "preserve.txt": "ebec628aedd2ae51d240747f94e69b5784e8f8a4c8338543e26dc3e7455623c7"
+    }
+  }
+]
