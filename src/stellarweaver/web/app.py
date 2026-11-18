@@ -591,8 +591,7 @@ def create_app(
         if chat:
             if body.mode != "read-only":
                 raise HTTPException(422, "普通对话不使用项目工具。")
-            root = state_dir
-        if root is None or not root.is_dir() or root.resolve() != root:
+        elif root is None or not root.is_dir() or root.resolve() != root:
             raise HTTPException(404, "Workspace not available")
         prompt = body.prompt.strip()
         if not prompt:
@@ -643,6 +642,8 @@ def create_app(
             except db.QuotaReached as exc:
                 raise HTTPException(429, "Account quota reached") from exc
             if created and not queued:
+                # Local accounts, including ordinary chat, always use a queue worker.
+                assert root is not None
                 journal = PgJournal(
                     engine,
                     tenant,

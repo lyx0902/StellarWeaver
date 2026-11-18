@@ -45,7 +45,14 @@ def git_repo(root: Path, name: str) -> None:
         subprocess.run(["git", *command], cwd=path, check=True, capture_output=True)
 
 
-def start(client: TestClient, workspace: str, message: str, session: str | None = None):
+def start(
+    client: TestClient,
+    workspace: str,
+    message: str,
+    session: str | None = None,
+    *,
+    mode: str = "read-only",
+):
     return client.post(
         "/api/v1/runs",
         headers=HEADERS,
@@ -54,6 +61,7 @@ def start(client: TestClient, workspace: str, message: str, session: str | None 
             "request_id": str(uuid4()),
             "prompt": message,
             "session_id": session,
+            "mode": mode,
         },
     )
 
@@ -80,6 +88,7 @@ def test_password_accounts_workspace_selection_archives_and_chat(
         pytest.skip("requires a dedicated test database for first-account enrollment")
     engine = db.engine_for(dsn)
     root, state = tmp_path / "src", tmp_path / "state"
+    api_state = tmp_path / "api-state"
     root.mkdir()
     state.mkdir()
     load_instructions = InstructionLoader.for_paths
@@ -101,7 +110,8 @@ def test_password_accounts_workspace_selection_archives_and_chat(
             text("UPDATE sw.runs SET status='completed' WHERE id=:run"), {"run": legacy["run_id"]}
         )
     config = LocalConfig(root, "D:/Projects", LOCAL_TENANT, uuid4(), old_workspace, "legacy")
-    app = create_app(engine, {}, state, queued=True, isolated=True, local=config)
+    # Only the Worker receives the state volume in the deployed Compose stack.
+    app = create_app(engine, {}, api_state, queued=True, isolated=True, local=config)
     stop = Event()
     worker = Thread(
         target=run_team_worker,
@@ -174,6 +184,8 @@ def test_password_accounts_workspace_selection_archives_and_chat(
             assert [entry["label"] for entry in ws] == ["legacy", "second", "普通对话"]
             assert ws[1]["path"] == "D:/Projects/second" and ws[-1]["kind"] == "chat"
             assert start(other, ws[1]["id"], "blocked project").status_code == 404
+            assert start(other, ws[-1]["id"], "blocked chat").status_code == 404
+            assert start(owner, ws[-1]["id"], "no tools", mode="repair").status_code == 422
             project = start(owner, ws[1]["id"], "project fixture")
             chat = start(owner, ws[-1]["id"], "chat fixture")
             assert project.status_code == chat.status_code == 202, (project.text, chat.text)
@@ -198,7 +210,18 @@ def test_password_accounts_workspace_selection_archives_and_chat(
             )
             followup = start(owner, ws[-1]["id"], "follow-up", session_id)
             assert followup.status_code == 202, followup.text
-            completed(owner, followup.json()["run_id"])
+            assert followup.json()["session_id"] == session_id
+            followup_id = followup.json()["run_id"]
+            completed(owner, followup_id)
+            followup_events = owner.get(f"/api/v1/runs/{followup_id}/events").text
+            assert "离线普通对话" in followup_events
+            assert "tool.completed" not in followup_events
+            assert (state / "chat" / tenant / session_id).is_dir()
+            assert not api_state.exists()
+            (root / "second").rename(root / "moved-second")
+            missing = start(owner, ws[1]["id"], "missing project")
+            assert missing.status_code == 404
+            assert missing.json()["detail"] == "该项目目录不可访问。"
             assert owner.post("/api/v1/auth/logout", headers=HEADERS).status_code == 204
             assert owner.get("/api/v1/workspaces").status_code == 401
             assert (
