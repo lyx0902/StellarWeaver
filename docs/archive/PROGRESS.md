@@ -1,6 +1,78 @@
 # StellarWeaver 开发进度
 
-本页按阶段保留当时的实现与验收结果。原始报告、日志和来源包仅作本地归档，不随 GitHub 源码公开；可公开的范围与复现入口见[验证摘要](validation/README.md)。下方代码路径是归档说明，不是下载链接。
+> 历史记录。现行说明见[项目文档](../README.md)。
+
+## 2026-11-18 · 本机账号、多个工作区与普通对话
+
+现有 `8787` 工作台就地更新。注册与登录使用账号名和密码，PostgreSQL 保存加盐哈希，浏览器使用会话 Cookie。本机首位注册者继承已有 StellarWeaver 历史，后续账号各有工作区及会话。上线后核对旧令牌被拒绝，6 个线程与 7 次运行原样保留，首次注册交由本机用户完成。
+
+用户可以从 `D:/PycharmProjects` 选择 Git 项目来新建工作区，在侧栏折叠和切换工作区会话，归档或恢复会话。输入框显示当前项目路径。「新任务」默认进入普通对话，普通对话可在同一线程追问，不加载仓库指令、文件或命令工具。DeepSeek 配置及原数据卷继续沿用。
+
+25 项 Web/PostgreSQL 回归与 Edge 端到端流程通过。普通对话的上下文与 Agent 回归为 44 通过、2 跳过。Ruff、mypy 和生产前端构建通过。真实 `8787` 页面的登录和注册表单已核验。
+
+## 2026-11-18 · G5 团队工作台试点
+
+现有 `stellarweaver` Compose 项目已就地升级至 G5。继续使用 `8787`、原数据库和工作区数据卷、既有令牌和 DeepSeek 配置。5 个旧线程和 6 次旧运行均保留，已归属本机管理员。原令牌登录后可以打开「审计与用量」。在当前工作台验证了一次真实 DeepSeek 回复及实际 token 结算。PostgreSQL 继续使用本机 `55434`。升级前已保存数据库、工作区和配置备份。见 [本机重启命令](legacy/WEB_G5_TEAM.md#重启已升级的本机工作台)。
+
+现有执行服务的单文件验证发现归档校验后的文件描述符偏移问题，造成测试发现为空。修正后，实际 worker 经执行服务运行 1 项隔离测试，确认凭据隔离和容器清理。相关 pytest 复跑 4 通过、3 跳过。
+
+增加 OIDC 组织账号登录、成员角色和项目授权。项目权限覆盖线程、运行、审批、取消、SSE、报告与补丁导出。添加按人提交限流、活跃任务上限、DeepSeek 日用量预算，以及管理员可见的项目审计和用量面板。
+
+G5 Compose 把 Docker socket 收到专用执行服务，worker 在内部网络分派验证。任务仍从同一已提交基线创建私有 worktree。双账号浏览器验收中，两套验证容器同时运行，用户各自完成修复并导出补丁。测试中强制中断执行服务后，正在进行的验证保留未确认结果，重启清理遗留容器。
+
+在独立 Compose 项目里用测试账号和 FakeModel 验收浏览器工作流。签名 OIDC 夹具通过登录与注销检查。独立 PostgreSQL 通过 G4 → G5 升级和备份回灌，保留旧运行记录，跨租户访问仍被拒绝。现有单人工作台继续使用原数据。实际组织身份服务、生产 HTTPS 入口及工作区与数据库联合恢复待验证。见 [G5 团队部署说明](legacy/WEB_G5_TEAM.md)。
+
+全量 pytest 为 501 通过、4 跳过。G5 Edge 端到端验收 2 项通过。Ruff、mypy、uv 锁文件检查和 TypeScript/Vite 生产构建通过。
+
+## 2026-11-18 · 线程工作台与上下文用量
+
+侧栏按工作区组织线程。主视图按轮次展示历史、流式回复和待审批操作。最终回复出现后，已执行的工具过程自动折叠。底部输入框可直接在同一线程追问，并展示最近一次模型请求输入量及 100,000 tokens 窗口配置。右侧面板按改动、验证、日志切换，宽屏可调整面板宽度，窄屏使用抽屉。见 [G4 使用说明](legacy/WEB_G4_WORKFLOW.md#浏览器中的操作)。
+
+Edge 浏览器回归 3 项、PostgreSQL 与 Docker 的 Web 回归 21 项、Agent 与上下文回归 32 项通过。新版已经部署到现有工作台。真实 DeepSeek 只读任务确认完成工具调用、流式回复和输入用量展示。
+
+## 2026-11-18 · G4 任务隔离、Web 续接与补丁验证
+
+Compose 可启用 G4 隔离。新线程从登记仓库的已提交 HEAD 创建私有 Git worktree，原仓库只读挂载。同线程追问可复用 worktree 和此前完整对话，可见文本通过 PostgreSQL/SSE 流式显示。中断后保留未确认的操作，用户确认后用新提示继续。
+
+验证命令由部署配置定义，每条命令接收该任务的快照并在一次性 Linux 容器中运行。浏览器支持逐块审阅和导出 diff，也可以把选中补丁应用到同基线的新 worktree，执行项目配置的测试及构建检查。详见 [G4 使用说明](legacy/WEB_G4_WORKFLOW.md)。
+
+独立 PostgreSQL 17 和 Docker Desktop 验收覆盖同仓库双任务、凭据及工作区边界、超时清理、原线程追问、中断确认和选中改动块重验。Edge 使用独立 Compose 实例跑通审批、下载所选补丁、验证和追问。用演练数据库验证 G3 升级后保留旧会话和租户边界。受托 worker 仍串行领取任务。G4 验收使用 FakeModel。
+
+全量 pytest 为 499 通过、4 跳过。Ruff、mypy、TypeScript/Vite 构建和 diff 空白检查通过。Windows 双重取消测试使用完成写入后的就绪信号，消除了测试进程可能读到空 PID 的竞态。
+
+## 2026-11-16：G3 故障恢复与 Compose 交付
+
+完成前端生产构建和 API、worker 共用镜像。Compose 启动 PostgreSQL、一次性迁移和应用，默认通过本机回环端口提供页面及 API，工作区默认只读挂载。容器部署按宿主机挂载路径登记工作区，避免切换挂载目录时把旧任务交给新仓库。见 [Compose 启动与维护](legacy/WEB_G3_COMPOSE.md)。
+
+API 重启后可继续查看原审批。替代 worker 把未结束的已领取任务标为中断，并记录故障阶段、已有结果数量和未确认工具数量。数据库短时不可用时 API 返回 503，浏览器从上次事件游标重新订阅。
+
+使用独立 PostgreSQL 17、Edge 和临时 Git 仓库验收。实测审批前强制终止不会写入，已编辑且真实测试运行中强制终止会保留编辑并标记结果未确认。另跑通失败后修复、报告、数据库重启、容器停止与重建、制品归档恢复和 PostgreSQL 转储恢复。40 项相关回归通过，Ruff、mypy、锁文件及前端镜像构建已验证。
+
+## 2026-11-16：G3 第一批持久队列与单 worker
+
+新增 PostgreSQL `run_jobs` 迁移和独立 worker。可通过 `serve --queued` 启用提交与入队同事务的模式，API 重启保留排队任务。浏览器显示排队和领取状态，审批及取消经 PostgreSQL 跨进程传递。worker 检查领取归属；遗留的已领取任务标为中断，已有工具启动记录而缺少结果时保留待核对状态。启动步骤见 [G3 队列指南](legacy/WEB_G3_QUEUE_QUICKSTART.md)。
+
+使用独立 PostgreSQL 17、临时 Git 仓库和两个先后启动的 Uvicorn 进程验证 API 重启，独立 worker 只领取一次并完成真实文件枚举。35 项回归通过，覆盖排队取消、审批跨 API 重启、单 worker 互斥及模拟的领取后中断。Ruff、mypy、前端构建和 Python 分发包检查通过。
+
+## 2026-11-16：G2 本地修复闭环
+
+工作台增加逐项浏览器审批、取消、三栏运行详情和 JSON 交付报告。默认只读；启用修复的服务只接受本机已登记工作区，测试命令限制为根目录下的 `<服务端 Python> -B -m unittest -q`。PostgreSQL 持久化审批、取消和报告，批准只绑定当前运行中的单项操作；编辑落盘前仍复核 SHA-256 和适用指令。
+
+Edge 使用临时 Git 仓库跑通审批、刷新恢复、取消、真实测试从退出码 1 到 0 及下载报告。单独使用 `deepseek-flash` 发起一次真实修复任务，完成 `read_file → 审批 → edit_file`，核对了临时文件的实际字节；该任务未运行测试。证据覆盖运行结束时的有界工作区快照，后续编辑会使此前测试结果过期。升级与复现见 [G2 启动说明](legacy/WEB_G2_QUICKSTART.md)。
+
+独立 PostgreSQL 17 集成 8 项、测试证据检查 1 项、Edge 端到端 2 项通过，并验证 G1 升级后保留历史运行。Ruff、mypy、TypeScript/Vite、锁文件和包含 G2 迁移的 Python 分发包检查通过。
+
+全量回归首次使用仓库内的临时目录，结果为 478 通过、4 跳过、8 失败。两个非 Git 工作区用例命中了上级仓库，另有六个 CLI 计时用例失败。改用系统临时目录后，8 个失败用例全部通过。
+
+G3 从 PostgreSQL 持久化任务队列、独立 worker 与 Compose 发布开始。
+
+## 2026-11-16：本地 GUI 第一批（G0 / 最小 G1）
+
+CLI 的单次执行与 Web 共用 Agent 装配。Web 按登记工作区创建一条只读会话，使用 PostgreSQL 保存任务、消息、工具意图、结果与事件；浏览器用 REST 提交、SSE 查看时间线，刷新按游标回读。CLI 仍保留 SQLite，未迁移既有数据。Web 默认可使用现有 DeepSeek 配置，离线验收明确选择 FakeModel。
+
+实际验证使用 Docker 中的 PostgreSQL 17（本机缓存的 pgvector 镜像，未使用扩展）。真实数据库集成 1 项通过，覆盖不同租户、重复提交、事件游标和未完成运行的重启标记；Edge 端到端测试 1 项通过，覆盖真实 Git 文件枚举、刷新后同一会话和零额外提交。Agent、CLI、会话恢复与预算相关 66 项回归通过；TypeScript/Vite、Ruff、mypy、锁文件和分发包检查通过。未重跑全量测试或发出 DeepSeek 请求；远程多用户、浏览器审批、worker、应用镜像与任务沙箱不在本批范围。启动步骤见 [G1 指南](legacy/WEB_G1_QUICKSTART.md)。
+
+本页按阶段保留当时的实现与验收结果。原始报告、日志和来源包仅作本地归档，不随 GitHub 源码公开；可公开的范围与复现入口见[验证记录](../VALIDATION.md)。下方代码路径是归档说明，不是下载链接。
 
 ## 2026-10-25：移除GitHub自动检查
 
@@ -137,7 +209,7 @@
 uv run python -m stellarweaver.extensions.demo
 ```
 
-完整离线suite：`uv run python -m stellarweaver.evals run --provider fake`。真实API与独立重评分步骤和口径见[evals/README.md](../evals/README.md)、[实际结果](../evals/RESULTS.md)；恢复/撤销规则见[CHANGES.md](CHANGES.md)。
+完整离线suite：`uv run python -m stellarweaver.evals run --provider fake`。真实API与独立重评分步骤和口径见[evals/README.md](../../evals/README.md)、[实际结果](../../evals/RESULTS.md)；恢复/撤销规则见[CHANGES.md](legacy/CHANGES.md)。
 
 ### 后续与未验证
 
@@ -156,7 +228,7 @@ M0–M5本轮实施范围完成；下一步从V2或补充实测继续：Windows 
 - Ctrl+C取消当前模型/工具、等待清理、补齐已提交工具回合，再返回输入；第二次中断只要求清理后退出。Windows信号等待加入100ms定时唤醒，不重复取消清理。首轮尚未开始便取消也可正常提交下一轮。
 - doctor --check-model --provider deepseek显式发起一次无工具、最多64输出token的检查；与--offline互斥。exec/chat增加三态--stream/--no-stream：未传参数尊重能力配置，只有显式参数才覆盖；无能力时有明确非流式fallback。
 - JSONL持久事件使用连续seq；text.delta使用独立request_index/chunk_index，不占durable seq，ASCII转义兼容Windows GBK。流失败显示的草稿明确作废，不作为历史。
-- 参考mini-swe-agent的显式query/execute/observation与预算边界、Pi的事件与继续上下文边界，以及前轮kitagent的职责分离；固定commit与具体融入点见[架构](ARCHITECTURE.md)。独立实现，没有复制源码或加入额外框架。
+- 参考mini-swe-agent的显式query/execute/observation与预算边界、Pi的事件与继续上下文边界，以及前轮kitagent的职责分离；固定commit与具体融入点见[架构](legacy/ARCHITECTURE.md)。独立实现，没有复制源码或加入额外框架。
 
 ### 真实 DeepSeek 编码小任务
 
@@ -330,7 +402,7 @@ uv run stellarweaver exec --provider fake --script examples/offline_read.json --
 STELLARWEAVER_API_KEY=你的Key
 ```
 
-程序支持显式 `--provider deepseek --env-file .env`，默认离线 FakeModel 不使用密钥。没有真实服务验证，不宣称兼容测试等于模型连通或编码能力通过。详见 [Provider兼容性](PROVIDER_COMPATIBILITY.md)。
+程序支持显式 `--provider deepseek --env-file .env`，默认离线 FakeModel 不使用密钥。没有真实服务验证，不宣称兼容测试等于模型连通或编码能力通过。详见 [Provider兼容性](legacy/PROVIDER_COMPATIBILITY.md)。
 
 ### 未完成与未验证
 

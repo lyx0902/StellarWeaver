@@ -30,9 +30,14 @@ from stellarweaver.domain import (
     ToolResult,
     ToolStatus,
 )
-from stellarweaver.instructions import InstructionLoader, InstructionLoadError
+from stellarweaver.instructions import (
+    InstructionLoader,
+    InstructionLoadError,
+    InstructionProjection,
+)
 from stellarweaver.providers.base import ModelProvider, ProviderError
 from stellarweaver.runtime.budget import Preflight, empty_preflight, finish_cleanup
+from stellarweaver.session.journal import RunJournal
 from stellarweaver.session.store import SessionBusy, SessionStore
 from stellarweaver.tools.registry import ToolRegistry
 from stellarweaver.tools.workspace import ToolError
@@ -84,7 +89,7 @@ class Agent:
         provider: ModelProvider,
         registry: ToolRegistry,
         limits: LimitsConfig | None = None,
-        store: SessionStore | None = None,
+        store: RunJournal | None = None,
         on_event: EventSink | None = None,
         max_output_tokens: int = 4096,
         *,
@@ -95,16 +100,27 @@ class Agent:
         max_retry_delay_seconds: float = 30.0,
         context_config: ContextConfig | None = None,
         preflight: Preflight | None = None,
+        system_prompt: str | None = None,
+        project_context: bool = True,
     ) -> None:
         if not 0 <= max_retries <= 2:
             raise ValueError("max_retries must be between 0 and 2")
         if retry_base_seconds < 0 or max_retry_delay_seconds <= 0:
             raise ValueError("Invalid retry delay")
         self.provider = provider
+        self.system_prompt = system_prompt if system_prompt is not None else SYSTEM
+        self.project_context = project_context
         self.registry = registry
         self.limits = limits or LimitsConfig()
         self.store = store or SessionStore(registry.workspace.root)
         self._owns_store = store is None
+        if not isinstance(self.store, SessionStore) and registry.policy.preset != "read-only":
+            if (
+                registry.policy.preset != "ask"
+                or not registry.policy.interactive
+                or registry.policy.approval is None
+            ):
+                raise ValueError("Alternate journals require read-only or explicit approval")
         if self.store.workspace != registry.workspace.root:
             if self._owns_store:
                 self.store.close()
@@ -289,8 +305,8 @@ class Agent:
             state_path=str(self.store.path),
             usage_incomplete=self._usage_incomplete,
         )
-        self.store.finish(asdict(outcome))
-        await self._emit(
+        event = self.store.finish_run(
+            asdict(outcome),
             {
                 "completed": "run.completed",
                 "blocked": "run.blocked",
@@ -298,8 +314,8 @@ class Agent:
                 "budget_exceeded": "run.budget_exceeded",
                 "failed": "run.failed",
             }[status],
-            asdict(outcome),
         )
+        await self._publish(event)
         return outcome
 
     async def _drain_dispatch(self, task: asyncio.Task[ToolResult], call: ToolCall) -> ToolResult:
@@ -399,10 +415,11 @@ class Agent:
         data = usage or {}
         prompt = data.get("prompt_tokens", data.get("input_tokens"))
         completion = data.get("completion_tokens", data.get("output_tokens"))
-        estimated = False
+        input_estimated = False
         if not isinstance(prompt, int) or isinstance(prompt, bool) or prompt < 0:
             prompt = input_estimate
-            estimated = True
+            input_estimated = True
+        estimated = input_estimated
         if not isinstance(completion, int) or isinstance(completion, bool) or completion < 0:
             completion = output_estimate
             estimated = True
@@ -412,6 +429,7 @@ class Agent:
         self._usage_incomplete |= incomplete and estimated
         return {
             "input_tokens": prompt,
+            "input_estimated": input_estimated,
             "output_tokens": completion,
             "estimated": estimated,
             "usage_incomplete": incomplete and estimated,
@@ -458,6 +476,10 @@ class Agent:
                     "retry_index": retry_index,
                     "streaming": streaming,
                     "stream_fallback": self.stream and not streaming,
+                    "context_window_tokens": self.provider.capabilities().context_window_tokens,
+                    "input_tokens": input_estimate,
+                    "max_output_tokens": request.max_output_tokens,
+                    "input_estimated": True,
                 },
             )
             try:
@@ -642,9 +664,13 @@ class Agent:
         )
         if output < 1:
             raise BudgetExceeded("max_output_tokens_total")
-        instructions = self._instructions.for_paths(sorted(self._scope_paths))
+        instructions = (
+            self._instructions.for_paths(sorted(self._scope_paths))
+            if self.project_context
+            else InstructionProjection((), (), (), False)
+        )
         fingerprint = tuple((source.source_path, source.sha256) for source in instructions.sources)
-        if fingerprint != self._instruction_logged:
+        if self.project_context and fingerprint != self._instruction_logged:
             await self._emit(
                 "instructions.loaded",
                 {
@@ -663,11 +689,15 @@ class Agent:
             self._instruction_logged = fingerprint
         history = self.projected_history()
         goal = next((item.content for item in reversed(history) if item.role == "user"), "")
-        repo = self._repo_map.build(
-            explicit_paths=sorted(self._scope_paths),
-            visited_paths=sorted(self._scope_paths),
-            keywords=goal.split()[:24],
-            max_tokens=min(2048, window // 10),
+        repo = (
+            self._repo_map.build(
+                explicit_paths=sorted(self._scope_paths),
+                visited_paths=sorted(self._scope_paths),
+                keywords=goal.split()[:24],
+                max_tokens=min(2048, window // 10),
+            )
+            if self.project_context
+            else None
         )
         derived = list(instructions.messages)
         extension_context = getattr(self.registry, "extension_context", None)
@@ -688,7 +718,7 @@ class Agent:
 
         def combined(include_map: bool) -> tuple[Message, ...]:
             extra = [*derived]
-            if include_map and repo.message is not None:
+            if include_map and repo is not None and repo.message is not None:
                 extra.append(repo.message)
             return (*history[:insertion], *extra, *history[insertion:])
 
@@ -746,7 +776,7 @@ class Agent:
         """Current model conversation boundary; raw session messages remain complete."""
         if not self._context_boundary:
             return tuple(self.messages)
-        return (Message("system", SYSTEM), *self.messages[self._context_boundary :])
+        return (Message("system", self.system_prompt), *self.messages[self._context_boundary :])
 
     async def compact(self) -> JSONDict:
         """Build and checkpoint a projection without a model or tool request."""
@@ -779,6 +809,8 @@ class Agent:
 
     async def load_skill(self, name: str) -> ToolResult:
         """Execute an explicit user's skill request through the ordinary dispatcher."""
+        if not isinstance(self.store, SessionStore):
+            raise ValueError("Explicit skills require a local session store")
         if self._running:
             raise ValueError("Cannot load a skill during an active task")
         if not name.strip():
@@ -796,7 +828,7 @@ class Agent:
         try:
             self.store.begin_run()
             if not self.messages:
-                message = Message("system", SYSTEM)
+                message = Message("system", self.system_prompt)
                 self.messages.append(message)
                 self.store.append_message(message)
             user = Message("user", "/skill " + name)
@@ -826,9 +858,12 @@ class Agent:
             self.registry.after_authorize = self._previous_after_authorize
             self._running = False
 
-    async def run(self, task: str) -> RunOutcome:
+    async def run(self, task: str, *, history: tuple[Message, ...] = ()) -> RunOutcome:
         if self.messages:
             raise ValueError("Use continue_run for a subsequent task in this session")
+        if history:
+            self.messages = [Message("system", self.system_prompt), *history]
+            self.store.append_message(self.messages[0])
         return await self._run_task(task, continuing=False)
 
     async def continue_run(self, task: str) -> RunOutcome:
@@ -843,8 +878,8 @@ class Agent:
             )
         return await self._run_task(task, continuing=True, recovering=True)
 
-    def _restore_history(self) -> None:
-        self.messages = list(self.store.load_messages())
+    def _restore_history(self, store: SessionStore) -> None:
+        self.messages = list(store.load_messages())
         for event in self.store.load_events():
             if event.type == "context.cleared":
                 boundary = event.payload.get("through_message_position", 0)
@@ -860,7 +895,7 @@ class Agent:
 
     def _save_task(self, task: str | None) -> None:
         if not self.messages:
-            self.messages = [Message("system", SYSTEM)]
+            self.messages = [Message("system", self.system_prompt)]
             self.store.append_message(self.messages[0])
         if task is not None:
             user = Message("user", task)
@@ -897,6 +932,9 @@ class Agent:
             raise ValueError("A session can execute only one task at a time")
         if task is not None and not task.strip():
             raise ValueError("Task must not be empty")
+        local_store = self.store if isinstance(self.store, SessionStore) else None
+        if (continuing or recovering) and local_store is None:
+            raise ValueError("Continuing requires a local session store")
         self._running = True
         self._reset_run()
         self._recovery_report = None
@@ -916,8 +954,8 @@ class Agent:
         try:
             try:
                 async with deadline:
-                    if continuing:
-                        self.store.begin_run()
+                    if continuing and local_store is not None:
+                        local_store.begin_run()
                     if not recovering:
                         self._save_task(task)
                     # Preserve the requested task even if reconciliation itself is interrupted.
@@ -931,10 +969,10 @@ class Agent:
                             "recovering": recovering,
                         },
                     )
-                    if recovering:
+                    if recovering and local_store is not None:
                         seen = {event.seq for event in self.store.load_events()}
-                        self._recovery_report = self.store.reconcile()
-                        self._restore_history()
+                        self._recovery_report = local_store.reconcile()
+                        self._restore_history(local_store)
                         self._save_task(task)
                         self._remaining()
                         for event in self.store.load_events():
@@ -950,12 +988,13 @@ class Agent:
                     else:
                         from stellarweaver.changes import ChangesManager
 
-                        await ChangesManager(
-                            self.registry.workspace.root,
-                            self.store,
-                            self.registry.policy,
-                            on_event=self._publish,
-                        ).capture_baseline()
+                        if local_store is not None:
+                            await ChangesManager(
+                                self.registry.workspace.root,
+                                local_store,
+                                self.registry.policy,
+                                on_event=self._publish,
+                            ).capture_baseline()
                         self._remaining()
                         environment = self.preflight()
                         await environment.__aenter__()

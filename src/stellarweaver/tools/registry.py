@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 from stellarweaver.domain import JSONDict, Message, ToolCall, ToolResult, ToolStatus
 from stellarweaver.policy import READ_TOOLS, PolicyEngine
 from stellarweaver.session.locking import SessionBusy, workspace_write_lock
+from stellarweaver.tools.commands import CommandRunner
 from stellarweaver.tools.workspace import ToolError, Workspace
 
 
@@ -29,6 +30,7 @@ class ToolContext:
     artifacts_dir: Path
     execution: Any = None
     operation_id: str = ""
+    command_runner: CommandRunner | None = None
 
 
 @dataclass(frozen=True)
@@ -61,11 +63,14 @@ class ToolRegistry:
         execution: Any = None,
         journal: Journal | None = None,
         artifacts_dir: Path | None = None,
+        command_runner: CommandRunner | None = None,
+        builtins: bool = True,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.policy = policy
         self.execution = execution
         self.journal = journal
+        self.command_runner = command_runner
         self.artifacts_dir = artifacts_dir or self.workspace.root / ".stellarweaver" / "artifacts"
         self._tools: dict[str, RegisteredTool] = {}
         self.extension_context: Message | None = None
@@ -74,8 +79,9 @@ class ToolRegistry:
         self.after_authorize: Callable[[ToolCall, JSONDict], Awaitable[None]] | None = None
         from stellarweaver.tools import commands, files, git, search
 
-        for module in (files, search, commands, git):
-            module.register_tools(self)
+        if builtins:
+            for module in (files, search, commands, git):
+                module.register_tools(self)
 
     def register(
         self,
@@ -186,7 +192,13 @@ class ToolRegistry:
             mutating = not tool.read_only
             if mutating:
                 write_scope.enter_context(workspace_write_lock(self.workspace.root))
-            context = ToolContext(self.workspace, self.artifacts_dir, self.execution, operation_id)
+            context = ToolContext(
+                self.workspace,
+                self.artifacts_dir,
+                self.execution,
+                operation_id,
+                self.command_runner,
+            )
             prepared = await tool.prepare(args, context)
             invocation = {
                 **prepared.invocation,

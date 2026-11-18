@@ -1,5 +1,7 @@
 # StellarWeaver：命令行 Coding Agent 实现规范
 
+> 本文保留初始项目模板。当前实现、使用方法与文档索引见 [StellarWeaver 项目文档](docs/README.md)。已落盘的历史规范见 [CLI 实现规范归档](docs/archive/IMPLEMENTATION_SPEC.md)。
+
 版本：1.1  
 调研与方案日期：2026-10-25  
 用途：交给 Codex 实施，也作为开发者逐阶段学习、验收和讲解的依据。  

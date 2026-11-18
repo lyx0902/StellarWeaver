@@ -24,6 +24,16 @@ dependencies = [
 [project.scripts]
 stellarweaver = "stellarweaver.cli:app"
 
+[project.optional-dependencies]
+web = [
+  "fastapi>=0.135,<1",
+  "uvicorn>=0.35,<1",
+  "sqlalchemy>=2.0,<2.1",
+  "psycopg[binary]>=3.2,<4",
+  "alembic>=1.16,<2",
+  "PyJWT[crypto]>=2.10,<3",
+]
+
 [dependency-groups]
 dev = [
   "pytest>=8,<10",
@@ -48,12 +58,14 @@ exclude = [
 [tool.hatch.build.targets.sdist]
 include = [
   "/src", "/tests", "/examples", "/evals", "/docs",
+  "/frontend", "/deploy",
   "/README.md", "/CONTRIBUTING.md", "/pyproject.toml",
-  "/uv.lock", "/stellarweaver.example.toml", "/.env.example", "/.gitignore",
+  "/uv.lock", "/stellarweaver.example.toml", "/.env.example", "/.gitignore", "/.dockerignore",
 ]
 exclude = [
   "/.idea", "/.vscode", "/.vs", "/.agents", "/.codex", "/.aws",
   "/.validation", "/.stellarweaver", "/docs/validation", "/evals/runs",
+  "/frontend/node_modules", "/frontend/dist", "/frontend/test-results", "/frontend/playwright-report",
   "**/__pycache__", "**/*.pyc", "**/.pytest_cache", "**/.mypy_cache",
   "**/.ruff_cache", "**/.env", "**/.env.*", "!/.env.example",
   "**/*.sqlite*", "**/*.db",
@@ -63,10 +75,10 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-markers = ["live_model: explicitly requested real provider checks"]
+markers = ["live_model: explicitly requested real provider checks", "postgres: requires a migrated PostgreSQL test database"]
 
 [tool.ruff]
-extend-exclude = ["CODING_AGENT_IMPLEMENTATION_SPEC.md", "docs/IMPLEMENTATION_SPEC.md", "evals/fixtures", ".validation", "evals/runs", "docs/validation"]
+extend-exclude = ["CODING_AGENT_IMPLEMENTATION_SPEC.md", "docs/archive", "evals/fixtures", ".validation", "evals/runs", "docs/validation"]
 target-version = "py312"
 line-length = 100
 

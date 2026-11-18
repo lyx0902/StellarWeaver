@@ -30,6 +30,7 @@ from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
 from stellarweaver.runtime.budget import finish_cleanup
 from stellarweaver.runtime.loop import Agent
+from stellarweaver.runtime.service import build_agent
 from stellarweaver.session.store import SCHEMA_VERSION, SessionBusy, SessionStore
 from stellarweaver.session.views import render_jsonl, render_markdown
 from stellarweaver.tools.registry import ToolRegistry
@@ -157,7 +158,7 @@ async def chat_setup(
         failure_reason = ": " + str(exc)
     except asyncio.CancelledError:
         status = "cancelled"
-    if status is None and (deadline.expired() or time.monotonic() - started >= max_wall_seconds):
+    if deadline.expired() or (status is None and time.monotonic() - started >= max_wall_seconds):
         status = "budget_exceeded"
     if status is not None:
         cleanup_reason = ""
@@ -244,35 +245,21 @@ async def execute_task(
     try:
         with SessionStore(workspace, data_dir=data_dir) as store:
             store.set_config(config.model_dump())
-            engine = PolicyEngine(
-                policy or config.policy.preset,
-                workspace=workspace,
+            agent = build_agent(
+                config,
+                model,
+                store,
+                on_event=ui.event,
+                on_delta=ui.delta,
                 interactive=interactive and sys.stdin.isatty() and sys.stdout.isatty(),
                 approval=ui.approve,
                 policy_file=policy_file,
-            )
-            registry = ToolRegistry(
-                workspace,
-                engine,
-                execution=config.execution,
-                artifacts_dir=store.artifacts_dir,
-            )
-            agent = Agent(
-                model,
-                registry,
-                limits=config.limits,
-                context_config=config.context,
-                preflight=lambda: task_extensions(
-                    registry, store, ui, extensions, trust_workspace, skill_dirs
-                ),
-                store=store,
-                on_event=ui.event,
-                on_delta=ui.delta,
                 stream=stream is not False,
-                max_retries=config.retry.max_retries,
-                retry_base_seconds=config.retry.base_delay_seconds,
-                max_retry_delay_seconds=config.retry.max_delay_seconds,
-                max_output_tokens=config.model.max_output_tokens,
+                preflight=lambda registry: (
+                    lambda: task_extensions(
+                        registry, store, ui, extensions, trust_workspace, skill_dirs
+                    )
+                ),
             )
             outcome = await agent.run(task)
             ui.outcome(outcome)

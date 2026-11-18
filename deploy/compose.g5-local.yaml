@@ -1,0 +1,28 @@
+# Local registration and projects. Only loopback ports are published.
+x-projects: &projects
+  type: bind
+  source: ${SW_WORKBENCH_PROJECTS_ROOT:?set SW_WORKBENCH_PROJECTS_ROOT}
+  target: /projects
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-local: &local
+  SW_WEB_LOCAL_OWNER_ID: ${SW_G5_LOCAL_OWNER_ID:?set SW_G5_LOCAL_OWNER_ID}
+  SW_WEB_PROJECTS_ROOT: /projects
+  SW_WEB_PROJECTS_HOST_ROOT: ${SW_WORKBENCH_PROJECTS_ROOT:?set SW_WORKBENCH_PROJECTS_ROOT}
+
+services:
+  db:
+    ports: !override
+      - "127.0.0.1:${SW_PG_PORT:-55434}:5432"
+  api:
+    environment:
+      <<: *local
+      STELLARWEAVER_WEB_TOKEN: ""
+    volumes:
+      - *projects
+  worker:
+    environment: *local
+    volumes:
+      - *projects

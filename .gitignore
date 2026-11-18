@@ -16,6 +16,9 @@ coverage.xml
 # Build and package output; keep pyproject.toml and uv.lock
 build/
 dist/
+node_modules/
+/frontend/test-results/
+/frontend/playwright-report/
 *.egg-info/
 
 # Credentials and local configuration; keep the empty public template

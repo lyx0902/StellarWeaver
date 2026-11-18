@@ -78,7 +78,7 @@ uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --t
 
 ## 报告与重评分
 
-`report.json` 保存请求的任务 ID、实际已记录 case、模型和平台信息、catalog 校验值、每题工作区绝对路径、基线 hash、工具结果、`RunOutcome` 和独立评分。每题 `outcome.state_path` 指向实际 SQLite 会话；备份和大输出制品在对应会话目录。工作区、会话和制品必须保留，才能继续检查或重评分。 GitHub 仅提供[公开验证摘要](../docs/validation/README.md)和[历史结果说明](RESULTS.md)；本地原始报告、日志与来源包不随源码上传。公开摘要不能直接传给 `score`，也不能替代相应运行工作区。
+`report.json` 保存请求的任务 ID、实际已记录 case、模型和平台信息、catalog 校验值、每题工作区绝对路径、基线 hash、工具结果、`RunOutcome` 和独立评分。每题 `outcome.state_path` 指向实际 SQLite 会话，备份和大输出制品在对应会话目录。`score` 读取原始报告并访问相应工作区和会话。公开资料提供[验证与实验计划](../docs/VALIDATION.md)、[历史结果](RESULTS.md)和评分规则，本地留存原始报告、日志和来源包。
 
 将实际报告路径替换到以下命令：
 

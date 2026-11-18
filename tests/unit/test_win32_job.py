@@ -42,7 +42,8 @@ def alive(pid: int) -> bool:
 def parent_script(root: Path, *, exit_parent: bool) -> list[str]:
     child = (
         "import os,time; from pathlib import Path; "
-        "Path('child.ready').write_text(str(os.getpid())); time.sleep(60)"
+        "Path('child.pid.tmp').write_text(str(os.getpid())); "
+        "Path('child.pid.tmp').replace('child.ready'); time.sleep(60)"
     )
     script = root / "detaching_parent.py"
     script.write_text(
@@ -55,6 +56,7 @@ def parent_script(root: Path, *, exit_parent: bool) -> list[str]:
         "deadline=time.monotonic()+5\n"
         "while not Path('child.ready').exists() and time.monotonic()<deadline: time.sleep(.01)\n"
         "assert Path('child.ready').exists(), 'child did not start'\n"
+        "Path('tree.ready').touch()\n"
         "print('detached child is running',flush=True)\n"
         + ("sys.exit(0)\n" if exit_parent else "time.sleep(60)\n"),
         encoding="utf-8",
@@ -114,10 +116,10 @@ async def test_double_cancel_cleans_detached_descendants_before_return(
         execute_command(parent_script(tmp_path, exit_parent=False), tmp_path)
     )
     for _ in range(500):
-        if (tmp_path / "child.ready").exists():
+        if (tmp_path / "tree.ready").exists():
             break
         await asyncio.sleep(0.01)
-    assert (tmp_path / "child.ready").exists()
+    assert (tmp_path / "tree.ready").exists()
     assert task.cancel()
     await asyncio.wait_for(cleanup_started.wait(), 5)
     assert task.cancel()  # The second cancellation occurs while teardown is in flight.

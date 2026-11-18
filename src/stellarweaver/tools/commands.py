@@ -15,7 +15,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -42,6 +42,18 @@ class RunCommandArgs(BaseModel):
         if sum(len(item) for item in value) > 131_072:
             raise ValueError("argv exceeds the 128 KiB argument limit")
         return value
+
+
+class CommandRunner(Protocol):
+    async def __call__(
+        self,
+        argv: list[str],
+        cwd: Path,
+        *,
+        config: Any = None,
+        artifacts_dir: Path | None = None,
+        timeout_seconds: float | None = None,
+    ) -> JSONDict: ...
 
 
 def controlled_environment(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -246,6 +258,7 @@ async def execute_command(
     artifacts_dir: Path | None = None,
     timeout_seconds: float | None = None,
     environment_overrides: Mapping[str, str] | None = None,
+    stdin_file: BinaryIO | None = None,
 ) -> JSONDict:
     """Execute an already-authorized argv and return a complete tool payload."""
     timeout = timeout_seconds or float(getattr(config, "default_timeout_seconds", 60))
@@ -308,7 +321,7 @@ async def execute_command(
                 *argv,
                 cwd=cwd,
                 env=controlled_environment(environment_overrides),
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=stdin_file if stdin_file is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 **options,
@@ -444,7 +457,8 @@ async def prepare_run_command(args: RunCommandArgs, context: ToolContext) -> Pre
             raise ToolError("PATH_CHANGED", "Command cwd changed after authorization.")
 
     async def execute() -> JSONDict:
-        return await execute_command(
+        runner = context.command_runner or execute_command
+        return await runner(
             args.argv,
             cwd,
             config=context.execution,

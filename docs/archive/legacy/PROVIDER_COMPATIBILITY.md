@@ -1,6 +1,8 @@
 # Provider compatibility (M2)
 
-Historical raw reports and logs remain local archives. See the [public validation summary](validation/README.md) for their scope and reproducible entry points.
+> 历史记录。现行说明见[项目文档](../../README.md)。
+
+Historical raw reports and logs remain local archives. See the [validation record](../../VALIDATION.md) for their scope and reproducible entry points.
 
 The default provider is the offline, scriptable `FakeModel`. No API key is needed for
 development or the repair demonstration. `doctor --offline` only inspects local
@@ -156,4 +158,4 @@ this successful run; their relevant protocol branches have offline tests.
 
 ## M5 真实任务补充（2026-10-25）
 
-DeepSeek deepseek-flash已显式完成固定20任务一次，SSE 93次请求，工具117次，输入319974/输出16757 token均由服务端usage报告。20次Agent运行completed；初评19/20、修正Q01无关读取要求后零模型重评分20/20。完整范围/分母/单次限制及原始报告见[评测结果](../evals/RESULTS.md)。未测试其他模型、原生Responses或HTTP/OAuth MCP。
+DeepSeek deepseek-flash已显式完成固定20任务一次，SSE 93次请求，工具117次，输入319974/输出16757 token均由服务端usage报告。20次Agent运行completed；初评19/20、修正Q01无关读取要求后零模型重评分20/20。完整范围/分母/单次限制及原始报告见[评测结果](../../../evals/RESULTS.md)。未测试其他模型、原生Responses或HTTP/OAuth MCP。

@@ -1,0 +1,83 @@
+# Overlay for compose.yaml. Only the loopback web port is published.
+name: stellarweaver
+
+x-workbench: &workbench
+  image: ${SW_WORKBENCH_IMAGE:-stellarweaver-workbench:local}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    target: workbench
+
+x-runtime: &runtime
+  SW_WEB_DB_HOST: db
+  SW_WEB_DB_PASSWORD: ${SW_PG_APP_PASSWORD:?set SW_PG_APP_PASSWORD}
+  SW_WEB_ENABLE_REPAIR: ${SW_WORKBENCH_REPAIR:-0}
+  SW_WEB_WORKSPACE_IDENTITY: ${SW_WORKBENCH_WORKSPACE:?set SW_WORKBENCH_WORKSPACE}
+
+services:
+  db:
+    restart: unless-stopped
+  migrate:
+    <<: *workbench
+    command: ["migrate"]
+    environment:
+      SW_WEB_DB_HOST: db
+      SW_WEB_DB_PASSWORD: ${SW_PG_ADMIN_PASSWORD:?set SW_PG_ADMIN_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *workbench
+    command: ["serve", "--queued", "--host", "0.0.0.0", "--workspace", "/workspaces/project", "--state-dir", "/state", "--provider", "${SW_WORKBENCH_PROVIDER:-fake}", "--static-dir", "/app/static"]
+    environment:
+      <<: *runtime
+      STELLARWEAVER_WEB_TOKEN: ${SW_WORKBENCH_TOKEN:-${STELLARWEAVER_WEB_TOKEN:-}}
+    volumes:
+      - type: bind
+        source: ${SW_WORKBENCH_WORKSPACE:?set SW_WORKBENCH_WORKSPACE}
+        target: /workspaces/project
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${SW_WORKBENCH_PORT:-8787}:8765"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  worker:
+    <<: *workbench
+    command: ["worker", "--workspace", "/workspaces/project", "--state-dir", "/state", "--provider", "${SW_WORKBENCH_PROVIDER:-fake}"]
+    environment:
+      <<: *runtime
+      STELLARWEAVER_API_KEY: ${STELLARWEAVER_API_KEY:-}
+      HTTPS_PROXY: ${SW_WORKBENCH_HTTPS_PROXY:-}
+    volumes:
+      - type: bind
+        source: ${SW_WORKBENCH_WORKSPACE:?set SW_WORKBENCH_WORKSPACE}
+        target: /workspaces/project
+        read_only: ${SW_WORKBENCH_WORKSPACE_READ_ONLY:-true}
+        bind:
+          create_host_path: false
+      - workbench_state:/state
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    init: true
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: ${SW_WORKBENCH_POSTGRES_VOLUME:-${COMPOSE_PROJECT_NAME}_postgres_data}
+    external: ${SW_WORKBENCH_EXTERNAL_VOLUMES:-false}
+  workbench_state:
+    name: ${SW_WORKBENCH_STATE_VOLUME:-${COMPOSE_PROJECT_NAME}_workbench_state}
+    external: ${SW_WORKBENCH_EXTERNAL_VOLUMES:-false}

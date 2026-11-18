@@ -1,0 +1,88 @@
+import { useEffect, useRef, useState } from 'react'
+import { api, type Thread, type Workspace } from './api'
+import { runLabel } from './conversation'
+
+type Directory = { path: string; display_path: string; selectable: boolean; folders: { name: string; path: string }[] }
+
+export function ProjectPicker({ onClose, onCreate }: { onClose: () => void; onCreate: (path: Directory) => Promise<void> }) {
+  const dialog = useRef<HTMLDialogElement>(null)
+  const [path, setPath] = useState('')
+  const [directory, setDirectory] = useState<Directory | null>(null)
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => { dialog.current?.showModal() }, [])
+  useEffect(() => {
+    const abort = new AbortController()
+    setError('')
+    setDirectory(null)
+    void api<Directory>('', 'workspaces/folders?path=' + encodeURIComponent(path), { signal: abort.signal })
+      .then(value => { if (!abort.signal.aborted) setDirectory(value) })
+      .catch(err => { if (!abort.signal.aborted) setError(err.message) })
+    return () => abort.abort()
+  }, [path])
+
+  async function create() {
+    if (!directory?.selectable) return
+    setSaving(true)
+    setError('')
+    try { await onCreate(directory) }
+    catch (err) { setError(err instanceof Error ? err.message : String(err)) }
+    finally { setSaving(false) }
+  }
+
+  return <dialog className="project-picker" ref={dialog} onCancel={onClose} aria-label="新建工作区">
+    <header><h2>新建工作区</h2><button type="button" onClick={onClose}>取消</button></header>
+    <div className="picker-path">
+      <button type="button" disabled={!path || saving} onClick={() => setPath(path.split('/').slice(0, -1).join('/'))}>上一级</button>
+      <code title={directory?.display_path}>{directory?.display_path ?? path}</code>
+    </div>
+    {error && <p className="notice" role="alert">{error}</p>}
+    {directory ? <ul className="folder-list" aria-label="项目文件夹">
+      {directory.folders.map(folder => <li key={folder.path}><button type="button" disabled={saving}
+        onClick={() => setPath(folder.path)}>{folder.name}</button></li>)}
+      {!directory.folders.length && <li className="muted">此目录无子文件夹。</li>}
+    </ul> : !error && <p className="muted">正在读取文件夹…</p>}
+    <footer>
+      {directory && !directory.selectable && <span className="muted">请选择 Git 项目文件夹。</span>}
+      <button type="button" className="primary" disabled={saving || !directory?.selectable}
+        onClick={() => void create()}>{saving ? '正在创建…' : '选择此文件夹'}</button>
+    </footer>
+  </dialog>
+}
+
+export function WorkspaceGroup({ item, threads, selectedSession, runId, selectedWorkspace, waiting, writable, manage,
+  onNew, onOpen, onArchive }: {
+  item: Workspace; threads: Thread[]; selectedSession?: string; runId: string; selectedWorkspace?: string
+  waiting: boolean; writable: boolean; manage: boolean; onNew: (id: string) => void
+  onOpen: (id: string) => void; onArchive: (thread: Thread) => void
+}) {
+  function row(thread: Thread) {
+    const selected = thread.session_id === selectedSession || thread.run_id === runId
+    const label = thread.is_review ? '补丁验证' : thread.title.split('\n')[0]
+    const status = (selected && waiting) || thread.needs_approval ? '待审批' : runLabel(thread.status)
+    return <div key={thread.session_id} className="thread-item">
+      <button className="thread-row" type="button" title={label + ' · ' + status}
+        aria-current={selected ? 'page' : undefined} onClick={() => onOpen(thread.run_id)}>
+        <span className="thread-title">{label}</span>
+        {(thread.status !== 'completed' || thread.needs_approval || (selected && waiting)) &&
+          <small className={status === '待审批' ? 'pending-label' : ''}>{status}</small>}
+      </button>
+      {manage && writable && thread.status !== 'active' && <button className="archive-action" type="button"
+        aria-label={(thread.archived ? '恢复 ' : '归档 ') + label} title={thread.archived ? '恢复' : '归档'}
+        onClick={() => onArchive(thread)}>{thread.archived ? '↶' : '⋯'}</button>}
+    </div>
+  }
+  const archived = threads.filter(thread => thread.archived)
+  return <section className={'project' + (item.id === selectedWorkspace ? ' project-selected' : '')}>
+    <details open>
+      <summary className="project-label"><span title={item.path ?? item.label}>{item.label}</span></summary>
+      {threads.filter(thread => !thread.archived).map(row)}
+      {archived.length > 0 && <details className="project-archive">
+        <summary>已归档 · {archived.length}</summary>{archived.map(row)}
+      </details>}
+    </details>
+    {writable && <button type="button" className="project-new" aria-label={'在 ' + item.label + ' 新建任务'}
+      title="在此工作区新建任务" onClick={() => onNew(item.id)}>＋</button>}
+  </section>
+}

@@ -14,9 +14,11 @@ uv run stellarweaver doctor --offline
 
 默认测试必须离线，文件和命令行为用真实临时仓库验证。真实 API 测试应显式选择，缺 Key 时跳过并说明。不要将模型“完成”声明替代工具证据。修改领域或工具协议时检查主循环与 provider 的整轮消息契约。
 
-本项目不自动提交、发布或连接外部账户。保存既有用户文件与工作区基线，遵守 docs/IMPLEMENTATION_SPEC.md 的阶段范围。
+保留用户的既有文件与工作区基线。开发范围和实施阶段见[路线图](docs/ROADMAP.md)，原始需求见 [CLI 实现规范](docs/archive/IMPLEMENTATION_SPEC.md)。提交、发布和外部账户操作由维护者授权。
 
-20题与独立评分说明见 evals/README.md。`uv run python -m stellarweaver.evals run --provider fake`运行真实工具参考脚本，不能称模型能力测量。`score REPORT`会执行独立检查；`replay`完全不执行历史工具。修改评分规则需有复现与回归，保留已有原始结果和规则修订原因。
+20 题评测和独立评分见[评测手册](evals/README.md)。`run --provider fake` 运行参考动作并检验执行链路。`score REPORT` 执行独立检查，`replay` 读取历史事件。评分规则变更需附复现和回归，保留原始结果与修订原因。
+
+改动 Web 模块时，运行 `uv sync --locked --extra web`，按[验证说明](docs/VALIDATION.md)准备测试数据库和浏览器夹具。数据库 schema 变更使用 Alembic revision，连接、迁移和恢复流程见[数据库文档](docs/DATABASE.md)。
 
 当前不配置 GitHub Actions，请手动运行上述检查；本机通过不能代替其他平台验证。故障夹具evals/fixtures与生成运行目录有意排除Ruff，避免格式化改变固定坏实现；src与tests仍全量检查。
 

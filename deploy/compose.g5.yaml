@@ -1,0 +1,79 @@
+# Team overlay for compose.yaml and compose.workbench.yaml.
+x-team: &team
+  SW_WEB_MEMBERS: /config/members.json
+  SW_WEB_RUNNER_IMAGE: ${SW_RUNNER_IMAGE:-python:3.12-slim-bookworm}
+  SW_WEB_RUNNER_NAMESPACE: ${COMPOSE_PROJECT_NAME}
+  SW_WEB_VERIFY_COMMANDS: '${SW_VERIFY_COMMANDS:-[["python","-m","unittest","-q"]]}'
+
+x-members: &members
+  type: bind
+  source: ${SW_G5_MEMBERS_FILE:?set SW_G5_MEMBERS_FILE}
+  target: /config/members.json
+  read_only: true
+  bind:
+    create_host_path: false
+
+services:
+  db:
+    ports: !reset []
+  api:
+    environment:
+      <<: *team
+      STELLARWEAVER_WEB_TOKEN: ""
+      SW_WEB_LOCAL_PILOT: "1"
+      SW_WEB_ALLOW_TEST_TOKENS: ${SW_G5_ALLOW_TEST_TOKENS:-0}
+      SW_WEB_TEST_TOKENS: '${SW_G5_TEST_TOKENS:-}'
+      SW_WEB_OIDC_ISSUER: ${SW_G5_OIDC_ISSUER:-}
+      SW_WEB_OIDC_ORIGIN: ${SW_G5_OIDC_ORIGIN:-}
+      SW_WEB_OIDC_CLIENT_ID: ${SW_G5_OIDC_CLIENT_ID:-}
+      SW_WEB_OIDC_CLIENT_SECRET: ${SW_G5_OIDC_CLIENT_SECRET:-}
+      SW_WEB_OIDC_LOOPBACK_HTTP: ${SW_G5_OIDC_LOOPBACK_HTTP:-0}
+    volumes:
+      - *members
+  worker:
+    environment:
+      <<: *team
+      SW_WEB_EXECUTOR_URL: http://executor:8766
+      SW_WEB_EXECUTOR_TOKEN: ${SW_G5_EXECUTOR_TOKEN:?set SW_G5_EXECUTOR_TOKEN}
+      SW_WEB_EXECUTOR_SLOTS: ${SW_G5_EXECUTOR_SLOTS:-2}
+    volumes:
+      - *members
+      - type: bind
+        source: ${SW_WORKBENCH_WORKSPACE:?set SW_WORKBENCH_WORKSPACE}
+        target: /workspaces/project
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [default, execution]
+    depends_on:
+      executor:
+        condition: service_healthy
+    stop_grace_period: 45s
+  executor:
+    image: ${SW_G5_EXECUTOR_IMAGE:-stellarweaver-workbench:g5-executor}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: isolated-worker
+    entrypoint: ["python", "-m", "stellarweaver.web.broker"]
+    environment:
+      SW_WEB_RUNNER_IMAGE: ${SW_RUNNER_IMAGE:-python:3.12-slim-bookworm}
+      SW_WEB_RUNNER_NAMESPACE: ${COMPOSE_PROJECT_NAME}
+      SW_WEB_VERIFY_COMMANDS: '${SW_VERIFY_COMMANDS:-[["python","-m","unittest","-q"]]}'
+      SW_WEB_EXECUTOR_TOKEN: ${SW_G5_EXECUTOR_TOKEN:?set SW_G5_EXECUTOR_TOKEN}
+      SW_WEB_EXECUTOR_SLOTS: ${SW_G5_EXECUTOR_SLOTS:-2}
+    networks: [execution]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    init: true
+    stop_grace_period: 45s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=2).close()"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+networks:
+  execution:
+    internal: true

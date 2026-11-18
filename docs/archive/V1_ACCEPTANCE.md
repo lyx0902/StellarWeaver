@@ -1,5 +1,7 @@
 # V1验收核对（2026-10-25）
 
+> 历史记录。现行说明见[项目文档](../README.md)。
+
 对应原始 `IMPLEMENTATION_SPEC.md` 第20项的25条。原规范和根目录副本不修改勾选，以本页记录当前实现、实际证据与边界。当前是Windows11/Python3.12.6本机验收；远端CI、Linux/macOS运行、重复真实评测及消融仍未完成，不能称全平台验证。
 
 | # | 验收行为 | 当前证据与边界 |
@@ -42,6 +44,6 @@
 - `tests/integration/test_eval_provenance.py`：来源字节校验、规则差异、拒覆盖、漂移与篡改检测。
 - `tests/integration/test_packaging.py`：合成私有状态的sdist与直接wheel内容检查。
 
-分发检查包含源码包和wheel实际构建、资源清单扫描及隔离加载smoke。sdist保留源码/测试/文档/评测夹具/示例/模板，排除IDE、真实环境文件、数据库、私钥与本机验证收据；完整收据仅留在本地的 `docs/validation`，不随 GitHub 源码或 sdist 提供；公开范围见[验证摘要](validation/README.md)。
+分发检查包含源码包和wheel实际构建、资源清单扫描及隔离加载smoke。sdist保留源码/测试/文档/评测夹具/示例/模板，排除IDE、真实环境文件、数据库、私钥与本机验证收据；完整收据仅留在本地的 `docs/validation`，不随 GitHub 源码或 sdist 提供；公开范围见[验证记录](../VALIDATION.md)。
 
 应用层授权、工作区锁、Job Object和oracle位置不能替代容器/低权限OS隔离。POSIX进程组不能保证回收主动setsid逃组的子进程，Windows外部broker代启也不属于Job继承树。精确tokenizer、DockerBackend、其他平台实跑、CI和评测比较是明确后续工作，不写成已经完成。

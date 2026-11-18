@@ -726,6 +726,16 @@ class SessionStore:
                 (str(outcome.get("run_status", "completed")), now()),
             )
 
+    def finish_run(self, outcome: JSONDict, event_type: str) -> AgentEvent:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE runs SET outcome_json=? WHERE run_id=?", (_json(outcome), self.run_id)
+            )
+            self.connection.execute(
+                "UPDATE sessions SET status=?,updated_at=?", (outcome["run_status"], now())
+            )
+            return self._event(event_type, outcome)
+
     def reconcile(self) -> JSONDict:
         """Coordinate tools and undo from evidence, never repeat a filesystem action."""
         with workspace_write_lock(self.workspace):

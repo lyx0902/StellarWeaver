@@ -1,5 +1,7 @@
 # 公开验证摘要
 
+本页记录 CLI 历史验收。当前测试入口、工作台验收和后续实验见[验证记录与实验计划](../VALIDATION.md)。
+
 StellarWeaver 0.1.0，SQLite 会话 schema 2。以下是 2026-10-25 在 Windows 11 / Python 3.12.6 上已完成检查的摘要；它区分不同补丁与历史评测，不代表跨平台验证。
 
 | 范围 | 已记录结果 |
@@ -30,4 +32,4 @@ uv run python -m stellarweaver.evals run --provider fake
 
 这些入口不请求模型 API；首次安装依赖可能需要联网。演示和评测需要 Git 位于 PATH；离线参考动作验证真实文件、工具和评分链路，不衡量模型自主编码能力。命令会建立新的临时工作区和报告，不复用历史成绩。针对真实 provider 的运行需另行配置密钥并显式选择，方法见评测说明。
 
-Linux/macOS 实机、远端 CI、重复真实评测及组件消融尚未完成。Windows Job Object 的受管进程测试不等于操作系统文件权限隔离；当前 Host 后端仍使用本机用户权限。当前范围见[V1 验收核对](../V1_ACCEPTANCE.md)。
+本阶段使用 Windows 宿主后端。平台矩阵、重复真实评测与组件消融见[后续实验](../VALIDATION.md#后续实验)。逐项历史范围见 [V1 验收核对](../archive/V1_ACCEPTANCE.md)。

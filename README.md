@@ -1,6 +1,6 @@
 # StellarWeaver
 
-一个用 Python 实现的命令行 Coding Agent：读取代码、调用工具、修改文件、运行测试，再根据真实反馈继续修复。核心是自行实现的单 Agent 循环，提供交互式 `chat` 和非交互 `exec`。
+StellarWeaver 是一个本地 Coding Agent，支持代码阅读、经授权的修改、项目测试与补丁审阅。CLI 和浏览器工作台共用同一个 Python Agent 循环。
 
 ## 已实现
 
@@ -10,14 +10,16 @@
 - **持久化与恢复**：SQLite 保存消息、授权、工具结果和制品；支持会话列表、恢复、只读回放与导出。结果未知的命令不会自动重跑。
 - **上下文与改动管理**：默认 100k 窗口配置、保留完整工具回合的历史压缩、分目录 `AGENTS.md` 和 Python repo map；`/diff` 区分原有与新增变化，`/undo` 只回退可证明匹配的内置编辑。
 - **Skills 与 MCP**：技能按需发现和加载；通过官方 MCP SDK 连接本地 stdio 服务器，统一进行授权、参数校验、调用和关闭。
+- **Web 工作台**支持账号注册、按工作区组织和归档会话、无项目对话、流式回复及逐项审批。Git worktree 隔离任务改动，专用执行器在一次性容器运行验证，工作台支持按改动块导出补丁并复验。见[使用与部署](docs/USAGE.md)。
+- **团队配置**支持 OIDC、成员角色、项目授权、DeepSeek 用量和操作审计。当前本机工作台使用账号密码，PostgreSQL 管理 Web 会话。见[数据库文档](docs/DATABASE.md)。
 
 ## 验证与边界
 
 默认测试无需外网或付费 Key，使用真实临时 Git 仓库、文件和进程验证编辑、失败后修复、恢复与冲突处理。另有 20 个固定开发任务及独立评分入口，覆盖 Bug、小功能、跨文件修改、测试补充和代码理解。
 
-DeepSeek `deepseek-flash` 已完成一次 20 题实测：初评 19/20，修正一项评分范围后，零新增模型调用重评分为 20/20。它只代表该小型任务集的一次结果；FakeModel 仅验证执行基础设施。详见[评测结果](evals/RESULTS.md)和[公开验证摘要](docs/validation/README.md)。
+DeepSeek `deepseek-flash` 在固定小任务集上完成过一次 20 题实测。初评 19/20，修正一项评分范围后，用原记录重评分为 20/20，新增模型调用 0 次。FakeModel 评测覆盖离线执行与评分链路。见[评测结果](evals/RESULTS.md)和[验证记录](docs/VALIDATION.md)。
 
-目前主要在 Windows / Python 3.12.6 验证，跨平台兼容性验收和重复/消融评测尚未完成。当前采用手动本地检查，仓库不配置 GitHub Actions。命令和 MCP 使用宿主机权限，不提供 OS 文件系统沙箱；100k 是客户端配置，当前采用保守字节估算。
+主要验证环境为 Windows 和 Python 3.12.6。CLI 命令和 MCP 使用宿主权限，Web 验证命令在 Linux 容器中运行。100,000 tokens 是应用的默认窗口配置，输入预算使用保守字节估算。跨平台和重复评测计划见[验证文档](docs/VALIDATION.md#后续实验)。
 
 ## 安装与配置
 
@@ -27,7 +29,7 @@ DeepSeek `deepseek-flash` 已完成一次 20 题实测：初评 19/20，修正�
 
 `.env`、本机配置、IDE 文件、会话数据库和原始运行产物已列入 [.gitignore](.gitignore)；提交源码时保留模板与 `uv.lock`。
 
-架构与完整用法：[架构](docs/ARCHITECTURE.md) · [改动与恢复](docs/CHANGES.md) · [评测说明](evals/README.md) · [开发指南](CONTRIBUTING.md) · [项目进度](docs/PROGRESS.md)。
+[完整文档](docs/README.md) · [架构与调用链](docs/ARCHITECTURE.md) · [阶段汇总与 Harness 对照](docs/ROADMAP.md) · [开发指南](CONTRIBUTING.md)
 
 ## 命令示例
 

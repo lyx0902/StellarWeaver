@@ -1,0 +1,2 @@
+# POSIX init scripts are executed inside Linux database containers.
+deploy/*.sh text eol=lf

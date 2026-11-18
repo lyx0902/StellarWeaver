@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from stellarweaver.changes import ChangesManager
+from stellarweaver.changes import ChangeObservationUnknown, ChangesManager
 from stellarweaver.cli import app, execute_chat
 from stellarweaver.config import LimitsConfig
 from stellarweaver.domain import AssistantReply
@@ -133,7 +133,7 @@ def test_real_mcp_startup_is_interrupted_by_the_task_deadline_and_process_is_clo
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = workspace(tmp_path)
-    (root / "stellarweaver.toml").write_text("[limits]\nmax_wall_seconds=2\n", encoding="utf-8")
+    (root / "stellarweaver.toml").write_text("[limits]\nmax_wall_seconds=4\n", encoding="utf-8")
     server = tmp_path / "slow_server.py"
     pid_file = tmp_path / "server.pid"
     server.write_text(
@@ -192,7 +192,7 @@ def test_real_mcp_startup_is_interrupted_by_the_task_deadline_and_process_is_clo
     )
     assert result.exit_code == 4, result.output
     outcome = emitted_outcome(result.output)
-    assert outcome["run_status"] == "budget_exceeded" and outcome["duration_ms"] >= 1900
+    assert outcome["run_status"] == "budget_exceeded" and outcome["duration_ms"] >= 3900
     assert not model.requests
     assert pid_file.exists(), "The test must reach a real server process before timing out"
     assert not alive(int(pid_file.read_text()))
@@ -294,18 +294,18 @@ async def test_baseline_and_extension_entry_share_one_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = ChangesManager.capture_baseline
     closed = False
 
     async def slow_baseline(self: ChangesManager) -> dict:
-        await asyncio.sleep(0.6)
-        return await original(self)
+        # Measure shared budgeting here, not the host-dependent duration of Git.
+        await asyncio.sleep(0.4)
+        return {}
 
     @asynccontextmanager
     async def slow_entry():
         nonlocal closed
         try:
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.8)
             yield
         finally:
             closed = True
@@ -344,6 +344,11 @@ async def test_chat_user_thinking_does_not_consume_the_next_task_deadline(
             return text
 
     model = FakeModel()
+
+    async def baseline(self: ChangesManager) -> dict:
+        return {}
+
+    monkeypatch.setattr(ChangesManager, "capture_baseline", baseline)
     monkeypatch.setattr("stellarweaver.cli.PromptSession", Reader)
     monkeypatch.setattr("stellarweaver.cli.build_provider", lambda *args, **kwargs: model)
     assert (
@@ -356,14 +361,21 @@ async def test_chat_user_thinking_does_not_consume_the_next_task_deadline(
     assert len(model.requests) == 2
 
 
+@pytest.mark.parametrize("translates_cancellation", [False, True])
 async def test_chat_setup_has_its_own_structured_timeout_before_prompting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    translates_cancellation: bool,
 ) -> None:
     (tmp_path / "stellarweaver.toml").write_text("[limits]\nmax_wall_seconds=1\n")
 
     async def slow(self: ChangesManager) -> dict:
-        await asyncio.sleep(3)
+        try:
+            await asyncio.sleep(3)
+        except asyncio.CancelledError as exc:
+            if translates_cancellation:
+                raise ChangeObservationUnknown("status", {"status": "cancelled"}) from exc
+            raise
         raise AssertionError("Deadline must interrupt setup")
 
     def no_prompt() -> None:
