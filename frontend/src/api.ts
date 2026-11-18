@@ -27,6 +27,13 @@ export type Delivery = {
     argv: string[]; cwd: string; stdout: string; stderr: string
   }[]
 }
+export type PatchPreflight = {
+  status: 'ready' | 'base_changed' | 'conflict' | 'local_changes'
+  branch: string | null; target_head: string; source_base: string; patch_sha256: string
+  paths: string[]; conflict_paths: string[]; local_changes: string[]; changed_since_base: string[] | null
+  verified_selection: boolean; handoff_ready: boolean
+}
+export type ReviewFeedback = { path: string; hunk?: string; text: string }
 export type Run = {
   run_id: string; session_id: string; status: string; prompt: string; provider?: string
   mode?: Mode; cancel_requested?: boolean; pending_approval?: Approval | null; through_seq?: number

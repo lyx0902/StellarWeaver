@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type PointerEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, receive, type Approval, type AuthOptions, type Delivery, type Mode, type Run, type RunEvent, type Thread, type Workspaces } from './api'
+import { api, receive, type Approval, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type Thread, type Workspaces } from './api'
 import { AdminPanel } from './admin'
 import { ApprovalCard, ContextMeter, Turn, runLabel } from './conversation'
 import { Inspector, type InspectorTab } from './inspector'
@@ -401,6 +401,22 @@ function App() {
     }
   }
 
+  async function submitFeedback(feedback: ReviewFeedback) {
+    const input = JSON.stringify([runId, feedback])
+    if (reviewRequest.current?.input !== input) reviewRequest.current = { input, id: crypto.randomUUID() }
+    const created = await api<Run>(token, 'runs/' + runId + '/review/feedback', {
+      method: 'POST', body: JSON.stringify({ ...feedback, request_id: reviewRequest.current.id }),
+    })
+    reviewRequest.current = null
+    openRun(created.run_id)
+  }
+
+  function preflightReview(hunks: string[]) {
+    return api<PatchPreflight>(token, 'runs/' + runId + '/review/preflight', {
+      method: 'POST', body: JSON.stringify({ hunks }),
+    })
+  }
+
   function startDrag(event: PointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return
     event.currentTarget.setPointerCapture(event.pointerId)
@@ -572,7 +588,9 @@ function App() {
       <Inspector key={runId} active={panel} onSelect={setPanel} onClose={() => setPanel(null)}
         delivery={currentReport} events={visibleEvents}
         canApply={run?.status === 'completed' && Boolean(listing.isolated && listing.repair_enabled)}
-        onReview={submitReview} />
+        canFeedback={Boolean(canContinue && !activeThread?.archived && latestIsKnown && !active)}
+        isReview={Boolean(run?.is_review)} targetLabel={currentProject?.path ?? currentProject?.label}
+        onReview={submitReview} onFeedback={submitFeedback} onPreflight={preflightReview} />
     </>}
     {showAdmin && <AdminPanel token={token} onClose={() => setShowAdmin(false)} />}
     {showPicker && <ProjectPicker onClose={() => setShowPicker(false)} onCreate={createProject} />}

@@ -158,7 +158,7 @@ SSE 在服务端查询已提交的事件页，按 `seq` 递增发送。浏览器
 
 **验证证据与补丁。** `Delivery` 在运行开始时观察基线，命令启动时记录文件快照摘要，结果到达后记录退出码、输出和清理状态。运行结束时，它将检查前快照与当前快照比较，失效的证据标为 `stale`。在隔离修复中，`candidate` 将改动生成相对于 Git 基线的文本 diff，按文件和 hunk 拆分，hunk ID 基于基线、路径及文本计算。后端以报告中已保存的 hunk 为输入重新组装补丁。`verify_selection` 校对基线、检查补丁能否应用，再跑完配置的检查。这里的检查由确定性代码执行，无需模型重新决定改法。
 
-**当前本机账号的复验入口。** `POST /runs/{run_id}/review` 仍用 `Principal.workspace_map()` 校验项目。静态项目配置在这个映射中登记，本机账号则通过 `local_projects` 获得动态项目权限。当前代码下，本机账号可读取已授权报告和候选补丁，发起复验会返回 `409`，请求在入队前结束。静态项目复验链路有集成测试覆盖。 [队列事务](../src/stellarweaver/web/db.py) · [领取与恢复](../src/stellarweaver/web/worker.py) · [审批](../src/stellarweaver/web/approval.py) · [验证报告](../src/stellarweaver/web/delivery.py) · [文本补丁](../src/stellarweaver/web/review.py) · [复验路由](../src/stellarweaver/web/app.py) · [复验集成测试](../tests/integration/test_web_g4.py)
+提交任务、复验和交接预检共用项目解析，统一处理本机账号动态登记和静态项目配置。审阅反馈由服务端从候选补丁解析文件及改动块，构造原线程的下一轮输入。提交事务锁定线程并校验反馈来源仍是最新运行，重复请求沿用普通运行的幂等键。交接预检读取目标分支、提交及涉及文件的工作区和索引，并在临时 worktree 执行 `git apply --check --recount`。通过的复验报告、自身完整补丁和当前预检结果共同决定交接状态。 [队列事务](../src/stellarweaver/web/db.py) · [复验和反馈路由](../src/stellarweaver/web/app.py) · [文本补丁与预检](../src/stellarweaver/web/review.py)
 
 ### Web 执行环境
 
@@ -210,7 +210,8 @@ sequenceDiagram
 
 1. **运行与浏览器连接解耦。** API 返回 `202` 后，worker 可以独立处理。用户关闭页面后重新打开，前端以原 `run_id` 读取快照并补读事件。刷新本身无需再提交一份任务，审批和取消仍可作用于原运行。 [前端运行状态](../frontend/src/main.tsx) · [Web API](../src/stellarweaver/web/app.py) · [持久队列](../src/stellarweaver/web/db.py)
 2. **将验证结果关联到具体改动。** 假设第一次测试时 `calc.py` 内容为 A，Agent 随后写成 B。报告仍保存 A 的真实测试记录，但该检查的快照和最终 B 不匹配，证据状态变为 `stale`。对 B 再次执行同一条测试后，报告才有与最终文件对应的新证据。 [验证报告实现](../src/stellarweaver/web/delivery.py)
-3. **从候选补丁建立独立复验运行。** 在支持复验的静态项目配置中，用户选择几个 hunk，前端仅提交这些标识。API 按原报告组装补丁，将复验作为新运行入队。worker 从原线程取得基线副本，在新 worktree 用 `git apply --check --recount` 预检，再应用并执行配置的所有验证命令。结果属于新运行和选中补丁，原线程和源仓库保留各自状态。本机账号的动态项目请求当前停在 API 的项目校验，具体见[调度与交付](#web-调度与交付)。 [补丁组装](../src/stellarweaver/web/review.py) · [复验执行](../src/stellarweaver/web/execution.py)
+3. **从候选补丁建立独立复验运行。** 用户选择改动块后，API 按原报告的标识组装补丁并将复验作为新运行入队。Worker 从原线程取得基线副本，在新 worktree 预检和应用，再执行项目配置的全部验证命令。结果对应新运行和选中补丁。 [补丁组装](../src/stellarweaver/web/review.py) · [复验执行](../src/stellarweaver/web/execution.py)
+4. **预检当前目标分支。** 在复验结果中预检完整补丁时，API 根据当前项目 checkout 建立临时 worktree，报告基线变化和冲突，并检查涉及路径的暂存和本地改动。比对文本内容时统一 LF 与 CRLF，明确标为 `-text` 的文件按原始字节比对。通过的完整复验补丁可下载交接，由维护者在 IDE 应用。 [目标预检](../src/stellarweaver/web/review.py)
 
 ## 普通对话与恢复
 

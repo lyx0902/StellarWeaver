@@ -323,6 +323,7 @@ def submit(
     enqueue: bool = False,
     session_id: str | None = None,
     continuation: str | None = None,
+    expected_previous_run: str | None = None,
     acknowledge_interrupted: bool = False,
     isolated: bool = False,
     review: JSONDict | None = None,
@@ -457,14 +458,21 @@ def submit(
                 raise ThreadUnavailable()
             previous = (
                 conn.execute(
-                    text("""SELECT status,outcome,review IS NOT NULL AS is_review
+                    text("""SELECT id,status,outcome,review IS NOT NULL AS is_review
                      FROM sw.runs WHERE session_id=:session ORDER BY created_at DESC,id DESC LIMIT 1"""),
                     params,
                 )
                 .mappings()
                 .one()
             )
-            if previous["status"] == "active" or previous["is_review"]:
+            if (
+                previous["status"] == "active"
+                or previous["is_review"]
+                or (
+                    expected_previous_run is not None
+                    and str(previous["id"]) != expected_previous_run
+                )
+            ):
                 raise ThreadUnavailable()
             if (
                 previous["status"] == "interrupted"

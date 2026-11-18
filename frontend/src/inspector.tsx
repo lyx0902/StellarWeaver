@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Delivery, RunEvent } from './api'
+import type { Delivery, PatchPreflight, ReviewFeedback, RunEvent } from './api'
 import { eventLabel } from './conversation'
 
 export type InspectorTab = 'changes' | 'checks' | 'logs'
@@ -40,15 +40,103 @@ function Diff({ patch }: { patch: string }) {
   </div>
 }
 
-export function Inspector({ active, onSelect, onClose, delivery, events, canApply, onReview }: {
-  active: InspectorTab; onSelect: (tab: InspectorTab) => void; onClose: () => void
-  delivery: Delivery | null; events: RunEvent[]; canApply: boolean
-  onReview: (hunks: string[]) => Promise<void>
+const statusLabels: Record<PatchPreflight['status'], string> = {
+  ready: '目标预检通过', base_changed: '目标分支基线已变化', conflict: '所选补丁与目标提交冲突',
+  local_changes: '补丁涉及的文件有本地改动',
+}
+
+function PreflightResult({ result, targetLabel, onDownload }: {
+  result: PatchPreflight; targetLabel?: string; onDownload: () => void
 }) {
-  const [selected, setSelected] = useState<string[]>([])
+  return <section className="review-result" aria-label="补丁预检结果" aria-live="polite">
+    <strong>{statusLabels[result.status]}</strong>
+    <dl>
+      {targetLabel && <><dt>目标项目</dt><dd>{targetLabel}</dd></>}
+      <dt>目标分支</dt><dd>{result.branch ?? '分离 HEAD'}</dd>
+      <dt>目标提交</dt><dd><code>{result.target_head}</code></dd>
+      <dt>补丁基线</dt><dd><code>{result.source_base}</code></dd>
+      <dt>补丁 SHA-256</dt><dd><code>{result.patch_sha256}</code></dd>
+    </dl>
+    {[
+      { label: '所选文件', paths: result.paths },
+      { label: '冲突文件', paths: result.conflict_paths },
+      { label: '有本地改动的文件', paths: result.local_changes },
+      { label: '相比补丁基线已变动的文件', paths: result.changed_since_base ?? [] },
+    ].filter(group => group.paths.length).map(group => <div key={group.label}>
+      <h3>{group.label}</h3><ul>{group.paths.map(path => <li key={path}><code>{path}</code></li>)}</ul>
+    </div>)}
+    {result.target_head !== result.source_base && <p className="muted">在目标提交上重新修订和复验后再交接。</p>}
+    {result.handoff_ready ? <>
+      <p className="muted">下载后在 IDE 核对目标分支和提交，再应用补丁。</p>
+      <button type="button" onClick={onDownload}>下载已复验补丁</button>
+    </> : !result.verified_selection && <p className="muted">要交接到 IDE，请先复验所选改动，再从复验结果预检全部改动。</p>}
+  </section>
+}
+
+export function Inspector({ active, onSelect, onClose, delivery, events, canApply, canFeedback, isReview,
+  targetLabel, onReview, onFeedback, onPreflight }: {
+  active: InspectorTab; onSelect: (tab: InspectorTab) => void; onClose: () => void
+  delivery: Delivery | null; events: RunEvent[]; canApply: boolean; canFeedback: boolean
+  isReview: boolean; targetLabel?: string
+  onReview: (hunks: string[]) => Promise<void>
+  onFeedback: (feedback: ReviewFeedback) => Promise<void>
+  onPreflight: (hunks: string[]) => Promise<PatchPreflight>
+}) {
+  const [selection, setSelection] = useState<string[] | null>(null)
   const [busy, setBusy] = useState(false)
+  const [feedback, setFeedback] = useState<ReviewFeedback | null>(null)
+  const [reviewError, setReviewError] = useState('')
+  const [preview, setPreview] = useState<{ key: string; result: PatchPreflight } | null>(null)
   const files = delivery?.review?.files ?? []
   const all = files.flatMap(file => file.hunks.map(hunk => hunk.id))
+  const reviewed = isReview && delivery?.verification === 'passed'
+  const selected = selection ?? (reviewed ? all : [])
+  const selectionKey = JSON.stringify(selected)
+
+  function selectHunks(ids: string[]) {
+    setSelection(ids)
+    setPreview(null)
+    setReviewError('')
+  }
+
+  async function preflight() {
+    setBusy(true)
+    setPreview(null)
+    setReviewError('')
+    try {
+      const result = await onPreflight(selected)
+      setPreview({ key: selectionKey, result })
+    } catch (err) {
+      setReviewError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function feedbackControl(path: string, hunk?: string) {
+    if (!canApply || !canFeedback) return null
+    if (!feedback || feedback.path !== path || feedback.hunk !== hunk) {
+      return <button className="quiet" type="button" disabled={busy} onClick={() => {
+        setReviewError('')
+        setFeedback({ path, hunk, text: '' })
+      }}>{hunk ? '反馈此改动块' : '反馈此文件'}</button>
+    }
+    return <form className="review-feedback" onSubmit={async event => {
+      event.preventDefault()
+      if (!feedback.text.trim() || busy) return
+      setBusy(true)
+      setReviewError('')
+      try { await onFeedback(feedback) }
+      catch (err) { setReviewError(err instanceof Error ? err.message : String(err)) }
+      finally { setBusy(false) }
+    }}>
+      <label>审阅意见<textarea rows={3} maxLength={2000} value={feedback.text} disabled={busy}
+        onChange={event => setFeedback({ ...feedback, text: event.target.value })} /></label>
+      <button type="submit" disabled={busy || !feedback.text.trim()}>发送到原线程并修订</button>
+      <button type="button" disabled={busy} onClick={() => setFeedback(null)}>取消</button>
+    </form>
+  }
+
   function exportPatch(hunks: string[]) {
     const chosen = new Set(hunks)
     const patch = files.map(file => {
@@ -91,6 +179,7 @@ export function Inspector({ active, onSelect, onClose, delivery, events, canAppl
           )}>下载 JSON 报告</button>
         </div>
         {active === 'checks' ? <>
+          {canApply && reviewed && all.length > 0 && <button type="button" onClick={() => onSelect('changes')}>预检并交接到 IDE</button>}
           {!delivery.checks.length && <p className="muted">本轮没有运行验证命令。</p>}
           {delivery.checks.map(check => <details className="check" key={check.operation_id}>
             <summary>退出码 {check.exit_code ?? '无'} · {check.state}
@@ -108,27 +197,33 @@ export function Inspector({ active, onSelect, onClose, delivery, events, canAppl
             <p className="muted">相对基线 <code>{delivery.review?.base.slice(0, 12)}</code> · {files.length} 个文件</p>
             <div className="actions review-actions">
               <button type="button" onClick={() => exportPatch(all)}>下载完整 Diff</button>
-              <button type="button" onClick={() => setSelected(selected.length === all.length ? [] : all)}>
+              <button type="button" onClick={() => selectHunks(selected.length === all.length ? [] : all)}>
                 {selected.length === all.length ? '清空选择' : '全选改动块'}
               </button>
               <button type="button" disabled={!selected.length} onClick={() => exportPatch(selected)}>下载所选 Diff</button>
             </div>
             {files.map(file => <details className="diff-file" key={file.path}>
               <summary>{file.path} · {file.hunks.length} 个改动块</summary>
+              {feedbackControl(file.path)}
               {file.hunks.map(hunk => <div key={hunk.id} className="hunk">
                 <label><input type="checkbox" checked={selected.includes(hunk.id)}
-                  onChange={e => setSelected(e.target.checked ? [...selected, hunk.id] : selected.filter(id => id !== hunk.id))} />
+                  onChange={e => selectHunks(e.target.checked ? [...selected, hunk.id] : selected.filter(id => id !== hunk.id))} />
                   选择 {hunk.diff.split('\n', 1)[0]}</label>
                 <Diff patch={hunk.diff} />
+                {feedbackControl(file.path, hunk.id)}
               </div>)}
             </details>)}
             {canApply && <div className="apply-bar">
               <span className="muted">已选 {selected.length} 个改动块</span>
-              <button className="primary" type="button" disabled={!selected.length || busy} onClick={async () => {
+              {!isReview && <button className="primary" type="button" disabled={!selected.length || busy} onClick={async () => {
                 setBusy(true)
                 try { await onReview(selected) } finally { setBusy(false) }
-              }}>在独立工作区应用所选并验证</button>
+              }}>在独立工作区应用所选并验证</button>}
+              <button type="button" disabled={!selected.length || busy} onClick={() => void preflight()}>预检目标分支</button>
             </div>}
+            {reviewError && <p className="notice" role="alert">{reviewError}</p>}
+            {preview?.key === selectionKey && <PreflightResult result={preview.result} targetLabel={targetLabel}
+              onDownload={() => exportPatch(selected)} />}
           </section>}
         </>}
       </section>}

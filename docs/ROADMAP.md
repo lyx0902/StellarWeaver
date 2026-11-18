@@ -28,7 +28,7 @@ StellarWeaver 的 CLI 阶段建立了模型、工具、策略和会话核心。W
 | 场景 | StellarWeaver 当前实现 | 对照与实际差距 |
 | --- | --- | --- |
 | 线程与项目环境 | 项目线程复用 worktree，支持追加轮次、日志补读和归档。普通对话单独分组。 | Codex App Server 提供线程分叉接口，Codex 的工作树作为独立执行环境。StellarWeaver 仍需支持从指定历史轮次创建分支线程、保存分支基线和处理运行中补充要求。 [Codex App Server](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md) · [Codex Worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees) |
-| 代码审阅与最终交付 | 按块选择、导出 Diff、在新独立 worktree 应用并复验。最终合并由维护者执行。 | Claude Code Desktop 提供差异批注和 PR 状态跟踪。StellarWeaver 需要受控地将选中补丁交付至目标分支，预览冲突，保留目标仓库的既有改动。 [Claude Code Desktop](https://code.claude.com/docs/en/desktop#review-changes-with-diff-view) |
+| 代码审阅与最终交付 | 按文件或改动块反馈并在原线程修订。按块复验、预检当前目标分支并导出已复验补丁，由维护者在 IDE 应用。 | Claude Code Desktop 还提供 PR 状态跟踪。StellarWeaver 的交付范围为当前 checkout，后续可评估跨分支或跨机器交接和应用后的证据回传。 [Claude Code Desktop](https://code.claude.com/docs/en/desktop#review-changes-with-diff-view) |
 | 应用验证和桌面开发 | 工作台显示编辑与命令结果、退出码、快照和清理状态。 | Claude Code Desktop 可管理开发服务器，在浏览器面板验证应用并查看 DOM 或截图。StellarWeaver 的验证仍以配置的批处理命令为主，交互终端、开发服务与浏览器产物需要接入。 [Claude Code 应用预览](https://code.claude.com/docs/en/desktop#preview-your-app) |
 | 扩展体系与客户端接入 | CLI 有 Skills 和本地 stdio MCP，Web 具备自身 REST 与 SSE 接口。 | DeepSeek Harness 将插件作为主要架构组成，并提供多种运行入口。StellarWeaver 需要明确 Web 扩展的权限、生命周期与部署方式，形成稳定的外部客户端接口。 [DeepSeek Harness 官方仓库](https://github.com/deepseek-ai/deepseek-harness) · [官方 CLI 参考](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/cli-help.md) |
 | 长期记忆、委派和定时 | 保存原始历史、压缩上下文和仓库说明，单 Agent 执行任务。worker 可以运行多个不同账号的任务。 | Hermes Agent 提供跨会话记忆、定时任务和子 Agent 委派。StellarWeaver 需要明确跨线程知识的保存、授权、删除和检索范围；任务并发与同一任务下的委派属于不同机制。 [Hermes Agent 功能说明](https://hermes-agent.nousresearch.com/docs/getting-started/learning-path/) |
@@ -38,7 +38,7 @@ StellarWeaver 的 CLI 阶段建立了模型、工具、策略和会话核心。W
 
 | 优先级 | 工作 | 验收标准 |
 | --- | --- | --- |
-| 1 | 安全完成补丁交付，并完善重启恢复。 | 对同一选中补丁展示应用前检查、成功路径和冲突详情。目标分支已有改动可核对，失败保留文件状态与操作记录。演练恢复 PostgreSQL 和状态卷后，可打开原线程并继续独立 worktree。 |
+| 1 | 演练补丁交付和重启恢复。 | 验证从预检和 IDE 应用到应用后检查的完整流程，记录目标分支和本地改动。演练恢复 PostgreSQL 和状态卷后，可打开原线程并继续独立 worktree。 |
 | 2 | 完善线程分支与面向应用的验证。 | 从规定轮次建立新线程并保留可比较的基线。隔离环境启动开发服务、记录状态和日志，至少完成一个 Web 功能的页面行为验收。异常时能关闭服务并收集结束证据。 |
 | 3 | 统一 CLI 与 Web 的扩展访问，提供稳定集成接口。 | 同一许可的 Skills 或 MCP 场景分别经 CLI 与 Web 验证。UI 能查看配置状态，连接失败和取消均有可追踪记录。外部接口明确版本和授权。 |
 | 4 | 扩大多用户与跨平台使用，再评估持久记忆、定时任务和子 Agent。 | 真实身份服务、部署恢复和平台矩阵具备验收记录。新机制以可测使用场景确定范围，分别记录权限、生命周期和资源限制。 |

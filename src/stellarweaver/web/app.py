@@ -55,7 +55,7 @@ from stellarweaver.web.oidc import (
     logout,
     session_member,
 )
-from stellarweaver.web.review import selected_patch
+from stellarweaver.web.review import feedback_prompt, preflight_patch, selected_patch
 from stellarweaver.web.worker import recover_interrupted
 
 LOCAL_TENANT = UUID("408f4403-a999-48de-94dc-cc049f8a95fd")
@@ -126,12 +126,24 @@ class Submit(BaseModel):
     acknowledge_interrupted: bool = False
 
 
-class ReviewSelection(BaseModel):
+HunkId = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+
+class PatchSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hunks: Annotated[list[HunkId], Field(min_length=1, max_length=300)]
+
+
+class ReviewSelection(PatchSelection):
+    request_id: UUID
+
+
+class ReviewFeedback(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: UUID
-    hunks: Annotated[
-        list[Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]], Field(min_length=1, max_length=300)
-    ]
+    path: Annotated[str, Field(min_length=1, max_length=4096, strict=True)]
+    hunk: HunkId | None = None
+    text: Annotated[str, Field(min_length=1, max_length=2000)]
 
 
 class Decision(BaseModel):
@@ -572,27 +584,36 @@ def create_app(
             p.access,
         )
 
-    @app.post("/api/v1/runs", status_code=202)
-    async def start(body: Submit, p: Principal = require_principal) -> JSONDict:
-        require_write(p)
-        workspace_id = str(body.workspace_id)
-        chat = False
-        root = p.workspace_map().get(workspace_id)
+    def resolve_workspace(p: Principal, workspace_id: str) -> Path | None:
+        """Resolve an authorized project. Only ordinary chat has no project root."""
         if p.local_projects is not None and local:
             project = next((item for item in p.local_projects if item["id"] == workspace_id), None)
             if project is None:
                 raise HTTPException(404, "找不到工作区。")
-            chat = project["relative_path"] is None
-            if not chat:
-                try:
-                    root = local.folder(project["relative_path"])
-                except (OSError, ValueError) as exc:
-                    raise HTTPException(404, "该项目目录不可访问。") from exc
-        if chat:
-            if body.mode != "read-only":
-                raise HTTPException(422, "普通对话不使用项目工具。")
-        elif root is None or not root.is_dir() or root.resolve() != root:
+            if project["relative_path"] is None:
+                return None
+            try:
+                return local.folder(project["relative_path"])
+            except (OSError, ValueError) as exc:
+                raise HTTPException(404, "该项目目录不可访问。") from exc
+        root = p.workspace_map().get(workspace_id)
+        if root is None or not root.is_dir() or root.resolve() != root:
             raise HTTPException(404, "Workspace not available")
+        return root
+
+    @app.post("/api/v1/runs", status_code=202)
+    async def start(body: Submit, p: Principal = require_principal) -> JSONDict:
+        return await submit_run(body, p)
+
+    async def submit_run(
+        body: Submit, p: Principal, *, expected_previous_run: str | None = None
+    ) -> JSONDict:
+        require_write(p)
+        workspace_id = str(body.workspace_id)
+        root = resolve_workspace(p, workspace_id)
+        chat = root is None
+        if chat and body.mode != "read-only":
+            raise HTTPException(422, "普通对话不使用项目工具。")
         prompt = body.prompt.strip()
         if not prompt:
             raise HTTPException(422, "Prompt is required")
@@ -616,6 +637,7 @@ def create_app(
                     enqueue=queued,
                     session_id=str(body.session_id) if body.session_id else None,
                     continuation=body.continuation if body.session_id else None,
+                    expected_previous_run=expected_previous_run,
                     acknowledge_interrupted=body.acknowledge_interrupted,
                     isolated=isolated and not chat,
                     member=p.member_id,
@@ -625,7 +647,12 @@ def create_app(
             except db.ExecutionModeConflict as exc:
                 raise HTTPException(503, "Workbench database is in inline mode") from exc
             except db.ThreadUnavailable as exc:
-                raise HTTPException(409, "Thread unavailable or already running") from exc
+                raise HTTPException(
+                    409,
+                    "请从原线程最新完成的改动发起反馈。"
+                    if expected_previous_run
+                    else "Thread unavailable or already running",
+                ) from exc
             except db.InterruptedConfirmationRequired as exc:
                 raise HTTPException(
                     409, "Review the interrupted run and confirm continuation"
@@ -788,28 +815,86 @@ def create_app(
             headers={"Content-Disposition": f'attachment; filename="stellarweaver-{run_id}.patch"'},
         )
 
+    async def review_source(p: Principal, run_id: UUID) -> tuple[JSONDict, Path, JSONDict]:
+        require_write(p)
+        if not isolated or not enable_repair:
+            raise HTTPException(403, "Isolated review is disabled")
+        row = await lookup(p, run_id)
+        if not row["isolated"] or row["status"] != "completed" or row["mode"] != "repair":
+            raise HTTPException(409, "Completed isolated repair required")
+        root = resolve_workspace(p, row["workspace_id"])
+        if root is None:
+            raise HTTPException(409, "Completed isolated repair required")
+        delivery = await get_report(str(p.tenant), run_id)
+        if not delivery.get("review"):
+            raise HTTPException(409, "No reviewable patch")
+        return row, root, delivery
+
+    @app.post("/api/v1/runs/{run_id}/review/feedback", status_code=202)
+    async def send_review_feedback(
+        run_id: UUID, body: ReviewFeedback, p: Principal = require_principal
+    ) -> JSONDict:
+        row, _, delivery = await review_source(p, run_id)
+        if not row["can_continue"] or row["is_review"]:
+            raise HTTPException(409, "请从可续接的项目线程发起反馈。")
+        try:
+            prompt = feedback_prompt(
+                delivery["review"], str(run_id), body.path, body.hunk, body.text
+            )
+        except ToolError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return await submit_run(
+            Submit(
+                workspace_id=UUID(row["workspace_id"]),
+                request_id=body.request_id,
+                session_id=UUID(row["session_id"]),
+                prompt=prompt,
+                mode="repair",
+            ),
+            p,
+            expected_previous_run=str(run_id),
+        )
+
+    preflight_slot = asyncio.Lock()
+
+    @app.post("/api/v1/runs/{run_id}/review/preflight")
+    async def preflight_review(
+        run_id: UUID, body: PatchSelection, p: Principal = require_principal
+    ) -> JSONDict:
+        row, root, delivery = await review_source(p, run_id)
+        if preflight_slot.locked():
+            raise HTTPException(429, "已有补丁预检正在进行，请稍后再试。")
+        try:
+            async with preflight_slot:
+                result = await asyncio.to_thread(
+                    preflight_patch,
+                    root,
+                    str(p.tenant),
+                    str(run_id),
+                    delivery["review"],
+                    body.hunks,
+                )
+        except (OSError, ValueError, ToolError) as exc:
+            if isinstance(exc, ToolError):
+                raise HTTPException(422, exc.message) from exc
+            raise HTTPException(422, "无法读取目标工作区进行预检。") from exc
+        entire = result.pop("entire_selection")
+        result["verified_selection"] = bool(
+            row["is_review"] and delivery.get("verification") == "passed" and entire
+        )
+        result["handoff_ready"] = result["verified_selection"] and result["status"] == "ready"
+        return result
+
     @app.post("/api/v1/runs/{run_id}/review", status_code=202)
     async def review(
         run_id: UUID,
         body: ReviewSelection,
         p: Principal = require_principal,
     ) -> JSONDict:
-        require_write(p)
-        if not isolated or not enable_repair:
-            raise HTTPException(403, "Isolated review is disabled")
+        row, _, delivery = await review_source(p, run_id)
         tenant = str(p.tenant)
-        row = await lookup(p, run_id)
         workspace = row["workspace_id"]
-        if (
-            workspace not in p.workspace_map()
-            or not row["isolated"]
-            or row["status"] != "completed"
-        ):
-            raise HTTPException(409, "Completed isolated repair required")
-        delivery = await get_report(tenant, run_id)
-        candidate = delivery.get("review")
-        if candidate is None:
-            raise HTTPException(409, "No reviewable patch")
+        candidate = delivery["review"]
         try:
             patch = selected_patch(candidate, body.hunks)
             ids, _ = await asyncio.to_thread(

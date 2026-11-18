@@ -26,7 +26,7 @@ uv run --offline python -m stellarweaver.extensions.demo
 | 真实模型 | 显式选择 `--provider deepseek`，由 `.env` 提供密钥。`doctor --check-model` 用于连通性检查，评测命令用于记录真实任务。 | 可见回复、工具调用和实际用量，以运行记录及独立检查为准。 |
 | Python 分发 | `uv build --offline`，以及 `tests/integration/test_packaging.py`。 | wheel、sdist、离线加载和本机数据排除。 |
 
-数据库与 Docker 用例因夹具缺失而跳过时，pytest 输出列出原因。Edge 的本机账号测试需要配置 `SW_WEB_LOCAL_PROJECT_A` 和 `SW_WEB_LOCAL_PROJECT_B`，指向可选择的两个已提交 Git 夹具。使用测试账号和测试库可以覆盖首次注册、继承、跨账号隔离与注销后的重新登录。命令和部署配置见[使用指南](USAGE.md)和[数据库](DATABASE.md)。
+数据库与 Docker 用例因夹具缺失而跳过时，pytest 输出列出原因。Edge 的本机账号测试需要配置 `SW_WEB_LOCAL_PROJECT_A` 和 `SW_WEB_LOCAL_PROJECT_B`，指向可选择的两个已提交 Git 夹具。补丁交接测试使用 `SW_WEB_LOCAL_REVIEW_PROJECT` 指定含 `calc.py`、`test_calc.py` 的已提交修复夹具，并启用修复与隔离执行。使用测试账号和测试库可以覆盖首次注册、继承、跨账号隔离与注销后的重新登录。命令和部署配置见[使用指南](USAGE.md)和[数据库](DATABASE.md)。
 
 ## 已记录的验收
 
@@ -45,6 +45,7 @@ uv run --offline python -m stellarweaver.extensions.demo
 | G4 | 私有 worktree、选中改动块复验、继续和取消。 | 安装了真实执行环境的全量测试 499 通过、4 跳过。后续线程界面迭代另有真实 DeepSeek 只读流式与用量显示记录。 |
 | G5 | 两账号跨租户、签名 OIDC 夹具、并行容器、执行器中断与 PostgreSQL 回灌。 | 全量 501 通过、4 跳过，Edge 端到端 2 项通过。执行器重启清理遗留容器，正在验证的任务保留未确认结果。本机部署另验证一次真实 DeepSeek 回复及用量结算。 |
 | 本机账号与多工作区 | 注册、历史继承、项目选择、归档、普通对话及源目录隔离。 | Web/PostgreSQL 回归 25 项通过，Agent 与上下文专项 44 通过、2 跳过，Edge 流程通过。`8787` 登录和注册界面、旧令牌拒绝及历史数量已在线核对。 |
+| 审阅反馈与补丁交接 | 本机账号发起同线程修订、选择改动复验、检查目标分支、导出经复验的补丁。 | Web 回归 26 项通过。最终换行兼容改动后重跑交接专项，并在 CRLF 工作区完成 1 项 Edge 端到端测试。覆盖跨账号拒绝、反馈幂等与过期反馈、本地改动、暂存和基线冲突。 |
 
 G5 组织身份使用签名测试服务完成验收。接入实际组织身份源、部署 HTTPS 和数据库与工作区卷的联合恢复仍是待验收项。浏览器自动化里的普通对话使用 FakeModel，当前工作台沿用 DeepSeek 配置。阶段明细见[历史进度](archive/PROGRESS.md)和[路线图](ROADMAP.md)。
 

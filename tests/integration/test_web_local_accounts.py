@@ -1,5 +1,7 @@
 """Exercise local accounts and projects with an actual PostgreSQL queue."""
 
+import hashlib
+import json
 import os
 import subprocess
 import time
@@ -15,10 +17,12 @@ pytest.importorskip("sqlalchemy")
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 
+from stellarweaver.domain import AssistantReply, ToolCall  # noqa: E402
 from stellarweaver.instructions import InstructionLoader  # noqa: E402
+from stellarweaver.providers.fake import FakeModel  # noqa: E402
 from stellarweaver.web import db  # noqa: E402
 from stellarweaver.web.app import LOCAL_TENANT, create_app  # noqa: E402
-from stellarweaver.web.isolation import Isolation  # noqa: E402
+from stellarweaver.web.isolation import DockerRunner, Isolation  # noqa: E402
 from stellarweaver.web.local_accounts import LocalConfig  # noqa: E402
 from stellarweaver.web.worker import run_team_worker  # noqa: E402
 
@@ -66,8 +70,8 @@ def start(
     )
 
 
-def completed(client: TestClient, run_id: str):
-    deadline = time.monotonic() + 15
+def completed(client: TestClient, run_id: str, *, approve: bool = False):
+    deadline = time.monotonic() + 25
     while time.monotonic() < deadline:
         response = client.get(f"/api/v1/runs/{run_id}")
         response.raise_for_status()
@@ -75,6 +79,13 @@ def completed(client: TestClient, run_id: str):
         if row["status"] != "active":
             assert row["status"] == "completed", row.get("outcome")
             return
+        if approve and (pending := row.get("pending_approval")) is not None:
+            decision = client.post(
+                f"/api/v1/runs/{run_id}/approvals/{pending['id']}",
+                headers=HEADERS,
+                json={"decision": "approve"},
+            )
+            assert decision.status_code == 204, decision.text
         time.sleep(0.1)
     pytest.fail("Queued run did not complete")
 
@@ -242,6 +253,220 @@ def test_password_accounts_workspace_selection_archives_and_chat(
                     text("SELECT password_hash FROM sw.local_accounts WHERE username='owner-test'")
                 ).scalar_one()
                 assert credentials["password"] not in value and ":" in value
+    finally:
+        stop.set()
+        worker.join(15)
+        engine.dispose()
+        assert not worker.is_alive()
+
+
+@pytest.mark.postgres
+def test_local_account_feedback_reverification_and_ide_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
+    image = os.getenv("STELLARWEAVER_G4_TEST_IMAGE")
+    if not dsn or not image:
+        pytest.skip("requires PostgreSQL and the Docker verification image")
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    for name in ("legacy", "review-project"):
+        git_repo(source_root, name)
+    source = source_root / "review-project"
+    state = tmp_path / "state"
+    engine = db.engine_for(dsn)
+    config = LocalConfig(source_root, "D:/Projects", uuid4(), uuid4(), str(uuid4()), "legacy")
+    isolation = Isolation(
+        image,
+        (("python", "-c", "assert open('review.txt').read().strip() == 'revised'"),),
+        f"test-{uuid4().hex}",
+    )
+
+    def model(_commands):
+        def respond(request):
+            prompt = next(msg.content for msg in reversed(request.messages) if msg.role == "user")
+            last = request.messages[-1]
+            revising = "Revise the note" in prompt
+            if revising:
+                assert '"path": "review.txt"' in prompt and '"hunk":' in prompt
+            if last.role == "user":
+                name = "read_file" if revising else "create_file"
+                args = {"path": "review.txt"}
+                if not revising:
+                    args["content"] = "initial\n"
+                return AssistantReply(tool_calls=(ToolCall("step-1", name, json.dumps(args)),))
+            if revising and last.role == "tool" and last.tool_call_id == "step-1":
+                args = {
+                    "path": "review.txt",
+                    "old_text": "initial",
+                    "new_text": "revised",
+                    "expected_sha256": json.loads(last.content)["data"]["sha256"],
+                }
+                return AssistantReply(
+                    tool_calls=(ToolCall("step-2", "edit_file", json.dumps(args)),)
+                )
+            return AssistantReply("Review fixture finished")
+
+        return FakeModel(respond)
+
+    monkeypatch.setattr("stellarweaver.web.execution.offline_repair_model", model)
+    monkeypatch.setattr(
+        "stellarweaver.web.worker.RemoteRunner",
+        lambda root, isolation, *_: DockerRunner(root, isolation),
+    )
+    app = create_app(
+        engine,
+        {},
+        tmp_path / "api-state",
+        queued=True,
+        isolated=True,
+        enable_repair=True,
+        local=config,
+    )
+    stop = Event()
+    worker = Thread(
+        target=run_team_worker,
+        args=(engine, {}, state),
+        kwargs=dict(
+            provider="fake",
+            api_key=None,
+            enable_repair=True,
+            isolation=isolation,
+            remote=("http://127.0.0.1:1", "fixture"),
+            slots=1,
+            shutdown=stop,
+            local=config,
+        ),
+    )
+    worker.start()
+    try:
+        with (
+            TestClient(app, base_url="http://127.0.0.1") as owner,
+            TestClient(app, base_url="http://127.0.0.1") as other,
+        ):
+            for client in (owner, other):
+                registered = client.post(
+                    "/api/v1/auth/register",
+                    headers=HEADERS,
+                    json={
+                        "username": f"review-{uuid4().hex[:12]}",
+                        "password": "local-fixture-password",
+                    },
+                )
+                assert registered.status_code == 204, registered.text
+            assert (
+                owner.post(
+                    "/api/v1/workspaces",
+                    headers=HEADERS,
+                    json={
+                        "path": source.name,
+                    },
+                ).status_code
+                == 204
+            )
+            workspace = next(
+                w["id"]
+                for w in owner.get("/api/v1/workspaces").json()["workspaces"]
+                if w["label"] == source.name
+            )
+
+            def post(run_id, action, **body):
+                return owner.post(
+                    f"/api/v1/runs/{run_id}/review{action}", headers=HEADERS, json=body
+                )
+
+            def report(run_id):
+                response = owner.get(f"/api/v1/runs/{run_id}/report")
+                assert response.is_success, response.text
+                return response.json()
+
+            first = start(owner, workspace, "Create review note", mode="repair")
+            assert first.status_code == 202, first.text
+            original = first.json()
+            original_id = original["run_id"]
+            completed(owner, original_id, approve=True)
+            original_hunk = report(original_id)["review"]["files"][0]["hunks"][0]["id"]
+            body = {
+                "request_id": str(uuid4()),
+                "path": "review.txt",
+                "hunk": original_hunk,
+                "text": "Revise the note",
+            }
+            for action, payload in (
+                ("/feedback", body),
+                ("/preflight", {"hunks": [original_hunk]}),
+                ("", {"request_id": str(uuid4()), "hunks": [original_hunk]}),
+            ):
+                denied = other.post(
+                    f"/api/v1/runs/{original_id}/review{action}", headers=HEADERS, json=payload
+                )
+                assert denied.status_code == 404
+            assert post(original_id, "/feedback", **{**body, "hunk": "0" * 64}).status_code == 422
+            feedback = post(original_id, "/feedback", **body)
+            assert feedback.status_code == 202, feedback.text
+            revised = feedback.json()
+            assert revised["session_id"] == original["session_id"]
+            completed(owner, revised["run_id"], approve=True)
+            assert post(original_id, "/feedback", **body).json() == revised
+            assert (
+                post(original_id, "/feedback", **{**body, "request_id": str(uuid4())}).status_code
+                == 409
+            )
+            revised_patch = report(revised["run_id"])["review"]
+            assert "+revised" in revised_patch["files"][0]["hunks"][0]["diff"]
+            selected = [revised_patch["files"][0]["hunks"][0]["id"]]
+            before = post(revised["run_id"], "/preflight", hunks=selected)
+            assert before.status_code == 200, before.text
+            assert before.json()["status"] == "ready" and not before.json()["handoff_ready"]
+            review = post(revised["run_id"], "", request_id=str(uuid4()), hunks=selected)
+            assert review.status_code == 202, review.text
+            verified_id = review.json()["run_id"]
+            assert review.json()["session_id"] != original["session_id"]
+            completed(owner, verified_id)
+            verified = report(verified_id)
+            assert verified["verification"] == "passed", verified
+            hunks = [verified["review"]["files"][0]["hunks"][0]["id"]]
+            (source / "README.md").write_text("unrelated local edit", encoding="utf-8")
+            result = post(verified_id, "/preflight", hunks=hunks).json()
+            assert result["handoff_ready"], result
+            assert result["branch"] and result["target_head"] == result["source_base"]
+            patch = owner.get(f"/api/v1/runs/{verified_id}/patch").content
+            assert hashlib.sha256(patch).hexdigest() == result["patch_sha256"]
+            assert not (source / "review.txt").exists()
+            assert (source / "README.md").read_text() == "unrelated local edit"
+
+            (source / "review.txt").write_text("local change", encoding="utf-8")
+            blocked = post(verified_id, "/preflight", hunks=hunks).json()
+            assert blocked["status"] == "local_changes" and blocked["local_changes"] == [
+                "review.txt"
+            ]
+            assert not blocked["handoff_ready"]
+            subprocess.run(["git", "add", "review.txt"], cwd=source, check=True)
+            (source / "review.txt").unlink()
+            staged = post(verified_id, "/preflight", hunks=hunks).json()
+            assert staged["local_changes"] == ["review.txt"] and not staged["handoff_ready"]
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "diverging target",
+                ],
+                cwd=source,
+                check=True,
+            )
+            (source / "review.txt").write_text("local change", encoding="utf-8")
+            conflict = post(verified_id, "/preflight", hunks=hunks).json()
+            assert conflict["status"] == "conflict" and conflict["conflict_paths"] == [
+                "review.txt"
+            ], conflict
+            assert (
+                conflict["changed_since_base"] == ["review.txt"] and not conflict["handoff_ready"]
+            )
     finally:
         stop.set()
         worker.join(15)

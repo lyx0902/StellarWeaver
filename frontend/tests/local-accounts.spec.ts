@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { readFileSync } from 'node:fs'
 
 const secret = 'local-browser-fixture-20261118'
 
@@ -79,4 +80,50 @@ test('register and log in, group project threads, archive, and chat without a pr
   await page.getByRole('button', { name: '登录', exact: true }).click()
   await expect(page.locator('.sidebar-footer')).toContainText(handle)
   await expect(nav.getByRole('button', { name: '第一个工作区任务', exact: true })).toBeVisible()
+})
+
+test('local account can send anchored feedback and hand off a verified patch', async ({ page }) => {
+  const project = process.env.SW_WEB_LOCAL_REVIEW_PROJECT
+  test.skip(!project, 'Requires a local account workbench with a committed calc repair fixture')
+  test.setTimeout(90_000)
+  if (!project) throw new Error('Missing review project')
+  await register(page, 'review-' + Date.now())
+  await createWorkspace(page, project)
+  await page.getByLabel('运行模式').selectOption('repair')
+  const title = '浏览器审阅与交接验证'
+  await page.getByLabel('任务说明').fill(title)
+  await page.getByRole('button', { name: '运行修复任务' }).click()
+  const approval = page.getByRole('region', { name: '待审批操作' })
+  for (const hint of ['return a + b + 1', 'unittest', '+    return a + b', 'unittest']) {
+    await expect(approval).toContainText(hint, { timeout: 20_000 })
+    await approval.getByRole('button', { name: '批准一次' }).click()
+  }
+  await expect(page.getByTestId('run-status')).toHaveText('已完成', { timeout: 20_000 })
+  const session = await page.getByTestId('session-id').textContent()
+  await page.getByRole('button', { name: '查看改动', exact: true }).click()
+  const review = page.getByRole('region', { name: '补丁审阅' })
+  await review.getByText('calc.py · 1 个改动块').click()
+  await review.getByRole('checkbox').check()
+  await review.getByRole('button', { name: '预检目标分支' }).click()
+  const result = page.getByRole('region', { name: '补丁预检结果' })
+  await expect(result).toContainText('目标预检通过')
+  await expect(result.getByRole('button', { name: '下载已复验补丁' })).toHaveCount(0)
+  await review.getByRole('button', { name: '在独立工作区应用所选并验证' }).click()
+  await expect(page.getByTestId('session-id')).not.toHaveText(session!)
+  await expect(page.getByTestId('verification')).toHaveText('passed', { timeout: 25_000 })
+  await page.getByRole('button', { name: '预检并交接到 IDE' }).click()
+  await review.getByRole('button', { name: '预检目标分支' }).click()
+  const download = result.getByRole('button', { name: '下载已复验补丁' })
+  await expect(download).toBeVisible()
+  const [patch] = await Promise.all([page.waitForEvent('download'), download.click()])
+  expect(readFileSync((await patch.path())!, 'utf8')).toContain('+    return a + b')
+  await page.getByRole('navigation', { name: '项目与线程' }).getByRole('button', { name: title, exact: true }).click()
+  await page.getByRole('button', { name: '查看改动', exact: true }).click()
+  await review.getByText('calc.py · 1 个改动块').click()
+  await review.getByRole('button', { name: '反馈此改动块' }).click()
+  await review.getByLabel('审阅意见').fill('请再检查这个加法实现。')
+  await review.getByRole('button', { name: '发送到原线程并修订' }).click()
+  await expect(page.getByText(/请再检查这个加法实现/)).toBeVisible()
+  await expect(page.getByTestId('session-id')).toHaveText(session!)
+  await expect(page.getByRole('article', { name: '对话轮次' })).toHaveCount(2)
 })
