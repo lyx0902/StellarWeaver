@@ -4,7 +4,7 @@ StellarWeaver 有两套持久化路径。Web 工作台使用 PostgreSQL 管理�
 
 ## 本机 PostgreSQL 连接
 
-当前工作台使用 `postgres:17`，本次核对的服务端版本为 17.12，Alembic 版本为 `g6_local_accounts`。从 PyCharm 的 **Database → Data Source → PostgreSQL** 创建连接，填写下列参数。选择 **Test Connection** 后，在架构列表中选中 `sw`，需要查看迁移版本时同时选中 `public`。
+当前工作台使用 `postgres:17`，源码的 Alembic 最新迁移为 `g7_model_usage_time`。从 PyCharm 的 **Database → Data Source → PostgreSQL** 创建连接，填写下列参数。选择 **Test Connection** 后，在架构列表中选中 `sw`，需要查看迁移版本时同时选中 `public`。
 
 | 配置 | 当前本机工作台 |
 | --- | --- |
@@ -269,10 +269,11 @@ erDiagram
 | `tenant_id`, `run_id`, `request_index` | `uuid`、`uuid`、`integer`，组成主键，前两列引用 `runs`。每次模型请求一行。 |
 | `member_id` | `uuid`，与 `tenant_id` 一起引用 `memberships`。 |
 | `usage_day` | `date`，默认取插入时的 UTC 日期。 |
+| `started_at` | `timestamptz`，默认取插入事务的 `now()`。无法从历史事件恢复时间的旧记录可为 `NULL`。 |
 | `tokens` | `bigint`，`CHECK` 要求大于等于 0。先记预留量，结算后为实际或估算用量。 |
 | `settled`, `estimated` | `boolean`，默认分别为 `false` 和 `true`，标记是否结算及数据是否来自估算。 |
 
-当前仅对有关联成员的 DeepSeek 请求记账。发起请求时预留输入估算量加输出上限，返回后用输入和输出用量结算。失败时有可信用量也可结算，缺少用量的失败请求保留原预留。两类写入都锁定成员行，并与对应模型事件一同提交。`usage_by_day (tenant_id, member_id, usage_day)` 支持限额检查与按成员、UTC 日期汇总。这种结构可在模型响应之前计算余量，并保留每次请求的估算和结算状态。 [预留、结算和聚合](../src/stellarweaver/web/db.py) · [事件计量入口](../src/stellarweaver/web/journal.py)
+当前仅对有关联成员的 DeepSeek 请求记账。发起请求时预留输入估算量加输出上限，返回后用输入和输出用量结算。失败时有可信用量也可结算，缺少用量的失败请求保留原预留。两类写入都锁定成员行，并与对应模型事件一同提交。`usage_by_day (tenant_id, member_id, usage_day)` 支持按 UTC 日期检查额度和汇总。`usage_by_started_at (tenant_id, started_at)` 支持按北京时间当天的时间区间统计可见项目，结算仍归属请求开始日期。迁移从 `model.started` 事件回填开始时间，缺失该事件的旧数据仍计入 UTC 历史和额度。 [预留、结算和聚合](../src/stellarweaver/web/db.py) · [事件计量入口](../src/stellarweaver/web/journal.py) · [历史回填](../src/stellarweaver/web/migrations/versions/g7_model_usage_time.py)
 
 ### 典型事务中的表协作
 
@@ -287,7 +288,7 @@ erDiagram
 
 ### `public.alembic_version`
 
-`version_num` 为 `varchar(32)` 主键，由 Alembic 随迁移更新。当前迁移历史为单线，已核对本机为 `g6_local_accounts`。版本表位于 `public`，与 `sw` 的业务事务及租户隔离独立。排查表或字段缺失时，可先查询该版本，再查看对应迁移增加了哪些结构。 [迁移环境](../src/stellarweaver/web/migrations/env.py)
+`version_num` 为 `varchar(32)` 主键，由 Alembic 随迁移更新。当前源码的迁移历史为单线，最新版本是 `g7_model_usage_time`。版本表位于 `public`，与 `sw` 的业务事务及租户隔离独立。排查表或字段缺失时，可先查询该版本，再查看对应迁移增加了哪些结构。 [迁移环境](../src/stellarweaver/web/migrations/env.py)
 
 | Revision | 内容 |
 | --- | --- |
@@ -297,6 +298,7 @@ erDiagram
 | `g4_threads` | 独立工作区标记、线程续接方式和补丁审阅请求。 |
 | `g5_identity` | 成员、项目授权、审计、用量、浏览器会话和运行归属。 |
 | `g6_local_accounts` | 本机账号、可选项目目录与线程归档。 |
+| `g7_model_usage_time` | 请求开始时间、历史回填和本地日期聚合索引。 |
 
 通过 Compose 启动时，`migrate` 服务先用管理员权限升级，再启动日常服务。开发环境可以用 `STELLARWEAVER_MIGRATION_DSN` 指定管理员 DSN 后运行 `uv run --locked --extra web python -m stellarweaver.web migrate`，并通过 `STELLARWEAVER_DATABASE_DSN` 为 API 或 worker 提供应用账号 DSN。数据库镜像初始化脚本在首次创建空数据卷时建立数据库角色。运行中的密码轮换需同步更新数据库角色与 Compose 配置。
 

@@ -114,6 +114,7 @@ flowchart LR
 `ExtensionManager` 由 CLI 在任务或交互会话的生命周期内装配。它将 Skills 和 MCP 接入同一个工具注册表，因此扩展调用也会产生授权、执行和结果事件。
 
 - **Skills。** `SkillCatalog` 从可信工作区和用户显式指定的目录发现技能。模型先看到目录中的元数据，通过 `load_skill` 请求某个技能的正文。目录记录来源和内容身份，加载结果进入模型工具回合。技能正文用于补充任务方法和指令，任何后续访问仍通过原工具授权路径。
+- **Web Skills 库。** API 复用 `SkillCatalog` 浏览 Compose 明确挂载的本机目录。列表按来源和相对路径生成条目标识，详情按标识重新读取正文。目录与正文作为页面数据返回，和 CLI 的 `load_skill` 工具调用各走自己的入口。 [Web 技能目录](../src/stellarweaver/web/skills.py)
 - **MCP。** 启动本地 stdio server 前，管理器检查工作区信任，并将 `server_id`、argv 和 cwd 交给策略判断。继承的额外环境变量按 `allow_env` 选择。启动后，连接完成协议初始化和 `tools/list`，为远程工具注册本地名称与参数 schema。显式的只读配置决定哪些工具可在只读模式中暴露。调用经 `tools/call` 返回统一工具结果，连接在退出时关闭。
 - **动态清单。** 当 server 发出工具列表变化通知时，管理器在下一次请求的上下文组装边界刷新注册表，使发送给模型的 schema 与实际可执行项对应。扩展生命周期中的启动失败、连接中断和结果截断也写入 Journal。
 

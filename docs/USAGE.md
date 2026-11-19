@@ -53,6 +53,10 @@ uv run stellarweaver resume SESSION_ID --provider deepseek --env-file .env --pro
 
 Enter 提交，Shift+Enter 换行。运行中的线程可以编辑追问草稿，当前轮次结束后提交。
 
+管理员在左侧打开「审计与用量」可查看北京时间今日用量、自己的 UTC 日额度和最近审计。面板打开后每 30 秒重新查询用量和审计，并显示服务端最近读取时间。今日用量在北京时间零点切换，UTC 日额度在北京时间 08:00 重置。
+
+左侧用户名上方的「Skills 库」可搜索、查看和刷新本机技能。正文以只读文档展示，列表同时给出来源和扫描提示。可在本机 Compose 配置中将 `SW_WORKBENCH_AGENT_SKILLS_ROOT`、`SW_WORKBENCH_CODEX_SKILLS_ROOT` 指向希望提供给工作台已登录用户浏览的目录。Agents 根目录下已有的 `skills-codex` 会作为独立来源扫描。路径通过 API 容器只读挂载，每个来源扫描一级子目录中的 `SKILL.md`。
+
 ## 本机 Compose
 
 ### 已部署实例

@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +56,7 @@ from stellarweaver.web.oidc import (
     session_member,
 )
 from stellarweaver.web.review import feedback_prompt, preflight_patch, selected_patch
+from stellarweaver.web.skills import SkillLibrary
 from stellarweaver.web.worker import recover_interrupted
 
 LOCAL_TENANT = UUID("408f4403-a999-48de-94dc-cc049f8a95fd")
@@ -237,6 +238,7 @@ def create_app(
     oidc: OIDC | None = None,
     legacy_owner: Principal | None = None,
     local: local_accounts.LocalConfig | None = None,
+    skill_roots: Sequence[tuple[str, Path]] = (),
 ) -> FastAPI:
     identities = (*principals.values(), *(subjects or {}).values())
     if isolated and not queued:
@@ -266,6 +268,7 @@ def create_app(
     controls: dict[tuple[str, str], Event] = {}
     repair_roots: set[Path] = set()
     submission_lock = asyncio.Lock()
+    skills = SkillLibrary(skill_roots)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -996,6 +999,23 @@ def create_app(
         if p.member is None or p.member.role != "admin" or p.access is None:
             raise HTTPException(403, "Administrator access required")
         return await asyncio.to_thread(db.usage_rows, engine, str(p.tenant), p.access)
+
+    @app.get("/api/v1/admin/usage/overview")
+    async def read_usage_today(p: Principal = require_principal) -> JSONDict:
+        if p.member is None or p.member.role != "admin" or p.access is None:
+            raise HTTPException(403, "Administrator access required")
+        return await asyncio.to_thread(db.usage_today, engine, str(p.tenant), p.access)
+
+    @app.get("/api/v1/skills")
+    def list_skills(p: Principal = require_principal, refresh: bool = False) -> JSONDict:
+        return skills.list(refresh=refresh)
+
+    @app.get("/api/v1/skills/{skill_id}")
+    def read_skill(skill_id: str, p: Principal = require_principal) -> JSONDict:
+        try:
+            return skills.detail(skill_id)
+        except ToolError as exc:
+            raise HTTPException(404 if exc.code == "SKILL_NOT_FOUND" else 409, exc.message) from exc
 
     if static_dir is not None:
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="workbench")

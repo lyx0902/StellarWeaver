@@ -261,6 +261,16 @@ def main() -> None:
         else:
             assert token is not None
             bearers, subjects, oidc = {token: principal}, {}, None
+        skill_roots = [
+            (label, Path(path))
+            for label, name in (
+                ("Agents", "SW_WEB_AGENT_SKILLS_ROOT"),
+                ("Agents / skills-codex", "SW_WEB_NESTED_SKILLS_ROOT"),
+                ("Codex", "SW_WEB_CODEX_SKILLS_ROOT"),
+            )
+            if (path := os.getenv(name))
+            and (name != "SW_WEB_NESTED_SKILLS_ROOT" or Path(path).exists())
+        ]
         app = create_app(
             engine,
             bearers,
@@ -275,6 +285,7 @@ def main() -> None:
             oidc=oidc,
             legacy_owner=local_owner[1] if local_owner else None,
             local=local,
+            skill_roots=skill_roots,
         )
         uvicorn.run(
             app, host=args.host, port=args.port, proxy_headers=False, access_log=oidc is None

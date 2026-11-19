@@ -5,6 +5,7 @@ import { AdminPanel } from './admin'
 import { ApprovalCard, ContextMeter, Turn, runLabel } from './conversation'
 import { Inspector, type InspectorTab } from './inspector'
 import { ProjectPicker, WorkspaceGroup } from './projects'
+import { SkillsPanel } from './skills'
 import './style.css'
 
 const tokenKey = 'stellarweaver.local-token'
@@ -22,6 +23,7 @@ function App() {
   const [authOptions, setAuthOptions] = useState<AuthOptions | null>(null)
   const [browserSession, setBrowserSession] = useState(false)
   const [showAdmin, setShowAdmin] = useState(false)
+  const [showSkills, setShowSkills] = useState(false)
   const [listing, setListing] = useState<Workspaces | null>(null)
   const [workspace, setWorkspace] = useState('')
   const [threads, setThreads] = useState<Thread[]>([])
@@ -311,6 +313,7 @@ function App() {
     setDraft('')
     setMode('read-only')
     setShowAdmin(false)
+    setShowSkills(false)
     setShowPicker(false)
     openRun('', null, true)
     setError('')
@@ -472,6 +475,7 @@ function App() {
         {!threads.length && <p className="sidebar-empty">还没有线程。</p>}
       </nav>
       <div className="sidebar-footer">
+        <button type="button" className="sidebar-skills" onClick={() => setShowSkills(true)}>Skills 库</button>
         <span className="local-indicator"><i />{listing.account?.name ?? '本机工作台'}</span>
         {listing.account?.role === 'admin' && <button type="button" onClick={() => setShowAdmin(true)}>审计与用量</button>}
         <button type="button" onClick={() => void disconnect()}>{listing.manage_workspaces ? '退出登录' : '断开'}</button>
@@ -593,6 +597,7 @@ function App() {
         onReview={submitReview} onFeedback={submitFeedback} onPreflight={preflightReview} />
     </>}
     {showAdmin && <AdminPanel token={token} onClose={() => setShowAdmin(false)} />}
+    {showSkills && <SkillsPanel token={token} onClose={() => setShowSkills(false)} />}
     {showPicker && <ProjectPicker onClose={() => setShowPicker(false)} onCreate={createProject} />}
   </main>
 }

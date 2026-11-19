@@ -127,3 +127,46 @@ test('local account can send anchored feedback and hand off a verified patch', a
   await expect(page.getByTestId('session-id')).toHaveText(session!)
   await expect(page.getByRole('article', { name: '对话轮次' })).toHaveCount(2)
 })
+
+test('installed skill browsing and 30-second usage and audit refresh', async ({ page }) => {
+  test.skip(!process.env.SW_WEB_PANELS_E2E, 'Requires a local account workbench with the panel skill fixture')
+  await register(page, 'panels-' + Date.now())
+  await page.getByRole('button', { name: 'Skills 库', exact: true }).click()
+  const library = page.getByRole('dialog', { name: 'Skills 库' })
+  await library.getByLabel('搜索 Skills').fill('readme')
+  await library.getByRole('button', { name: /readme-helper/ }).click()
+  await expect(library.getByRole('region', { name: '技能详情' })).toContainText('Fixed skill fixture body.')
+  await library.getByRole('button', { name: '刷新目录' }).click()
+  await expect(library.getByRole('region', { name: '技能详情' })).toContainText('Fixed skill fixture body.')
+  await library.getByRole('button', { name: '关闭' }).click()
+
+  let reads = 0
+  let audits = 0
+  page.on('request', request => { if (request.url().endsWith('/api/v1/admin/audit')) audits++ })
+  await page.route('**/api/v1/admin/usage/overview', route => {
+    const previous = ++reads === 1
+    return route.fulfill({ json: {
+      read_at: previous ? '2026-11-18T15:59:45Z' : '2026-11-18T16:00:15Z',
+      day: previous ? '2026-11-18' : '2026-11-19', quota_day: '2026-11-18',
+      quota_resets_at: '2026-11-19T00:00:00Z',
+      today: { tokens: previous ? 58 : 0, requests: previous ? 1 : 0, estimated_requests: 0, unsettled_requests: 0 },
+      quota: { limit_tokens: 500000, used_tokens: 58 }, history: [],
+    } })
+  })
+  await page.clock.install({ time: new Date('2026-11-18T15:59:45Z') })
+  await page.getByRole('button', { name: '审计与用量' }).click()
+  const panel = page.getByRole('dialog', { name: '审计与用量' })
+  const today = panel.getByRole('region', { name: '今日模型用量' })
+  await expect(today).toContainText('2026-11-18')
+  await expect(panel.getByTestId('usage-read-at')).toContainText('23:59:45')
+  await panel.getByRole('button', { name: '刷新', exact: true }).waitFor()
+  await page.clock.fastForward(30_000)
+  await expect(today).toContainText('2026-11-19')
+  await expect(today).toContainText('0 tokens')
+  await expect(panel.getByTestId('usage-read-at')).toContainText('00:00:15')
+  expect(audits).toBe(2)
+  await panel.getByRole('button', { name: '关闭' }).click()
+  await page.clock.fastForward(30_000)
+  expect(reads).toBe(2)
+  expect(audits).toBe(2)
+})

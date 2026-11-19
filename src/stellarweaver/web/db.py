@@ -273,8 +273,12 @@ def model_usage(
 
 def usage_rows(engine: Engine, tenant: str, access: Access) -> list[JSONDict]:
     with scoped(engine, tenant) as conn:
-        rows = conn.execute(
-            text(f"""
+        return _usage_rows(conn, access)
+
+
+def _usage_rows(conn: Connection, access: Access) -> list[JSONDict]:
+    rows = conn.execute(
+        text(f"""
             SELECT u.member_id::text,m.name,u.usage_day,m.daily_tokens,
                 sum(u.tokens)::bigint AS tokens,count(*) AS requests,
                 count(*) FILTER (WHERE u.estimated) AS estimated_requests
@@ -285,9 +289,67 @@ def usage_rows(engine: Engine, tenant: str, access: Access) -> list[JSONDict]:
             GROUP BY u.member_id,m.name,u.usage_day,m.daily_tokens
             ORDER BY u.usage_day DESC,u.member_id LIMIT 100
         """),
-            _visible(access),
+        _visible(access),
+    )
+    return [dict(row) for row in rows.mappings()]
+
+
+def usage_today(engine: Engine, tenant: str, access: Access, *, at: str | None = None) -> JSONDict:
+    with scoped(engine, tenant) as conn:
+        clock = (
+            conn.execute(
+                text("""
+            WITH clock AS (
+                SELECT COALESCE(CAST(:at AS timestamptz),clock_timestamp()) AS read_at
+            )
+            SELECT read_at,(read_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
+                   (read_at AT TIME ZONE 'UTC')::date AS quota_day,
+                   (((read_at AT TIME ZONE 'UTC')::date+1)::timestamp AT TIME ZONE 'UTC')
+                       AS quota_resets_at
+            FROM clock
+            """),
+                {"at": at},
+            )
+            .mappings()
+            .one()
         )
-        return [dict(row) for row in rows.mappings()]
+        today = (
+            conn.execute(
+                text(f"""
+            SELECT coalesce(sum(u.tokens),0)::bigint AS tokens,count(*) AS requests,
+                   count(*) FILTER (WHERE u.estimated) AS estimated_requests,
+                   count(*) FILTER (WHERE NOT u.settled) AS unsettled_requests
+            FROM sw.model_usage u
+            JOIN sw.runs r ON (r.tenant_id,r.id)=(u.tenant_id,u.run_id)
+            JOIN sw.sessions s ON (s.tenant_id,s.id)=(r.tenant_id,r.session_id)
+            WHERE {_ACCESS}
+              AND u.started_at >= (CAST(:day AS timestamp) AT TIME ZONE 'Asia/Shanghai')
+              AND u.started_at < ((CAST(:day AS date)+1)::timestamp AT TIME ZONE 'Asia/Shanghai')
+            """),
+                {"day": clock["day"], **_visible(access)},
+            )
+            .mappings()
+            .one()
+        )
+        quota = (
+            conn.execute(
+                text("""
+            SELECT m.daily_tokens AS limit_tokens,coalesce(sum(u.tokens),0)::bigint AS used_tokens
+            FROM sw.memberships m LEFT JOIN sw.model_usage u
+              ON (u.tenant_id,u.member_id)=(m.tenant_id,m.id) AND u.usage_day=:quota_day
+            WHERE m.id=:member GROUP BY m.daily_tokens
+            """),
+                {"member": access.actor, "quota_day": clock["quota_day"]},
+            )
+            .mappings()
+            .one()
+        )
+        return {
+            **clock,
+            "today": dict(today),
+            "quota": dict(quota),
+            "history": _usage_rows(conn, access),
+        }
 
 
 class RequestConflict(Exception):

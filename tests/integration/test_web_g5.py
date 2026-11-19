@@ -88,6 +88,82 @@ def account(tenant: UUID, path: Path, role: str, name: str, **extra) -> Principa
 
 
 @pytest.mark.postgres
+def test_usage_days_and_read_only_skill_library(engine, tmp_path: Path) -> None:
+    tenant = uuid4()
+    admin = account(tenant, tmp_path, "admin", "Admin")
+    viewer = account(tenant, tmp_path, "viewer", "Viewer")
+    admin_key, viewer_key = uuid4().hex, uuid4().hex
+    headers = {"Authorization": "Bearer " + admin_key}
+    viewer_headers = {"Authorization": "Bearer " + viewer_key}
+    root = tmp_path / "host-skills"
+    document = root / "example" / "SKILL.md"
+    document.parent.mkdir(parents=True)
+    document.write_text(
+        "---\nname: example\ndescription: Local fixture\n---\nOnly show this text.\n"
+    )
+    app = create_app(
+        engine,
+        {admin_key: admin, viewer_key: viewer},
+        tmp_path / "state",
+        queued=True,
+        isolated=True,
+        skill_roots=(("Fixture", root),),
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        route = "/api/v1/admin/usage/overview"
+        assert client.get(route, headers=viewer_headers).status_code == 403
+        empty = client.get(route, headers=headers)
+        assert empty.status_code == 200, empty.text
+        assert empty.json()["today"]["tokens"] == 0
+        assert empty.json()["read_at"] and empty.json()["quota_resets_at"]
+        ids, _ = db.submit(
+            engine,
+            str(tenant),
+            next(iter(admin.workspace_map())),
+            str(uuid4()),
+            "Boundary fixture",
+            "deepseek",
+            member=admin.member_id,
+        )
+        with db.scoped(engine, str(tenant)) as conn:
+            conn.execute(
+                text("""
+                INSERT INTO sw.model_usage(tenant_id,run_id,request_index,member_id,usage_day,
+                                           started_at,tokens,settled,estimated) VALUES
+                (:tenant,:run,1,:member,'2026-11-18','2026-11-18 15:59:00+00',17,true,false),
+                (:tenant,:run,2,:member,'2026-11-18','2026-11-18 16:00:00+00',23,false,true),
+                (:tenant,:run,3,:member,'2026-11-18',NULL,5,true,false)
+                """),
+                {"tenant": str(tenant), "run": ids["run_id"], "member": admin.member_id},
+            )
+        assert admin.access is not None
+        previous = db.usage_today(engine, str(tenant), admin.access, at="2026-11-18T15:59:59Z")
+        assert previous["day"].isoformat() == "2026-11-18" and previous["today"]["tokens"] == 17
+        current = db.usage_today(engine, str(tenant), admin.access, at="2026-11-18T16:00:00Z")
+        assert current["day"].isoformat() == "2026-11-19"
+        assert current["today"] == dict(
+            tokens=23, requests=1, estimated_requests=1, unsettled_requests=1
+        )
+        assert current["history"][0]["tokens"] == 45 and current["quota"]["used_tokens"] == 45
+        reset = db.usage_today(engine, str(tenant), admin.access, at="2026-11-19T00:00:00Z")
+        assert reset["today"]["tokens"] == 23 and reset["quota"]["used_tokens"] == 0
+
+        route = "/api/v1/skills"
+        assert client.get(route).status_code == 401
+        listing = client.get(route, headers=viewer_headers).json()
+        assert listing["sources"] == ["Fixture"] and not listing["errors"]
+        (entry,) = listing["skills"]
+        assert entry["path"] == "example/SKILL.md" and "content" not in entry
+        detail = client.get(f"{route}/{entry['id']}", headers=viewer_headers).json()
+        assert detail["content"] == "Only show this text."
+        assert str(root) not in json.dumps(detail)
+        assert client.get(f"{route}/{'0' * 64}", headers=headers).status_code == 404
+        document.unlink()
+        assert client.get(f"{route}/{entry['id']}", headers=headers).status_code == 409
+        assert client.get(route + "?refresh=true", headers=headers).json()["skills"] == []
+
+
+@pytest.mark.postgres
 def test_team_access_quotas_audit_and_report_exports(engine, tmp_path: Path):
     repo, other = tmp_path / "repo", tmp_path / "other"
     repo.mkdir()
