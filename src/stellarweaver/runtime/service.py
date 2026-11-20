@@ -28,6 +28,7 @@ def build_agent(
     command_runner: CommandRunner | None = None,
     completion_check: CompletionCheck | None = None,
     chat_only: bool = False,
+    enable_web_search: bool = False,
 ) -> Agent:
     engine = PolicyEngine(
         config.policy.preset,
@@ -59,9 +60,11 @@ def build_agent(
         max_retry_delay_seconds=config.retry.max_delay_seconds,
         max_output_tokens=config.model.max_output_tokens,
         system_prompt="You are StellarWeaver. Answer the user's questions in their language. "
-        "This is a conversation without a project or tools."
+        "This conversation has no project. If ds_search is available, use it for requested web "
+        "lookups and time-sensitive facts. Link the sources you actually used."
         if chat_only
         else None,
         project_context=not chat_only,
         completion_check=completion_check,
+        enable_web_search=enable_web_search,
     )

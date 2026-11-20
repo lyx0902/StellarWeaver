@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent, type PointerEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, receive, type Approval, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type Thread, type Workspaces } from './api'
+import { api, receive, type Approval, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type Thread, type Workspace, type Workspaces } from './api'
 import { AdminPanel } from './admin'
 import { ApprovalCard, ContextMeter, Turn, runLabel } from './conversation'
 import { Inspector, type InspectorTab } from './inspector'
-import { ProjectPicker, WorkspaceGroup } from './projects'
+import { ProjectAliasDialog, ProjectPicker, WorkspaceGroup } from './projects'
 import { SkillsPanel } from './skills'
 import { ExperimentPanel } from './experiment'
 import './style.css'
@@ -47,6 +47,7 @@ function App() {
   const [panel, setPanel] = useState<InspectorTab | null>(null)
   const [showNavigation, setShowNavigation] = useState(false)
   const [showPicker, setShowPicker] = useState(false)
+  const [renameTarget, setRenameTarget] = useState<Workspace | null>(null)
   const [width, setWidth] = useState(() => clampWidth(Number(localStorage.getItem(widthKey)) || 420))
   const request = useRef<{ input: string; id: string } | null>(null)
   const reviewRequest = useRef<{ input: string; id: string } | null>(null)
@@ -355,6 +356,16 @@ function App() {
     newThread(config.workspaces.find(item => item.path === directory.display_path)?.id)
   }
 
+  async function renameProject(item: Workspace, alias: string) {
+    const updated = await api<{ alias: string | null; label: string }>(token, 'workspaces/' + item.id, {
+      method: 'PATCH', body: JSON.stringify({ alias }),
+    })
+    setListing(current => current ? {
+      ...current,
+      workspaces: current.workspaces.map(project => project.id === item.id ? { ...project, ...updated } : project),
+    } : current)
+  }
+
   async function archive(thread: Thread) {
     try {
       await api<void>(token, 'threads/' + thread.session_id, {
@@ -474,7 +485,7 @@ function App() {
           threads={threads.filter(thread => thread.workspace_id === item.id)} selectedSession={run?.session_id}
           runId={runId} selectedWorkspace={selectedWorkspace} waiting={Boolean(approval)} writable={writable}
           manage={Boolean(listing.manage_workspaces)} onNew={newThread} onOpen={openRun}
-          onArchive={thread => void archive(thread)} />)}
+          onArchive={thread => void archive(thread)} onRename={setRenameTarget} />)}
         {!threads.length && <p className="sidebar-empty">还没有线程。</p>}
       </nav>
       <div className="sidebar-footer">
@@ -557,26 +568,30 @@ function App() {
             }}
             placeholder={!writable ? '你的角色可以查看此项目的会话。' : active ? '本轮运行中，可先写下追问…' : canContinue ? '继续追问这个线程…' : '描述我可以帮你完成的任务…'} />
           <div className="composer-toolbar">
-            {!runId && listing.workspaces.length > 1 && <label className="inline-label">项目
-              <select value={workspace} onChange={event => setWorkspace(event.target.value)}>
-                {listing.workspaces.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
-              </select></label>}
-            {currentProject?.path && <code className="composer-path" title={currentProject.path}>{currentProject.path}</code>}
-            {listing.repair_enabled && !chatting && <label className="inline-label">
-              <span className="sr-only">运行模式</span>
-              <select value={mode} onChange={event => setMode(event.target.value as Mode)}>
-                <option value="read-only">只读</option><option value="repair">修复 · 逐项审批</option>
-              </select></label>}
-            <span className="model-label">{listing.provider === 'deepseek' ? 'DeepSeek · deepseek-flash' : 'FakeModel · 离线'}</span>
+            <div className="composer-meta">
+              {!runId && listing.workspaces.length > 1 && <label className="inline-label composer-workspace">项目
+                <select value={workspace} onChange={event => setWorkspace(event.target.value)}>
+                  {listing.workspaces.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}
+                </select></label>}
+              <span className="model-label">{listing.provider === 'deepseek' ? 'DeepSeek · deepseek-flash' : 'FakeModel · 离线'}</span>
+            </div>
             <div className="composer-end">
-              <ContextMeter events={visibleEvents} limit={listing.context_window_tokens} />
               {writable && run?.status === 'active' && <button type="button" disabled={stopping} onClick={() => void cancel()}>
                 {stopping ? '正在取消…' : '取消运行'}</button>}
-              <button className="primary send-button" disabled={!canSend || !draft.trim()}>
-                {submitting ? '提交中…' : runId ? '发送追问' : chatting ? '发送' : mode === 'repair' ? '运行修复任务' : '运行只读任务'}
-              </button>
+              <div className="composer-submit">
+                <ContextMeter events={visibleEvents} limit={listing.context_window_tokens} />
+                {listing.repair_enabled && !chatting && <label className="inline-label composer-mode">
+                  <span className="sr-only">运行模式</span>
+                  <select value={mode} onChange={event => setMode(event.target.value as Mode)}>
+                    <option value="read-only">只读</option><option value="repair">修复 · 逐项审批</option>
+                  </select></label>}
+                <button className="primary send-button" disabled={!canSend || !draft.trim()}>
+                  {submitting ? '提交中…' : runId ? '发送追问' : chatting ? '发送' : mode === 'repair' ? '运行修复任务' : '运行只读任务'}
+                </button>
+              </div>
             </div>
           </div>
+          {currentProject?.path && <code className="composer-path" title={currentProject.path}>{currentProject.path}</code>}
         </form>
       </div>
     </section>
@@ -606,6 +621,8 @@ function App() {
     {showExperiment && listing.experiment_available &&
       <ExperimentPanel token={token} onClose={() => setShowExperiment(false)} />}
     {showPicker && <ProjectPicker onClose={() => setShowPicker(false)} onCreate={createProject} />}
+    {renameTarget && <ProjectAliasDialog item={renameTarget} onClose={() => setRenameTarget(null)}
+      onSave={alias => renameProject(renameTarget, alias)} />}
   </main>
 }
 

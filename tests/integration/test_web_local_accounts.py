@@ -225,6 +225,27 @@ def test_password_accounts_workspace_selection_archives_and_chat(
             ws = owner.get("/api/v1/workspaces").json()["workspaces"]
             assert [entry["label"] for entry in ws] == ["legacy", "second", "普通对话"]
             assert ws[1]["path"] == "D:/Projects/second" and ws[-1]["kind"] == "chat"
+            assert ws[1]["alias"] is None and ws[1]["default_label"] == "second"
+            rename = f"/api/v1/workspaces/{ws[1]['id']}"
+            assert owner.patch(rename, json={"alias": "blocked"}).status_code == 403
+            assert (
+                other.patch(rename, headers=HEADERS, json={"alias": "blocked"}).status_code == 404
+            )
+            assert (
+                owner.patch(
+                    f"/api/v1/workspaces/{ws[-1]['id']}", headers=HEADERS, json={"alias": "chat"}
+                ).status_code
+                == 404
+            )
+            for invalid in ("x" * 81, "two\nlines"):
+                assert (
+                    owner.patch(rename, headers=HEADERS, json={"alias": invalid}).status_code == 422
+                )
+            updated = owner.patch(rename, headers=HEADERS, json={"alias": "  我的实验  "})
+            assert updated.status_code == 200
+            assert updated.json() == {"alias": "我的实验", "label": "我的实验"}
+            listed = owner.get("/api/v1/workspaces").json()["workspaces"][1]
+            assert listed == {**ws[1], "alias": "我的实验", "label": "我的实验"}
             assert start(other, ws[1]["id"], "blocked project").status_code == 404
             assert start(other, ws[-1]["id"], "blocked chat").status_code == 404
             assert start(owner, ws[-1]["id"], "no tools", mode="repair").status_code == 422
@@ -279,6 +300,12 @@ def test_password_accounts_workspace_selection_archives_and_chat(
                 == 204
             )
             assert owner.get("/api/v1/workspaces").json()["account"]["name"] == "owner-test"
+            persisted = owner.get("/api/v1/workspaces").json()["workspaces"][1]
+            assert persisted["alias"] == "我的实验" and persisted["id"] == ws[1]["id"]
+            assert owner.patch(rename, headers=HEADERS, json={"alias": " "}).json() == {
+                "alias": None,
+                "label": "second",
+            }
             with engine.connect() as db_conn:
                 value = db_conn.execute(
                     text("SELECT password_hash FROM sw.local_accounts WHERE username='owner-test'")

@@ -6,10 +6,15 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import cast
+from urllib.parse import urlsplit
 
 import httpx
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, AsyncOpenAI, omit
-from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
+from openai.types.chat import (
+    ChatCompletionMessage,
+    ChatCompletionMessageParam,
+    ChatCompletionToolUnionParam,
+)
 
 from stellarweaver.config import ModelConfig
 from stellarweaver.context.manager import thinking_history
@@ -148,6 +153,56 @@ def serialize_message(message: Message, *, include_reasoning: bool = False) -> J
     return value
 
 
+def _public_sources(message: ChatCompletionMessage) -> tuple[JSONDict, ...]:
+    """Project evidence from executed server searches and prioritize cited sources."""
+    steps = (message.model_extra or {}).get("server_tool_calls")
+    if not isinstance(steps, list):
+        return ()
+    sources: dict[str, JSONDict] = {}
+    for step in steps:
+        if not isinstance(step, dict) or not isinstance(step.get("calls"), list):
+            continue
+        for call in step["calls"]:
+            if not isinstance(call, dict) or call.get("status") != "completed":
+                continue
+            if call.get("kind") not in ("search", "deep_search"):
+                continue
+            values = call.get("sources")
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url")
+                if not isinstance(url, str) or len(url) > 2000 or any(c.isspace() for c in url):
+                    continue
+                try:
+                    parts = urlsplit(url)
+                    if (
+                        parts.scheme not in {"http", "https"}
+                        or not parts.hostname
+                        or parts.username is not None
+                        or parts.password is not None
+                    ):
+                        continue
+                except ValueError:
+                    continue
+                limits = {"title": 180, "snippet": 400, "published_at": 40}
+                fields = {
+                    key: item[key][:limit]
+                    for key, limit in limits.items()
+                    if isinstance(item.get(key), str) and item[key]
+                }
+                sources.setdefault(url, {"url": url, **fields})
+    cited = dict.fromkeys(
+        citation.url
+        for annotation in message.annotations or []
+        if (citation := getattr(annotation, "url_citation", None)) and isinstance(citation.url, str)
+    )
+    ordered_urls = dict.fromkeys([*cited, *sources])
+    return tuple(sources[url] for url in ordered_urls if url in sources)[:6]
+
+
 class OpenAICompatibleChatProvider:
     """One request per complete call; SDK retries disabled for visible budget accounting."""
 
@@ -182,6 +237,15 @@ class OpenAICompatibleChatProvider:
             context_window_tokens=self.config.context_window_tokens,
             requires_reasoning_history=self._thinking_enabled,
             request_settings=settings,
+            web_search=self._web_search_available,
+        )
+
+    @property
+    def _web_search_available(self) -> bool:
+        return (
+            self.config.provider == "deepseek"
+            and self.config.model == "deepseek-flash"
+            and self.config.supports_tools
         )
 
     @property
@@ -210,23 +274,31 @@ class OpenAICompatibleChatProvider:
     async def complete(self, request: ModelRequest) -> AssistantReply:
         if request.tools and not self.config.supports_tools:
             raise ProviderError("Configured provider does not support function tools")
+        tools = list(request.tools)
+        extra_body = self._vendor_parameters()
+        if request.web_search:
+            if not self._web_search_available or tools:
+                raise ProviderError(
+                    "DeepSeek server search requires a separate DeepSeek Flash request"
+                )
+            if len(request.messages) != 1 or request.messages[0].role != "user":
+                raise ProviderError("DeepSeek server search accepts one public query")
+            tools = [{"type": "deepseek_web_search"}]
+            extra_body = {"thinking": {"type": "disabled"}}
         try:
             response = await self._client.chat.completions.create(
                 model=self.config.model,
                 messages=self._messages(request),
-                tools=(
-                    cast(list[ChatCompletionToolUnionParam], list(request.tools))
-                    if request.tools
-                    else omit
-                ),
+                tools=(cast(list[ChatCompletionToolUnionParam], tools) if tools else omit),
                 max_tokens=min(request.max_output_tokens, self.config.max_output_tokens),
                 stream=False,
-                extra_body=self._vendor_parameters(),
+                extra_body=extra_body,
             )
         except (APIError, httpx.HTTPError) as exc:
             raise _provider_failure(exc) from exc
-        if len(response.choices) != 1:
-            raise ProviderError("Expected exactly one complete assistant choice")
+        usage = usage_fields(response.usage) if response.usage is not None else None
+        if not response.choices or len(response.choices) != 1:
+            raise ProviderError("Expected exactly one complete assistant choice", usage=usage)
         choice = response.choices[0]
         if choice.finish_reason is None:
             raise ProviderError("Model response did not include a complete stop reason")
@@ -239,7 +311,6 @@ class OpenAICompatibleChatProvider:
                 raise ProviderError("Provider returned an invalid or duplicate tool call ID")
             seen.add(call.id)
             calls.append(ToolCall(call.id, call.function.name, call.function.arguments))
-        usage = usage_fields(response.usage) if response.usage is not None else None
         if choice.finish_reason != "length" and bool(calls) != (
             choice.finish_reason == "tool_calls"
         ):
@@ -264,10 +335,11 @@ class OpenAICompatibleChatProvider:
             reasoning_content=reasoning,
             provider_model=response.model,
             provider_fingerprint=response.system_fingerprint,
+            web_sources=_public_sources(choice.message) if request.web_search else (),
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        if not self.config.supports_streaming:
+        if request.web_search or not self.config.supports_streaming:
             # Explicitly configured fallback produces one complete response, with no
             # intermediate arguments or pretend streamed network request.
             reply = await self.complete(request)

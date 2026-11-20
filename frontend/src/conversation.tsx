@@ -61,7 +61,12 @@ function Process({ events, settled, onLogs }: {
             ? <Answer text={event.payload.content ?? ''} />
             : <><strong>{eventLabel(event)}</strong>{event.payload.status && <span>{event.payload.status}</span>}
               {event.payload.code && <code>{event.payload.code}</code>}
-              {event.payload.content && <details><summary>查看工具输出</summary><pre>{event.payload.content}</pre></details>}</>}
+              {event.payload.sources?.length ? <details>
+                <summary>查看搜索来源（{event.payload.sources.length}）</summary>
+                <div className="search-sources">{event.payload.sources.map(source =>
+                  <a key={source.url} href={source.url} target="_blank" rel="noreferrer">{source.title || source.url}</a>
+                )}</div>
+              </details> : event.payload.content && <details><summary>查看工具输出</summary><pre>{event.payload.content}</pre></details>}</>}
         </li>)}
       </ul>
       <button className="quiet" type="button" onClick={onLogs}>查看完整日志</button>
@@ -145,7 +150,8 @@ export function Turn({ run, events, focused, approval, hasReport, onOpen, onLogs
 }
 
 export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: number }) {
-  const started = events.filter(event => event.type === 'model.started').at(-1)
+  const [open, setOpen] = useState(false)
+  const started = events.filter(event => event.type === 'model.started' && event.payload.purpose !== 'ds_search').at(-1)
   const completed = events.filter(event =>
     event.type === 'model.completed' && event.payload.request_index === started?.payload.request_index).at(-1)
   const payload = completed?.payload ?? started?.payload
@@ -155,11 +161,24 @@ export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: num
   const formatted = (n: number) => n.toLocaleString('zh-CN')
   const label = used === undefined ? '等待统计' : (estimated ? '约 ' : '') + formatted(used)
   const ratio = used === undefined ? 0 : Math.min(100, (used / window) * 100)
-  const help = '最近一次模型请求的输入 token，包含系统指令、工具和已投影的对话。发送前按估算显示，收到模型用量后更新。窗口含预留的输出空间。'
-  return <span className="context-meter" data-testid="context-usage" title={help}
-    aria-label={'上下文用量 ' + label + ' / ' + formatted(window) + ' tokens'} tabIndex={0}>
-    <span className="context-ring" aria-hidden="true"
-      style={{ background: 'conic-gradient(var(--accent) ' + ratio + '%, var(--line) 0)' }} />
-    <span>上下文 <b>{label}</b> / {formatted(window)}</span>
+  return <span className="context-meter" data-testid="context-usage"
+    onMouseEnter={() => setOpen(true)} onMouseLeave={event => {
+      if (!event.currentTarget.contains(document.activeElement)) setOpen(false)
+    }}>
+    <button type="button" className="context-trigger"
+      aria-label={'上下文用量 ' + label + ' / ' + formatted(window) + ' tokens'}
+      onFocus={() => setOpen(true)} onBlur={() => setOpen(false)} onClick={() => setOpen(true)}
+      onKeyDown={event => {
+        if (event.key === 'Escape' && open) {
+          event.stopPropagation()
+          setOpen(false)
+        }
+      }}>
+      <span className="context-ring" aria-hidden="true"
+        style={{ background: 'conic-gradient(var(--accent) ' + ratio + '%, var(--line) 0)' }} />
+    </button>
+    {open && <span className="context-tooltip" role="tooltip">
+      <span>上下文</span><span><b>{label}</b> / {formatted(window)}</span>
+    </span>}
   </span>
 }

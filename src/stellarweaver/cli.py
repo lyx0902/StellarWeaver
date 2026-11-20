@@ -256,6 +256,7 @@ async def execute_task(
                 approval=ui.approve,
                 policy_file=policy_file,
                 stream=stream is not False,
+                enable_web_search=True,
                 preflight=lambda registry: (
                     lambda: task_extensions(
                         registry, store, ui, extensions, trust_workspace, skill_dirs
@@ -324,6 +325,7 @@ async def execute_chat(
                 retry_base_seconds=config.retry.base_delay_seconds,
                 max_retry_delay_seconds=config.retry.max_delay_seconds,
                 max_output_tokens=config.model.max_output_tokens,
+                enable_web_search=True,
             )
             changes = ChangesManager(workspace, store, engine, on_event=ui.event)
             build_preset = engine.preset
@@ -401,7 +403,8 @@ async def execute_chat(
                                 await candidate.aclose()
                             raise
                         previous = model
-                        model, agent.provider, config = candidate, candidate, next_config
+                        agent.set_provider(candidate)
+                        model, config = candidate, next_config
                         store.set_config(config.model_dump())
                         store.append_event(
                             "model.changed",
@@ -560,6 +563,7 @@ async def execute_resume(
                 retry_base_seconds=config.retry.base_delay_seconds,
                 max_retry_delay_seconds=config.retry.max_delay_seconds,
                 max_output_tokens=config.model.max_output_tokens,
+                enable_web_search=True,
             )
             outcome = await agent.resume(task)
             ui.outcome(outcome)

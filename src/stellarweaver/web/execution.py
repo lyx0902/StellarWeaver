@@ -125,6 +125,7 @@ async def run(
                 on_delta=on_delta,
                 command_runner=runner,
                 chat_only=journal.chat,
+                enable_web_search=True,
             )
             interruption = journal.latest_interruption() if continuation else None
             if interruption is not None:

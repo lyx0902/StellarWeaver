@@ -54,6 +54,7 @@ class AssistantReply:
     reasoning_content: str | None = field(default=None, repr=False, compare=False)
     provider_model: str | None = None
     provider_fingerprint: str | None = None
+    web_sources: tuple[JSONDict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class ModelRequest:
     messages: tuple[Message, ...]
     tools: tuple[JSONDict, ...] = ()
     max_output_tokens: int = 4096
+    web_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,7 @@ class ModelCapabilities:
     context_window_tokens: int | None = 100_000
     requires_reasoning_history: bool = False
     request_settings: JSONDict = field(default_factory=dict)
+    web_search: bool = False
 
 
 @dataclass(frozen=True)

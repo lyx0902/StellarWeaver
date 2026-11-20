@@ -1,4 +1,7 @@
-export type Workspace = { id: string; label: string; kind?: 'chat' | 'project'; path?: string | null }
+export type Workspace = {
+  id: string; label: string; kind?: 'chat' | 'project'; path?: string | null
+  alias?: string | null; default_label?: string
+}
 export type Workspaces = {
   provider: string; repair_enabled: boolean; isolated?: boolean;
   context_window_tokens: number; workspaces: Workspace[]
@@ -61,6 +64,8 @@ export type RunEvent = {
     request_index?: number
     input_tokens?: number; context_window_tokens?: number; input_estimated?: boolean; estimated?: boolean
     has_tools?: boolean
+    purpose?: string
+    sources?: { url: string; title?: string }[]
   }
 }
 

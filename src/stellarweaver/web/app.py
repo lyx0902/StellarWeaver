@@ -32,6 +32,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from stellarweaver.config import ModelConfig
 from stellarweaver.domain import JSONDict
+from stellarweaver.policy import DS_SEARCH
 from stellarweaver.tools.workspace import ToolError
 from stellarweaver.web import db, local_accounts
 from stellarweaver.web.approval import (
@@ -152,6 +153,11 @@ class Decision(BaseModel):
     decision: Literal["approve", "deny"]
 
 
+class WorkspaceAlias(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    alias: Annotated[str, Field(max_length=80, pattern=r"^[^\r\n]*$")]
+
+
 def public_event(event: JSONDict) -> JSONDict:
     """Use an explicit web projection; internal journal entries stay intact."""
     kind, payload = event["type"], event["payload"]
@@ -178,6 +184,8 @@ def public_event(event: JSONDict) -> JSONDict:
         visible = {k: payload[k] for k in ("tool_name", "status", "operation_id") if k in payload}
         if payload.get("status") == "ok":
             visible["content"] = str(payload.get("content", ""))[:12000]
+            if payload.get("tool_name") == DS_SEARCH:
+                visible["sources"] = payload.get("data", {}).get("sources", [])
         else:
             visible["code"] = payload.get("data", {}).get("code")
             visible["exit_code"] = payload.get("data", {}).get("exit_code")
@@ -190,6 +198,7 @@ def public_event(event: JSONDict) -> JSONDict:
                 "input_tokens",
                 "input_estimated",
                 "estimated",
+                "purpose",
             )
             if key in payload
         }
@@ -527,6 +536,8 @@ def create_app(
                 {
                     "id": item["id"],
                     "label": item["label"],
+                    "default_label": item["default_label"],
+                    "alias": item["alias"],
                     "path": local.describe(item["relative_path"])
                     if item["relative_path"] is not None
                     else None,
@@ -564,6 +575,20 @@ def create_app(
         except (OSError, ValueError) as exc:
             raise HTTPException(422, "请选择本机项目目录内可访问的 Git 仓库。") from exc
         return Response(status_code=204)
+
+    @app.patch("/api/v1/workspaces/{workspace_id}")
+    def set_workspace_alias(
+        workspace_id: UUID, body: WorkspaceAlias, p: Principal = require_principal
+    ) -> JSONDict:
+        require_write(p)
+        if local is None or p.local_projects is None or p.member_id is None:
+            raise HTTPException(404)
+        renamed = local_accounts.rename_project(
+            engine, str(p.tenant), p.member_id, str(workspace_id), body.alias or None
+        )
+        if renamed is None:
+            raise HTTPException(404, "找不到项目工作区。")
+        return renamed
 
     @app.get("/api/v1/threads")
     async def threads(p: Principal = require_principal) -> list[JSONDict]:

@@ -58,7 +58,7 @@ flowchart LR
 | `AgentEvent.seq` | 按事件顺序定位会话记录。Web 用它作为 SSE 补读游标。 |
 | `RunOutcome` | 保存运行终态、验证状态、证据、计量和回复。CLI 运行时将 `task_assessment` 保持为 `unknown`，独立评测随后按任务规则判定。 |
 
-`build_agent` 是公共装配点。它用 Journal 的工作区创建 `PolicyEngine` 和 `ToolRegistry`，再把模型、边界配置、审批回调、可选的命令执行器和通知回调交给 `Agent`。CLI 将审批连接到终端，Web 修复连接到 `ApprovalGate`，普通对话用 `chat_only` 关闭内置工具和仓库上下文。
+`build_agent` 是公共装配点。它用 Journal 的工作区创建 `PolicyEngine` 和 `ToolRegistry`，再把模型、边界配置、审批回调、可选的命令执行器和通知回调交给 `Agent`。CLI 将审批连接到终端，Web 修复连接到 `ApprovalGate`，普通对话用 `chat_only` 关闭仓库工具和仓库上下文。
 
 主循环 `_drive` 收集工具 schema，准备模型请求并获取回复。它先核验工具调用 ID，然后由 Journal 把 assistant 消息和计划操作落库。`_tools` 按回复里的顺序调用工具。每个结果接入消息序列后，下一次模型请求才能从这些结果继续。测试退出码非零会作为工具错误交给模型，便于继续修复；连续三次相同的工具失败、权限阻断、预算耗尽或无法确认的执行状态会提前结束。本轮已经声明但尚未执行的调用会补上对应结果，保持消息配对完整。 [领域类型](../src/stellarweaver/domain/__init__.py) · [公共装配点](../src/stellarweaver/runtime/service.py) · [主循环](../src/stellarweaver/runtime/loop.py)
 
@@ -100,6 +100,7 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 | `edit_file` | 要求 `expected_sha256` 和唯一匹配的旧文本，生成差异供预览。授权后复检，将修改前快照和差异保存为制品，再写同目录临时文件并替换。 |
 | `run_command` | 参数采用 argv 和工作目录，返回退出码、输出、超时、取消与清理状态。Web 可注入验证执行器，CLI 默认使用宿主后端。 |
 | `git_status`、`git_diff` | 调用 workspace 范围内的 Git 查询，返回版本控制证据。 |
+| `ds_search` | CLI 和 Web 选用 DeepSeek Flash 时注册。将公开查询交给单独的 Chat Completions 请求，由 DeepSeek 执行服务端搜索。工具只公布成功搜索返回的网页来源，并将模型用量纳入原有预算。 |
 
 `PolicyEngine` 根据预设与显式授权计算结果。`read-only` 开放内置读工具与经用户配置确认的只读 MCP 调用，已明确授权的 MCP 启动单独判定。`workspace-edit` 放行内置编辑，命令依然按策略判断。`ask` 可交由交互回调。授权文件绑定工作区，命令匹配完整 argv 与 cwd，内置修改匹配显式文件路径。有相应权限才能在非交互场景执行写入或命令。仓库指令影响任务选择和复检，授权来自程序策略与用户决定。 [注册表](../src/stellarweaver/tools/registry.py) · [策略](../src/stellarweaver/policy/__init__.py) · [文件工具](../src/stellarweaver/tools/files.py) · [工作区](../src/stellarweaver/tools/workspace.py)
 
@@ -218,7 +219,7 @@ sequenceDiagram
 
 ## 普通对话与恢复
 
-普通对话在本机账号注册时取得独立工作区标识。该工作区的项目相对路径为空。用户从侧栏顶部创建普通对话，API 据此按 `read-only` 接收入队。worker 为会话准备独立状态目录，执行层以 `chat_only` 选项装配 Agent。该路径继续使用可见消息、预算和流式输出，关闭仓库索引、`AGENTS.md`、内置工具和验证执行器。新回复和用量按相同的 Web Journal 与 SSE 协议返回。 [本机账号与工作区](../src/stellarweaver/web/local_accounts.py) · [任务准备](../src/stellarweaver/web/worker.py) · [Agent 装配](../src/stellarweaver/runtime/service.py)
+普通对话在本机账号注册时取得独立工作区标识。该工作区的项目相对路径为空。用户从侧栏顶部创建普通对话，API 据此按 `read-only` 接收入队。worker 为会话准备独立状态目录，执行层以 `chat_only` 选项装配 Agent。该路径沿用可见消息、预算和流式输出，关闭仓库索引、`AGENTS.md`、仓库工具和验证执行器。DeepSeek Flash 可使用 `ds_search`，独立搜索请求只包含本次公开查询，基础会话继续沿用 DeepSeek Thinking 配置。新回复、工具证据和用量按相同的 Web Journal 与 SSE 协议返回。 [本机账号与工作区](../src/stellarweaver/web/local_accounts.py) · [任务准备](../src/stellarweaver/web/worker.py) · [Agent 装配](../src/stellarweaver/runtime/service.py)
 
 Web 追问沿用已有 `session_id`，服务端为本轮生成新的 `run_id`。在 `history` 续接方式下，`PgJournal.prior_turns` 从至多 8 次已完成且非复验的历史运行中提取用户任务和最终可见回答，并按时间顺序传给模型。`fresh` 从当前提示开始，项目任务仍复用原 worktree。历史工具意图和执行记录保存在数据库中，续接会使用新的工具调用与审批记录。 [历史读取](../src/stellarweaver/web/journal.py) · [Web 执行](../src/stellarweaver/web/execution.py)
 

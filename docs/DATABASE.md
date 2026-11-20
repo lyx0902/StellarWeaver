@@ -4,7 +4,7 @@ StellarWeaver 有两套持久化路径。Web 工作台使用 PostgreSQL 管理�
 
 ## 本机 PostgreSQL 连接
 
-当前工作台使用 `postgres:17`，源码的 Alembic 最新迁移为 `g7_model_usage_time`。从 PyCharm 的 **Database → Data Source → PostgreSQL** 创建连接，填写下列参数。选择 **Test Connection** 后，在架构列表中选中 `sw`，需要查看迁移版本时同时选中 `public`。
+当前工作台使用 `postgres:17`，源码的 Alembic 最新迁移为 `g8_workspace_alias`。从 PyCharm 的 **Database → Data Source → PostgreSQL** 创建连接，填写下列参数。选择 **Test Connection** 后，在架构列表中选中 `sw`，需要查看迁移版本时同时选中 `public`。
 
 | 配置 | 当前本机工作台 |
 | --- | --- |
@@ -116,6 +116,9 @@ erDiagram
 | --- | --- |
 | `tenant_id`, `workspace_id` | `uuid`，组成主键，同时引用同一租户的 `workspaces`。 |
 | `relative_path` | `text`，可为 `NULL`。有值时是相对于本机受管项目根目录的路径，`NULL` 表示普通对话分组。 |
+| `alias` | `varchar(80)`，可为 `NULL`。本机项目的显示别名。为空时使用 `workspaces.label`，普通对话分组不设别名。 |
+
+修改别名需要该项目的成员授权。应用角色只获得别名列的更新权限，项目路径及历史会话归属继续使用原有字段与工作区 ID。 [别名迁移](../src/stellarweaver/web/migrations/versions/g8_workspace_alias.py)
 
 `UNIQUE (tenant_id, relative_path)` 防止同一租户重复登记同一项目目录。常规 PostgreSQL 唯一约束允许出现多个 `NULL`，普通对话分组的唯一性由注册代码使用 `UUIDv5(tenant_id, "personal-chat")` 和主键实现。添加项目时，应用检查目录是否位于允许的范围、是否存在及是否为受支持的 Git 目录，再保存相对路径。真实目录和文件内容位于文件系统。 [目录检查及登记](../src/stellarweaver/web/local_accounts.py) · [本机账号迁移](../src/stellarweaver/web/migrations/versions/g6_local_accounts.py)
 
@@ -288,7 +291,7 @@ erDiagram
 
 ### `public.alembic_version`
 
-`version_num` 为 `varchar(32)` 主键，由 Alembic 随迁移更新。当前源码的迁移历史为单线，最新版本是 `g7_model_usage_time`。版本表位于 `public`，与 `sw` 的业务事务及租户隔离独立。排查表或字段缺失时，可先查询该版本，再查看对应迁移增加了哪些结构。 [迁移环境](../src/stellarweaver/web/migrations/env.py)
+`version_num` 为 `varchar(32)` 主键，由 Alembic 随迁移更新。当前源码的迁移历史为单线，最新版本是 `g8_workspace_alias`。版本表位于 `public`，与 `sw` 的业务事务及租户隔离独立。排查表或字段缺失时，可先查询该版本，再查看对应迁移增加了哪些结构。 [迁移环境](../src/stellarweaver/web/migrations/env.py)
 
 | Revision | 内容 |
 | --- | --- |
@@ -299,6 +302,7 @@ erDiagram
 | `g5_identity` | 成员、项目授权、审计、用量、浏览器会话和运行归属。 |
 | `g6_local_accounts` | 本机账号、可选项目目录与线程归档。 |
 | `g7_model_usage_time` | 请求开始时间、历史回填和本地日期聚合索引。 |
+| `g8_workspace_alias` | 本机项目别名列、约束和列级更新授权。 |
 
 通过 Compose 启动时，`migrate` 服务先用管理员权限升级，再启动日常服务。开发环境可以用 `STELLARWEAVER_MIGRATION_DSN` 指定管理员 DSN 后运行 `uv run --locked --extra web python -m stellarweaver.web migrate`，并通过 `STELLARWEAVER_DATABASE_DSN` 为 API 或 worker 提供应用账号 DSN。数据库镜像初始化脚本在首次创建空数据卷时建立数据库角色。运行中的密码轮换需同步更新数据库角色与 Compose 配置。
 

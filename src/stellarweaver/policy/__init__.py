@@ -10,8 +10,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+DS_SEARCH = "ds_search"
 READ_TOOLS = frozenset(
-    {"list_files", "read_file", "search_text", "git_status", "git_diff", "load_skill"}
+    {"list_files", "read_file", "search_text", "git_status", "git_diff", "load_skill", DS_SEARCH}
 )
 EDIT_TOOLS = frozenset({"create_file", "edit_file"})
 
@@ -153,6 +154,8 @@ class PolicyEngine:
         tool = invocation["tool"]
         if self.workspace is not None and Path(invocation["workspace"]) != self.workspace:
             return {"decision": "deny", "reason": "Workspace does not match frozen policy"}
+        if tool == DS_SEARCH:
+            return {"decision": "allow", "reason": "DeepSeek public web search"}
         if tool in READ_TOOLS:
             return {"decision": "allow", "reason": "Built-in workspace read"}
         if invocation.get("remote") and invocation.get("confirmed_read_only"):

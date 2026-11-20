@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { api, type Thread, type Workspace } from './api'
 import { runLabel } from './conversation'
 
@@ -51,11 +51,61 @@ export function ProjectPicker({ onClose, onCreate }: { onClose: () => void; onCr
   </dialog>
 }
 
+export function ProjectAliasDialog({ item, onClose, onSave }: {
+  item: Workspace; onClose: () => void; onSave: (alias: string) => Promise<void>
+}) {
+  const dialog = useRef<HTMLDialogElement>(null)
+  const [alias, setAlias] = useState(item.alias ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { dialog.current?.showModal() }, [])
+
+  function close() {
+    dialog.current?.close()
+    onClose()
+  }
+
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (saving) return
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(alias.trim())
+      close()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setSaving(false)
+    }
+  }
+
+  return <dialog className="project-picker project-alias-dialog" ref={dialog}
+    aria-labelledby="project-alias-heading" onCancel={event => {
+      event.preventDefault()
+      if (!saving) close()
+    }} onKeyDown={event => { if (event.key === 'Escape') event.stopPropagation() }}>
+    <form onSubmit={save}>
+      <h2 id="project-alias-heading">修改工作区别名</h2>
+      <label htmlFor="project-alias">工作区别名</label>
+      <input id="project-alias" autoFocus value={alias} maxLength={80} disabled={saving}
+        aria-describedby="project-alias-hint" placeholder={item.default_label ?? item.label}
+        onChange={event => setAlias(event.target.value)} />
+      <p id="project-alias-hint" className="muted">留空恢复原名称。</p>
+      {error && <p className="notice" role="alert">{error}</p>}
+      <footer>
+        <button type="button" disabled={saving} onClick={close}>取消</button>
+        <button className="primary" type="submit" disabled={saving}>{saving ? '正在保存…' : '保存'}</button>
+      </footer>
+    </form>
+  </dialog>
+}
+
 export function WorkspaceGroup({ item, threads, selectedSession, runId, selectedWorkspace, waiting, writable, manage,
-  onNew, onOpen, onArchive }: {
+  onNew, onOpen, onArchive, onRename }: {
   item: Workspace; threads: Thread[]; selectedSession?: string; runId: string; selectedWorkspace?: string
   waiting: boolean; writable: boolean; manage: boolean; onNew: (id: string) => void
   onOpen: (id: string) => void; onArchive: (thread: Thread) => void
+  onRename: (item: Workspace) => void
 }) {
   function row(thread: Thread) {
     const selected = thread.session_id === selectedSession || thread.run_id === runId
@@ -82,7 +132,12 @@ export function WorkspaceGroup({ item, threads, selectedSession, runId, selected
         <summary>已归档 · {archived.length}</summary>{archived.map(row)}
       </details>}
     </details>
-    {writable && <button type="button" className="project-new" aria-label={'在 ' + item.label + ' 新建任务'}
-      title="在此工作区新建任务" onClick={() => onNew(item.id)}>＋</button>}
+    {writable && <div className="project-actions">
+      {manage && item.kind === 'project' && <button type="button" className="project-edit"
+        aria-label={'修改 ' + item.label + ' 的别名'} title="修改工作区别名"
+        onClick={() => onRename(item)}>✎</button>}
+      <button type="button" className="project-new" aria-label={'在 ' + item.label + ' 新建任务'}
+        title="在此工作区新建任务" onClick={() => onNew(item.id)}>＋</button>
+    </div>}
   </section>
 }

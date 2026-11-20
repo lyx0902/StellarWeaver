@@ -20,6 +20,9 @@ def usage_fields(usage: CompletionUsage) -> JSONDict:
         "prompt_cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", None),
         "reasoning_tokens": getattr(usage.completion_tokens_details, "reasoning_tokens", None),
     }
+    server_tools = getattr(usage, "server_tool_use", None)
+    if isinstance(server_tools, dict):
+        optional["tool_search"] = server_tools.get("tool_search")
     if optional["prompt_cache_hit_tokens"] is None:
         optional["prompt_cache_hit_tokens"] = getattr(
             usage.prompt_tokens_details, "cached_tokens", None

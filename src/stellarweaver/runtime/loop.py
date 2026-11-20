@@ -36,11 +36,13 @@ from stellarweaver.instructions import (
     InstructionLoadError,
     InstructionProjection,
 )
+from stellarweaver.policy import DS_SEARCH
 from stellarweaver.providers.base import ModelProvider, ProviderError
 from stellarweaver.runtime.budget import Preflight, empty_preflight, finish_cleanup
 from stellarweaver.session.journal import RunJournal
 from stellarweaver.session.store import SessionBusy, SessionStore
 from stellarweaver.tools.registry import ToolRegistry
+from stellarweaver.tools.web_search import register_search
 from stellarweaver.tools.workspace import ToolError
 
 EventSink = Callable[[AgentEvent], None | Awaitable[None]]
@@ -114,15 +116,17 @@ class Agent:
         completion_check: CompletionCheck | None = None,
         system_prompt: str | None = None,
         project_context: bool = True,
+        enable_web_search: bool = False,
     ) -> None:
         if not 0 <= max_retries <= 2:
             raise ValueError("max_retries must be between 0 and 2")
         if retry_base_seconds < 0 or max_retry_delay_seconds <= 0:
             raise ValueError("Invalid retry delay")
-        self.provider = provider
         self.system_prompt = system_prompt if system_prompt is not None else SYSTEM
         self.project_context = project_context
         self.registry = registry
+        self._enable_web_search = enable_web_search
+        self.set_provider(provider)
         self.limits = limits or LimitsConfig()
         self.store = store or SessionStore(registry.workspace.root)
         self._owns_store = store is None
@@ -482,12 +486,44 @@ class Agent:
             )
         return response
 
+    def set_provider(self, provider: ModelProvider) -> None:
+        self.provider = provider
+        if self._enable_web_search:
+            self.registry.unregister(DS_SEARCH)
+            if provider.capabilities().web_search:
+                register_search(self.registry, self._lookup_web)
+
+    async def _lookup_web(self, query: str) -> AssistantReply:
+        message = Message(
+            "user",
+            "Search the public web now using the tool. Return a brief summary based on "
+            "retrieved sources. Public search query:\n" + query,
+        )
+        request = ModelRequest(
+            (message,), max_output_tokens=min(1024, self.max_output_tokens), web_search=True
+        )
+        try:
+            reply = await self._request_model(request, estimate_tokens(message.recorded()))
+        except BudgetExceeded as exc:
+            raise ToolError("WEB_SEARCH_BUDGET_EXCEEDED", str(exc)) from exc
+        except ProviderError as exc:
+            raise ToolError("WEB_SEARCH_FAILED", str(exc)) from exc
+        if reply.stop_reason not in {"stop", "length"}:
+            raise ToolError("WEB_SEARCH_INCOMPLETE", "DeepSeek could not complete the web search.")
+        return reply
+
     async def _request_model(
         self, initial_request: ModelRequest, input_estimate: int
     ) -> AssistantReply:
         request = initial_request
         capabilities = self.provider.capabilities()
-        streaming = self.stream and capabilities.streaming
+        stream_requested = self.stream and not request.web_search
+        streaming = stream_requested and capabilities.streaming
+        settings = dict(capabilities.request_settings)
+        if request.web_search:
+            settings["thinking"] = "disabled"
+            settings.pop("reasoning_effort", None)
+            settings["purpose"] = DS_SEARCH
         for retry_index in range(self.max_retries + 1):
             request = self._checked_request(request, input_estimate)
             self._model_calls += 1
@@ -498,12 +534,12 @@ class Agent:
                     "request_index": self._model_calls,
                     "retry_index": retry_index,
                     "streaming": streaming,
-                    "stream_fallback": self.stream and not streaming,
+                    "stream_fallback": stream_requested and not streaming,
                     "context_window_tokens": capabilities.context_window_tokens,
                     "input_tokens": input_estimate,
                     "max_output_tokens": request.max_output_tokens,
                     "input_estimated": True,
-                    **capabilities.request_settings,
+                    **settings,
                 },
             )
             try:

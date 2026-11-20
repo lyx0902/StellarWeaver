@@ -199,7 +199,8 @@ def projects(engine: Engine, tenant: str, member: str) -> list[JSONDict]:
             dict(row)
             for row in conn.execute(
                 text("""
-            SELECT w.id::text,w.label,p.relative_path FROM sw.local_projects p
+            SELECT w.id::text,COALESCE(p.alias,w.label) AS label,w.label AS default_label,
+                   p.alias,p.relative_path FROM sw.local_projects p
             JOIN sw.workspaces w ON (w.tenant_id,w.id)=(p.tenant_id,p.workspace_id)
             JOIN sw.workspace_grants g ON (g.tenant_id,g.workspace_id)=(p.tenant_id,p.workspace_id)
             WHERE g.member_id=:member ORDER BY (p.relative_path IS NULL),lower(w.label),w.id
@@ -211,6 +212,30 @@ def projects(engine: Engine, tenant: str, member: str) -> list[JSONDict]:
 
 def project_for_job(engine: Engine, tenant: str, member: str, workspace: str) -> JSONDict | None:
     return next((row for row in projects(engine, tenant, member) if row["id"] == workspace), None)
+
+
+def rename_project(
+    engine: Engine, tenant: str, member: str, workspace: str, alias: str | None
+) -> JSONDict | None:
+    with db.scoped(engine, tenant) as conn:
+        row = (
+            conn.execute(
+                text("""
+                UPDATE sw.local_projects AS p SET alias=:alias
+                FROM sw.workspaces AS w, sw.workspace_grants AS g
+                WHERE p.tenant_id=:tenant AND p.workspace_id=:workspace
+                  AND p.relative_path IS NOT NULL
+                  AND (w.tenant_id,w.id)=(p.tenant_id,p.workspace_id)
+                  AND (g.tenant_id,g.workspace_id)=(p.tenant_id,p.workspace_id)
+                  AND g.member_id=:member
+                RETURNING p.alias,COALESCE(p.alias,w.label) AS label
+            """),
+                {"tenant": tenant, "member": member, "workspace": workspace, "alias": alias},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        return dict(row) if row is not None else None
 
 
 def add_project(engine: Engine, config: LocalConfig, tenant: str, member: str, path: str) -> None:
