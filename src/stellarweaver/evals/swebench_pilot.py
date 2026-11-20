@@ -8,26 +8,46 @@ import hashlib
 import json
 import os
 import subprocess
-from dataclasses import asdict
+import tempfile
+from collections.abc import Mapping
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from pydantic import BaseModel, ConfigDict
+
 from stellarweaver.cli import build_provider, effective_config
 from stellarweaver.config import AppConfig
 from stellarweaver.domain import AgentEvent, JSONDict
+from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
 from stellarweaver.runtime.loop import CompletionProof
 from stellarweaver.runtime.service import build_agent
 from stellarweaver.session.store import SessionStore
-from stellarweaver.tools.commands import controlled_environment, execute_command
+from stellarweaver.tools.commands import (
+    CommandRunner,
+    RunCommandArgs,
+    controlled_environment,
+    execute_command,
+    prepare_run_command,
+)
+from stellarweaver.tools.registry import Prepare, PreparedTool, ToolContext, ToolRegistry
 from stellarweaver.tools.workspace import ToolError
 
 INSTANCE = "marshmallow-code__marshmallow-1359"
+REPO = "marshmallow-code/marshmallow"
 BASE = "b40a0f4e33823e6d0f341f7e8684e359a99060d1"
 IMAGE = "python:3.12-slim-bookworm"
 TESTS = ("pytest", "-q", "tests/test_fields.py", "tests/test_schema.py")
 REPRO = ("python", "/repro/reproduce.py")
+PILOT_COMMANDS = {
+    "run_visible_tests": (
+        "Run the configured visible repository tests in the isolated container.",
+        TESTS,
+    ),
+    "run_reproducer": ("Run the public issue reproducer in the isolated container.", REPRO),
+}
 EXPECTED_ERROR = "AttributeError: 'List' object has no attribute 'opts'"
 REPRODUCER = b"""\
 from marshmallow import Schema, fields
@@ -50,15 +70,24 @@ def write_json(path: Path, body: JSONDict) -> None:
 def git(root: Path, *argv: str) -> bytes:
     return subprocess.check_output(
         ["git", "-C", str(root), "-c", f"core.hooksPath={os.devnull}", *argv],
-        env=controlled_environment(),
+        env=controlled_environment({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LFS_SKIP_SMUDGE": "1",
+        }),
         timeout=30,
     )
 
 
-def checkout(source: Path, destination: Path) -> None:
+def checkout(source: Path, destination: Path, base_commit: str | None = None) -> None:
     git(source, "clone", "--quiet", "--no-hardlinks", "--no-checkout", ".", str(destination))
     git(destination, "config", "core.autocrlf", "false")
-    git(destination, "checkout", "--quiet", "--detach", BASE)
+    git(destination, "checkout", "--quiet", "--detach", base_commit or BASE)
+
+
+class NoArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 def snapshot(root: Path) -> str:
@@ -216,8 +245,20 @@ class PilotRunner:
 
 def prepare(assets: Path, output: Path) -> tuple[JSONDict, PilotRunner]:
     issue = json.loads((assets / "agent-input.json").read_text(encoding="utf-8"))
-    if issue["instance_id"] != INSTANCE:
+    if (
+        not isinstance(issue, dict)
+        or issue.get("instance_id") != INSTANCE
+        or not isinstance(issue.get("problem_statement"), str)
+        or not issue["problem_statement"].strip()
+    ):
         raise ValueError("Unexpected SWE-bench instance")
+    source = assets / "marshmallow-1359"
+    objects = git(
+        source, "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype)"
+    )
+    commits = [entry.split()[0] for entry in objects.splitlines() if entry.endswith(b" commit")]
+    if commits != [BASE.encode("ascii")]:
+        raise ValueError("The pilot checkout must contain only the pinned base commit")
     dependencies = (assets / "test-deps").resolve(strict=True)
     image = subprocess.check_output(
         ["docker", "image", "inspect", "--format", "{{.Id}}", IMAGE],
@@ -227,11 +268,63 @@ def prepare(assets: Path, output: Path) -> tuple[JSONDict, PilotRunner]:
     ).strip()
     output.mkdir(parents=True)
     workspace = output / "checkout"
-    checkout(assets / "marshmallow-1359", workspace)
+    checkout(source, workspace)
     repro_dir = output / "repro"
     repro_dir.mkdir()
     (repro_dir / "reproduce.py").write_bytes(REPRODUCER)
-    return issue, PilotRunner(workspace, dependencies, repro_dir, image)
+    return {"problem_statement": issue["problem_statement"]}, PilotRunner(
+        workspace, dependencies, repro_dir, image
+    )
+
+
+def register_pilot_tools(registry: ToolRegistry, runner: PilotRunner) -> None:
+    register_fixed_tools(registry, runner.run, PILOT_COMMANDS)
+
+
+def register_fixed_tools(
+    registry: ToolRegistry,
+    runner: CommandRunner,
+    commands: Mapping[str, tuple[str, tuple[str, ...]]],
+) -> None:
+    def bind(argv: tuple[str, ...]) -> Prepare:
+        async def prepare_fixed(_: NoArguments, context: ToolContext) -> PreparedTool:
+            return await prepare_run_command(
+                RunCommandArgs(argv=list(argv)),
+                replace(context, command_runner=runner),
+            )
+
+        return prepare_fixed
+
+    registry.unregister("run_command")
+    for name, (description, argv) in commands.items():
+        registry.register(
+            name, description, NoArguments, bind(argv), authorization_tool="run_command"
+        )
+
+
+def export_candidate(assets: Path, output: Path, workspace: Path, model_id: str) -> JSONDict:
+    before = snapshot(workspace)
+    git(workspace, "add", "-N", "--", ".")
+    patch = git(workspace, "diff", "--no-ext-diff", "--binary", BASE, "--")
+    after = snapshot(workspace)
+    destination = output / "candidate.patch"
+    destination.write_bytes(patch)
+    evidence = {"sha256": digest(patch), "bytes": len(patch), "snapshot_sha256": after}
+    if before != after:
+        return {**evidence, "status": "invalid_patch", "reason": "candidate_snapshot_changed"}
+    if not patch:
+        return {**evidence, "status": "empty_patch", "reason": "no_changes_from_base"}
+    with tempfile.TemporaryDirectory(prefix="apply-check-", dir=output) as verification:
+        clean = Path(verification) / "checkout"
+        checkout(assets / "marshmallow-1359", clean)
+        try:
+            git(clean, "apply", "--check", str(destination.resolve()))
+            text = patch.decode("utf-8")
+        except (subprocess.CalledProcessError, UnicodeDecodeError):
+            return {**evidence, "status": "invalid_patch", "reason": "patch_not_exportable"}
+    prediction = {"instance_id": INSTANCE, "model_name_or_path": model_id, "model_patch": text}
+    (output / "predictions.jsonl").write_text(json.dumps(prediction) + "\n", encoding="utf-8")
+    return {**evidence, "status": "valid_patch", "reason": "applies_to_base"}
 
 
 async def run_pilot(
@@ -242,6 +335,7 @@ async def run_pilot(
     replay_patch: Path | None,
     *,
     replay: bool,
+    fake_script: Path | None = None,
 ) -> int:
     issue, runner = await asyncio.to_thread(prepare, assets, output)
     workspace = runner.workspace
@@ -267,11 +361,13 @@ async def run_pilot(
         {
             "workspace": str(workspace),
             "grants": [
-                {"tool": "run_command", "argv": argv, "cwd": "."} for argv in (TESTS, REPRO)
+                {"tool": "run_command", "argv": argv, "cwd": "."}
+                for _, argv in PILOT_COMMANDS.values()
             ],
         },
     )
-    config = effective_config(AppConfig(), "deepseek", "workspace-edit", True)
+    provider: Literal["fake", "deepseek"] = "fake" if fake_script is not None else "deepseek"
+    config = effective_config(AppConfig(), provider, "workspace-edit", True)
     config = config.model_copy(
         update={
             "limits": config.limits.model_copy(
@@ -285,12 +381,17 @@ async def run_pilot(
             )
         }
     )
-    model = build_provider(config, workspace, "deepseek", None, env_file, stream=True)
+    model = (
+        FakeModel.from_script(fake_script)
+        if fake_script is not None
+        else build_provider(config, workspace, "deepseek", None, env_file, stream=True)
+    )
     prompt = (
-        "Fix the following issue at the checked-out base revision. The authorized executable "
-        f"commands are {json.dumps(TESTS)} for the existing suites and {json.dumps(REPRO)} "
-        "for the issue reproduction. Use the exact commands if testing. Review the diff and "
-        "report actual evidence.\n\n" + issue["problem_statement"]
+        f"Fix {INSTANCE} in {REPO}. The workspace contains base_commit {BASE}. "
+        "Use search_text and read_file to locate the problem. Use git_status and git_diff "
+        "to inspect the working tree. Use run_visible_tests and run_reproducer with {} "
+        "to run the configured container checks. Review the diff and report actual evidence.\n\n"
+        + issue["problem_statement"]
     )
 
     def event(item: AgentEvent) -> None:
@@ -312,18 +413,22 @@ async def run_pilot(
                 store,
                 policy_file=policy,
                 on_event=event,
-                command_runner=runner.run,
                 completion_check=runner.check if gate else None,
             )
+            register_pilot_tools(agent.registry, runner)
             outcome = await agent.run(prompt)
             checks = [item for item in outcome.evidence if item.get("kind") == "completion_check"]
             report = {
                 "instance_id": INSTANCE,
+                "repo": REPO,
                 "base_commit": BASE,
                 "session_id": store.session_id,
-                "model": config.model.model,
-                "thinking": config.model.thinking,
-                "reasoning_effort": config.model.reasoning_effort,
+                "provider": provider,
+                "model": config.model.model if provider == "deepseek" else "scripted-reference",
+                "thinking": config.model.thinking if provider == "deepseek" else None,
+                "reasoning_effort": config.model.reasoning_effort
+                if provider == "deepseek"
+                else None,
                 "outcome": asdict(outcome),
                 "tools": [asdict(tool) for tool in agent.results],
                 "image": runner.image,
@@ -331,14 +436,15 @@ async def run_pilot(
     finally:
         if isinstance(model, OpenAICompatibleChatProvider):
             await model.aclose()
-    before = await asyncio.to_thread(snapshot, workspace)
-    git(workspace, "add", "-N", "--", ".")
-    patch = git(workspace, "diff", "--no-ext-diff", "--binary", "HEAD", "--")
-    after = await asyncio.to_thread(snapshot, workspace)
+    candidate = await asyncio.to_thread(
+        export_candidate, assets, output, workspace, f"stellarweaver-{report['model']}"
+    )
     last = checks[-1] if checks else None
     reproduction_status = last["status"] if last else "unavailable" if gate else "not_run"
     reproduction_reason = last["reason"] if last else "no_completed_check"
-    if before != after or (last and last["evidence"].get("snapshot_sha256") not in {after, None}):
+    if candidate["reason"] == "candidate_snapshot_changed" or (
+        last and last["evidence"].get("snapshot_sha256") not in {candidate["snapshot_sha256"], None}
+    ):
         reproduction_status, reproduction_reason = "unavailable", "candidate_snapshot_changed"
     report["reproduction"] = {
         "enabled": gate,
@@ -347,18 +453,28 @@ async def run_pilot(
         "status": reproduction_status,
         "reason": reproduction_reason,
     }
-    (output / "candidate.patch").write_bytes(patch)
-    prediction = {
-        "instance_id": INSTANCE,
-        "model_name_or_path": "stellarweaver-deepseek-flash",
-        "model_patch": patch.decode("utf-8"),
+    report["candidate"] = candidate
+    report["official_evaluation"] = {
+        "status": "not_evaluated",
+        "reason": "pending_independent_evaluation"
+        if candidate["status"] == "valid_patch"
+        else candidate["status"],
+        "resolved": None,
     }
-    (output / "predictions.jsonl").write_text(json.dumps(prediction) + "\n", encoding="utf-8")
     write_json(output / "agent-report.json", report)
     print(
-        outcome.run_status, reproduction_status, outcome.model_calls, outcome.tool_calls, flush=True
+        outcome.run_status,
+        candidate["status"],
+        reproduction_status,
+        outcome.model_calls,
+        outcome.tool_calls,
+        flush=True,
     )
-    return int(outcome.run_status != "completed" or (gate and reproduction_status != "passed"))
+    return int(
+        outcome.run_status != "completed"
+        or candidate["status"] != "valid_patch"
+        or (gate and reproduction_status != "passed")
+    )
 
 
 def main() -> int:
@@ -369,11 +485,16 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--patch", type=Path, help="Candidate or reference patch for replay")
     parser.add_argument(
+        "--fake-script", type=Path, help="Use an offline FakeModel script in agent mode"
+    )
+    parser.add_argument(
         "--no-gate", action="store_true", help="Control run with the same allowed commands"
     )
     args = parser.parse_args()
     if args.patch is not None and args.mode != "replay":
         parser.error("--patch is only available with replay")
+    if args.fake_script is not None and args.mode != "agent":
+        parser.error("--fake-script is only available with agent")
     return asyncio.run(
         run_pilot(
             args.assets.resolve(),
@@ -382,6 +503,7 @@ def main() -> int:
             not args.no_gate,
             args.patch.resolve() if args.patch else None,
             replay=args.mode == "replay",
+            fake_script=args.fake_script.resolve() if args.fake_script else None,
         )
     )
 

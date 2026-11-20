@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as SchemaValidationError
@@ -53,6 +53,7 @@ class RegisteredTool:
     schema: JSONDict | None = None
     read_only: bool = False
     remote: bool = False
+    authorization_tool: Literal["run_command"] | None = None
 
 
 class ToolRegistry:
@@ -93,6 +94,7 @@ class ToolRegistry:
         schema: JSONDict | None = None,
         read_only: bool | None = None,
         remote: bool = False,
+        authorization_tool: Literal["run_command"] | None = None,
     ) -> None:
         if name in self._tools:
             raise ValueError(f"Duplicate tool: {name}")
@@ -122,6 +124,7 @@ class ToolRegistry:
             schema,
             name in READ_TOOLS if read_only is None else read_only,
             remote,
+            authorization_tool,
         )
 
     def unregister(self, name: str) -> None:
@@ -130,6 +133,12 @@ class ToolRegistry:
     def is_mutation(self, name: str) -> bool:
         tool = self._tools.get(name)
         return tool is None or not tool.read_only
+
+    def is_command(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        return name == "run_command" or (
+            tool is not None and tool.authorization_tool == "run_command"
+        )
 
     def schemas(self) -> list[JSONDict]:
         return [
@@ -187,7 +196,7 @@ class ToolRegistry:
                 raise ToolError(
                     "INVALID_ARGUMENTS",
                     "Tool arguments do not match the strict schema.",
-                    {"errors": exc.errors(include_context=False, include_input=False)},
+                    {"errors": json.loads(exc.json(include_context=False, include_input=False))},
                 ) from exc
             mutating = not tool.read_only
             if mutating:
@@ -212,7 +221,11 @@ class ToolRegistry:
             }
             if self.before_execute is not None:
                 await self.before_execute(call, invocation)
-            decision = await self.policy.decide(invocation)
+            if tool.authorization_tool is not None:
+                invocation["authorization_tool"] = tool.authorization_tool
+                decision = await self.policy.decide({**invocation, "tool": tool.authorization_tool})
+            else:
+                decision = await self.policy.decide(invocation)
             await self._record("tool.authorization", {**invocation, **decision})
             if decision["decision"] != "allow":
                 status = "blocked" if decision["decision"] == "blocked" else "denied"

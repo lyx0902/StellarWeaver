@@ -80,7 +80,9 @@ uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --o
 
 ## SWE-bench Lite 单题复现试跑
 
-`stellarweaver.evals.swebench_pilot` 支持 Marshmallow 开发题 `marshmallow-code__marshmallow-1359`。从本机试跑资料读取公开题目、基线 checkout 和测试依赖，为每次运行新建工作区。`replay` 可对原始基线或通过 `--patch` 提供的补丁执行复现。`agent` 使用现有 DeepSeek 配置，可加 `--no-gate` 运行对照组，两种配置提供相同的测试命令。
+`stellarweaver.evals.swebench_pilot` 支持 Marshmallow 开发题 `marshmallow-code__marshmallow-1359`。从本机试跑资料读取公开题目、固定基线和测试依赖，为每次运行新建工作区。`replay` 可对原始基线或通过 `--patch` 提供的补丁执行复现。`agent` 默认使用现有 DeepSeek 配置，也可传 `--fake-script PATH` 离线回放 FakeModel。加 `--no-gate` 运行对照组，两组提供同样的模型工具。
+
+模型获得仓库名和 `base_commit`，用 `run_visible_tests` 与 `run_reproducer` 执行固定的断网容器检查。两项工具只接受空对象，程序绑定实际命令和工作目录，并走精确授权。常规命令工具从试跑工具表移除。导出的候选在另一个干净基线上运行 `git apply --check`，只有可应用的非空补丁生成 `predictions.jsonl`。Agent 终态、验证和官方评分状态在报告中分别记录，FakeModel 产物标记为脚本化验收。
 
 复现脚本来自公开 issue，运行器在修改前确认预期异常。候选补丁准备交付时，在断网容器里运行同一份只读脚本。首次复现失败会追加一次修复机会，模型请求、执行工具和复现都在原有运行预算内。报告保留脚本哈希、候选快照、退出码和异常摘要。官方测试补丁及评分留在单独的评分环境。
 
@@ -91,6 +93,56 @@ uv run --locked python -m stellarweaver.evals.swebench_pilot agent `
   --assets .validation/swebench-lite-pilot `
   --output .validation/swebench-gate-next --env-file .env
 ```
+
+## SWE-bench Lite 批量评测
+
+批量入口为 `python -m stellarweaver.evals.swebench`。它固定 SWE-bench Lite 修订 `b0dde1093fe417d83b7184254edf8199c1f0dff5`，逐一校验 `dev` 和 `test` 的 Parquet SHA-256、题数和题号。`prepare` 生成冻结清单，每题的公开题面与评分资料分别保存在 `task.json` 和 `scorer.json`。Agent 只加载公开题面，仓库目录仅包含题目指定的基线提交。
+
+准备独立 Python 环境并安装 `swebench==5.0.2`，将该环境的 Python 路径传给 `--grader-python`。评测前为所选题缓存两个环境。可见测试使用操作方指定的 Python 镜像 ID、公开依赖和 pytest 参数。官方评分使用题目对应的完整镜像摘要。`--recipes` 读取按题号或 `owner/repo` 索引的 JSON 对象，题号配置优先。各条配置字段如下。
+
+| 字段 | 值 |
+|---|---|
+| `image` | 已安装的可见测试镜像 ID，格式为 `sha256:<64 位十六进制>` |
+| `pytest_args` | 固定 pytest 参数，如 `["-q", "tests/test_fields.py"]`，模型通过 `run_visible_tests` 触发 |
+| `dependencies` | 可选，`--assets` 下的公开依赖目录，对容器只读 |
+| `grader_image` | 已安装的官方镜像完整引用，格式为 `仓库@sha256:<64 位十六进制>` |
+
+`--assets` 可以缓存以题号命名的浅层 Git 仓库。缺少缓存时，运行器从公开 GitHub 地址只获取基线提交，同时检查本地对象库中不存在其他提交。可见测试容器断网，只读挂载当前候选，并在有大小上限的临时目录中测试副本。测试生成的文件留在临时目录。官方评分进程读取独立评分资料，使用无宿主目录挂载的断网容器。
+
+```powershell
+$swRun = '.validation/swebench-dev-smoke'
+$swData = '.validation/swebench-lite-dataset/dev.parquet'
+$swSha = (Get-FileHash -LiteralPath $swData).Hash.ToLowerInvariant()
+$swGrader = '.validation/swebench-lite-pilot/grader-venv/Scripts/python.exe'
+$swAssets = '.validation/swebench-phase2-assets'
+$swRecipes = "$swAssets/recipes.json"
+
+uv run --locked python -m stellarweaver.evals.swebench prepare `
+  --dataset $swData --dataset-sha256 $swSha --split dev `
+  --grader-python $swGrader --recipes $swRecipes --output $swRun `
+  --instance-id marshmallow-code__marshmallow-1359 `
+  --instance-id pylint-dev__astroid-1333 --instance-id pydicom__pydicom-1694
+uv run --locked python -m stellarweaver.evals.swebench run --output $swRun --assets $swAssets --env-file .env --live
+uv run --locked python -m stellarweaver.evals.swebench export --output $swRun
+uv run --locked python -m stellarweaver.evals.swebench evaluate --output $swRun --grader-python $swGrader
+uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
+```
+
+`run` 也接受 `--fake-scripts`，脚本文件名为 `<instance_id>.json`。重复执行 `run` 会跳过已经完成的尝试。中断或环境失败后，`--retry-interrupted` 建立新的尝试目录并保留原记录。`import --predictions PATH` 可以导入以前的 JSONL。`evaluate` 默认复用已完成的评分，`--rescore` 使用新评分 ID。导出、评分和汇总均使用保存的补丁，无需再次调用模型。`task_results.jsonl` 保留全部计划题目的状态，`aggregate.json` 始终使用计划题数作为分母。
+
+旧版 23 题 JSON 快照可用 `--legacy-dev` 回放并固定文件哈希。清单会标记上游修订未经核验。该快照缺少官方执行脚本等评分字段，用 `--official-cases` 补入已保存的官方评分条目。若某题缺少必要的评分字段，记录为 `evaluation_error`。
+
+### Phase 2 多仓库试跑记录
+
+2026-11-20 已校验固定修订 `dev` Parquet，并生成完整的 23 题清单。前期试跑使用旧版 `dev` 快照。随后用固定修订核对三个样本的题号、仓库、基线提交和公开题面，确认一致，再将已有补丁导入官方评分。官方评分器版本为 `swebench 5.0.2`，镜像和补丁均按摘要归档。
+
+| 样本 | Agent 证据 | 官方评分 |
+|---|---|---|
+| Marshmallow `1359` | 导入之前的 DeepSeek 补丁 | `resolved`，缺陷测试 1/1，回归测试 76/76 |
+| Pydicom `1694` | Thinking High 试跑，16 次模型调用后耗尽预算，保存可应用补丁 | `resolved`，缺陷测试 1/1，回归测试 26/26 |
+| Astroid `1333` | Thinking High 试跑，16 次模型调用后耗尽预算，补丁为空 | `not_evaluated` |
+
+本机证据位于 `.validation/swebench-phase2-smoke-v2` 和 `.validation/swebench-phase2-official-sample`。重复执行 `evaluate` 已核对会保留先前的评分 ID。可见测试隔离调整后，使用 FakeModel 触发真实测试，Pydicom 基线通过 26 项，Astroid 在 Python 3.10 中通过 46 项。该检查使测试写入留在临时副本，Astroid 的真实模型尝试保持原记录。完整 `dev` 清单位于 `.validation/swebench-phase2-dev23`，剩余题目的环境配方和实跑仍待验收。
 
 ## 后续实验
 

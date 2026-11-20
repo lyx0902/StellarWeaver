@@ -296,7 +296,7 @@ class Agent:
             if result.tool_name in {"create_file", "edit_file"} and result.status == "ok":
                 checks.clear()
                 evidence.append({"kind": "change", **asdict(result)})
-            if result.tool_name == "run_command" and "exit_code" in result.data:
+            if self.registry.is_command(result.tool_name) and "exit_code" in result.data:
                 key = json.dumps([result.data.get("argv"), result.data.get("cwd")], sort_keys=True)
                 checks[key] = result
                 evidence.append({"kind": "command", **asdict(result)})
