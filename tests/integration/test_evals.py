@@ -16,7 +16,7 @@ def materialize(task: dict, folder: Path, *, fixed: bool = False) -> Path:
     return folder
 
 
-def test_catalog_has_twenty_fixed_independent_fixtures() -> None:
+def test_catalog_has_twenty_independent_tasks() -> None:
     tasks = catalog()
     assert len({task["task_id"] for task in tasks}) == 20
     assert Counter(task["category"] for task in tasks) == {
@@ -29,16 +29,12 @@ def test_catalog_has_twenty_fixed_independent_fixtures() -> None:
     for task in tasks:
         compile(task["oracle"], task["task_id"], "exec")
         assert {
-            "fixture_repo",
             "policy_file",
             "model_config",
             "limits",
             "oracle_entrypoint",
             "scoring_rules",
         } <= task.keys()
-        for name, body in task["files"].items():
-            public = Path(__file__).parents[2] / task["fixture_repo"] / name
-            assert public.read_bytes() == body.encode("utf-8")
         assert "oracle" not in task["files"] and "reference" not in task["files"]
 
 

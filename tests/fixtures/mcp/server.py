@@ -1,8 +1,4 @@
-"""Local stdio MCP fixture: fixed source lookup, paginated discovery and delay tests.
-
-Run via the explicitly configured StellarWeaver extension client. No network,
-account, arbitrary file reader or subprocess tool is exposed by this server.
-"""
+"""Local stdio MCP test server with fixed lookup, pagination and delay cases."""
 
 import asyncio
 import os
@@ -15,14 +11,14 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 server = Server("stellarweaver-local-fixture")
-fixture = Path(__file__).parent / "fixtures" / "sample.py"
+fixture = Path(__file__).with_name("sample.py")
 changed = False
 
 
 def declaration(name: str) -> types.Tool:
     return types.Tool(
         name=name,
-        description="Find a symbol in a fixed local example source file.",
+        description="Find a symbol in the fixed test source file.",
         inputSchema={
             "type": "object",
             "properties": {"symbol": {"type": "string", "minLength": 1}},
@@ -74,7 +70,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
         )
     symbol = arguments["symbol"]
     matches = [
-        {"path": "examples/fixtures/sample.py", "line": index, "text": line.strip()}
+        {"path": fixture.name, "line": index, "text": line.strip()}
         for index, line in enumerate(fixture.read_text(encoding="utf-8").splitlines(), start=1)
         if line.lstrip().startswith((f"def {symbol}(", f"class {symbol}"))
     ]

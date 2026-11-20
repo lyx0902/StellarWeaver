@@ -56,7 +56,7 @@ SWE-bench Lite 有 **300 道 test 题和 23 道 dev 题**。每题基于真实 G
 - Python AST Repo Map、AGENTS.md 与上下文压缩；SQLite/PostgreSQL Journal 可回放和恢复；工作台已有 FastAPI/React、Worker、队列、SSE、审批、Git Worktree 和专用验证容器。
 - 历史自建 20 题集：DeepSeek `deepseek-flash`、Non-thinking，初评 **19/20**，修正规则后零模型重评分 **20/20**。这是**固定小型自建任务**，不是 SWE-bench，也不能外推大型仓库。
 - 现有参考配置：100k 应用上下文、30 模型请求、100 工具调用、900 秒、累计输入 1M Tokens / 输出 30k Tokens。须在实际源码中确认是否仍有效。
-- 核心源码路径参考：`src/stellarweaver/providers/openai_compatible.py`、`src/stellarweaver/providers/streaming.py`、`src/stellarweaver/domain/`、`src/stellarweaver/runtime/`、`src/stellarweaver/context/`、`src/stellarweaver/web/`、`frontend/`、`evals/`。
+- 核心源码路径参考：`src/stellarweaver/providers/openai_compatible.py`、`src/stellarweaver/providers/streaming.py`、`src/stellarweaver/domain/`、`src/stellarweaver/runtime/`、`src/stellarweaver/context/`、`src/stellarweaver/web/`、`frontend/`、`src/stellarweaver/evals/`。
 
 **已发现的明确技术缺口**：目前 `OpenAICompatibleChatProvider.complete()` 与 `stream()` 对 DeepSeek 显式使用 `thinking: disabled`，同时流式聚合没有保存 DeepSeek 的 `reasoning_content`。需要先补齐 Thinking + Tool Calling 协议，才适合比较与 Thinking High 外部运行的结果。
 
@@ -99,7 +99,7 @@ flowchart TD
 
 **任务**
 
-- 检查 README、ARCHITECTURE、ROADMAP、VALIDATION、evals/RESULTS 以及关键模块，绘制真实数据流。
+- 检查 README、ARCHITECTURE、ROADMAP、VALIDATION、[历史评测结果](archive/legacy/INTERNAL_EVAL_RESULTS.md)以及关键模块，绘制真实数据流。
 - 跑现有单元测试、集成测试、构建；记录当前实际通过/跳过/失败数及环境依赖。
 - 核实 DeepSeek API 支持的 `thinking`、`reasoning.effort`、`reasoning_content`、流式 Tool Call 结构和缓存用量字段，不凭假设添加请求参数。
 - 记录基线 Git SHA，避免同时混入无关的 Web 或界面改动。
@@ -143,7 +143,7 @@ src/stellarweaver/benchmarks/
   reporting.py        # aggregator and reports
 
 # 可扩展现有 web/ routes 与 worker，不必新建第二个调度框架
-# 可扩展现有 evals/，但应明确区分 internal-20 与 swebench-lite
+# 可扩展现有 src/stellarweaver/evals/，分别记录 internal-20 与 swebench-lite
 ```
 
 **任务适配**
@@ -459,7 +459,7 @@ write_predictions = true
 - DeepSeek Thinking + Tool Calling：https://api-docs.deepseek.com/guides/thinking_mode/
 - DeepSeek Chat Completion API：https://api-docs.deepseek.com/api/create-chat-completion/
 - StellarWeaver 架构：https://github.com/lyx0902/StellarWeaver/blob/master/docs/ARCHITECTURE.md
-- StellarWeaver 既有评测：https://github.com/lyx0902/StellarWeaver/blob/master/evals/RESULTS.md
+- [StellarWeaver 既有评测](archive/legacy/INTERNAL_EVAL_RESULTS.md)
 - StellarWeaver 验证与后续计划：https://github.com/lyx0902/StellarWeaver/blob/master/docs/VALIDATION.md
 - 第三方 Yuki Flash 1017 SWE-bench Lite 记录（仅供参考）：https://github.com/YuanYeYouTao/Yuki/blob/main/docs/benchmarks/2026-10-20-yuki-flash-1017/README.md
 

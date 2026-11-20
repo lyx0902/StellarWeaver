@@ -38,6 +38,7 @@ def edit(old: str, new: str, call_id: str) -> AssistantReply:
     ("repair", "model_limit", "tool_limit", "expected_status", "proofs", "feedback_count"),
     [
         (True, 10, 10, "completed", ["failed", "passed"], 1),
+        (True, None, 10, "completed", ["failed", "passed"], 1),
         (False, 10, 10, "completed", ["failed", "failed"], 1),
         (True, 2, 10, "budget_exceeded", ["failed"], 0),
         (True, 10, 3, "budget_exceeded", ["failed"], 1),
@@ -46,7 +47,7 @@ def edit(old: str, new: str, call_id: str) -> AssistantReply:
 async def test_completion_check_repair_and_budgets(
     tmp_path: Path,
     repair: bool,
-    model_limit: int,
+    model_limit: int | None,
     tool_limit: int,
     expected_status: str,
     proofs: list[str],

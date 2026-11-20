@@ -1,6 +1,6 @@
 # 小型评测实际结果
 
-本页记录历史测量和评分修订。原始报告、工作区及来源收据在本地留存，可重评分的输入包含原报告与运行工作区。当前验收索引和实验计划见[验证文档](../docs/VALIDATION.md)。
+本页记录历史测量和评分修订。原始报告、工作区及来源收据在本地留存，可重评分的输入包含原报告与运行工作区。当前验收索引和实验计划见[验证文档](../../VALIDATION.md)。
 
 日期：2026-10-25。平台：Windows，Python 3.12.6。真实模型：DeepSeek `deepseek-flash`，`https://api.deepseek.com`，Chat Completions SSE，关闭thinking。没有估算货币费用。
 
@@ -54,11 +54,11 @@ uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --o
 - 没有重复20题多次采样，没有bash-only与结构化工具、关闭/开启repo-map或压缩的对比实验。
 - 鲁棒性故障注入单独由pytest报告，不混入20题成功率，当前报告recovery_rate保持null并指向故障测试。
 - 没有 Linux/macOS 实机验收结果；后续 GitHub Actions 曾运行但未全通过，现已按用户要求移除自动 workflow，改为手动检查。
-- 本页的 CLI 评测与独立 oracle 使用 Host 后端。后续加入 Windows Job Object 并验证受管子进程清理。Web 工作台另有专用容器执行器，验收见[工作台验证](../docs/VALIDATION.md#工作台与部署验证)。将 CLI 评测移入单独隔离环境仍是后续实验项。
+- 本页的 CLI 评测与独立 oracle 使用 Host 后端。后续加入 Windows Job Object 并验证受管子进程清理。Web 工作台另有专用容器执行器，验收见[工作台验证](../../VALIDATION.md#工作台与部署验证)。将 CLI 评测移入单独隔离环境仍是后续实验项。
 ## 验收修复后的来源补齐
 
 2026-10-25 使用保存工作区和原工具证据，以当前评分器分别执行旧规则与修正规则：旧规则19/20、当前规则20/20，新增模型调用均为0。新旧规则收据（本地归档 `docs/validation/audit_fixes_old_rules_v2.json`）与当前规则收据（本地归档 `docs/validation/audit_fixes_current_rules_v2.json`）记录原报告hash、实际catalog hash、评分器版本及按内容hash归档的评分源码。原始报告与旧重评分回执的字节保持不变。
 
-旧catalog经过CRLF/JSON格式精确重建，SHA-256为`14a8d31d6ef372cb27e12943f0f00e8bd2cc90edead76a9c0e60d56e751ce6ef`，与原报告完全一致；当前规则hash为`092f952d8a83b17606a6082da01f16e6999990a80a1bf4d0f5bdb86d9c318df0`。旧评分Python当时未归档，新增收据只声称当前评分器加旧规则的复现，不声称找回旧实现。规则档案见[provenance](provenance/README.md)。这次没有重新运行真实模型，不将历史成绩当成修改后全栈的新实测。
+旧catalog经过CRLF/JSON格式精确重建，SHA-256为`14a8d31d6ef372cb27e12943f0f00e8bd2cc90edead76a9c0e60d56e751ce6ef`，与原报告完全一致；当前规则hash为`092f952d8a83b17606a6082da01f16e6999990a80a1bf4d0f5bdb86d9c318df0`。旧评分Python当时未归档，新增收据只声称当前评分器加旧规则的复现，不声称找回旧实现。历史规则档案可从 Git 历史的 `evals/provenance/` 恢复。这次没有重新运行真实模型，不将历史成绩当成修改后全栈的新实测。
 
 来源捕获另有并发修改回归：实际任务从同一份catalog原始字节解析，身份捕获或归档间发生漂移即拒绝运行，不把旧任务对象标成新规则版本。v2收据记录此修复后的实际评分源码；先前收据继续保留。

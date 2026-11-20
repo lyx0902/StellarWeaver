@@ -35,7 +35,7 @@ def source_repo(path: Path) -> str:
     return git(path, "rev-parse", "HEAD").decode().strip()
 
 
-def prepare(tmp_path: Path, base: str) -> Path:
+def prepare(tmp_path: Path, base: str, max_model_calls: int | None = None) -> Path:
     rows = [
         {
             "instance_id": key,
@@ -77,6 +77,7 @@ def prepare(tmp_path: Path, base: str) -> Path:
             recipes=recipes,
             instance_id=[FIRST, SECOND],
             limit=None,
+            max_model_calls=max_model_calls,
         )
     )
     return root
@@ -173,6 +174,57 @@ async def test_batch_isolated_attempts_resume_and_failed_image(
         "not_evaluated": 1,
         "evaluation_error": 1,
     }
+
+
+@pytest.mark.parametrize("model_limit,expected_calls", [(None, 32), (16, 16)])
+async def test_batch_uses_frozen_model_call_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model_limit: int | None, expected_calls: int
+) -> None:
+    assets = tmp_path / "assets"
+    root = prepare(tmp_path, source_repo(assets / FIRST), model_limit)
+    case = root / "cases" / FIRST
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    bench.save(
+        fixtures / f"{FIRST}.json",
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": f"read-{index}",
+                        "name": "read_file",
+                        "arguments_json": '{"path":"module.py"}',
+                    }
+                ],
+                "stop_reason": "tool_calls",
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            }
+            for index in range(31)
+        ]
+        + [{"text": "Done."}],
+    )
+    monkeypatch.setattr(bench, "local_image", lambda image: None)
+    args = argparse.Namespace(
+        live=False, fake_scripts=fixtures, assets=assets, retry_interrupted=False
+    )
+    # Keep the second task pending without provisioning another checkout.
+    bench.save(
+        root / "cases" / SECOND / "solve.json", {"status": "running", "attempt": "agent-abandoned"}
+    )
+    await bench.solve(root, args)
+    solved = bench.state(case)
+    outcome = bench.read_json(case / solved["attempt"] / "agent-report.json")["outcome"]
+    assert outcome["model_calls"] == expected_calls
+    if model_limit is None:
+        assert outcome["run_status"] == "completed"
+    else:
+        assert (outcome["run_status"], outcome["reason"]) == ("budget_exceeded", "max_model_calls")
+    limits = bench.read_json(root / "manifest.json")["limits"]
+    assert (
+        limits
+        == bench.read_json(root / "run-settings.json")["limits"]
+        == {**bench.LIMITS, "max_model_calls": model_limit}
+    )
 
 
 def test_checkout_refuses_future_commits(tmp_path: Path) -> None:

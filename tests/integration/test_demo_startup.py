@@ -20,10 +20,7 @@ def _report(output: str) -> dict[str, object]:
     return json.loads(output[output.index("{") :])
 
 
-@pytest.mark.parametrize("module", ["stellarweaver.demo", "stellarweaver.extensions.demo"])
-def test_missing_git_reports_dependency_before_creating_workspace(
-    tmp_path: Path, module: str
-) -> None:
+def test_missing_git_reports_dependency_before_creating_workspace(tmp_path: Path) -> None:
     empty_path = tmp_path / "empty-path"
     temporary = tmp_path / "temporary"
     empty_path.mkdir()
@@ -37,7 +34,7 @@ def test_missing_git_reports_dependency_before_creating_workspace(
         "PYTHONUTF8": "1",
     }
     result = subprocess.run(
-        [sys.executable, "-m", module],
+        [sys.executable, "-m", "stellarweaver.demo"],
         cwd=tmp_path,
         env=environment,
         capture_output=True,

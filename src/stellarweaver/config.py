@@ -42,7 +42,7 @@ class ModelConfig(StrictConfig):
 
 
 class LimitsConfig(StrictConfig):
-    max_model_calls: int = Field(default=30, ge=1)
+    max_model_calls: int | None = Field(default=30, ge=1)
     max_tool_calls: int = Field(default=100, ge=1)
     max_wall_seconds: int = Field(default=900, ge=1)
     max_input_tokens_total: int = Field(default=1_000_000, ge=1)

@@ -80,7 +80,7 @@ Windows的run_command先以CREATE_SUSPENDED创建主进程，再加入带KILL_ON
 
 默认pytest全离线，以真实临时Git、文件、进程与故障os._exit验证A–G；不会因Key存在自动请求模型。20题参考动作脚本只是框架测试；真实DeepSeek需显式命令。外部行为oracle、变异检测和源码hash事实评分独立于Agent自报，完成marker防普通提前exit0绕过，评分后复核修改范围。完整成功要求独立评分与diff合格且Agent运行completed。受阻、失败、拒绝、取消和估算用量各自保留。
 
-新评测和收据记录原报告hash、实际catalog与评分源码hash、评分版本和来源包；旧报告保持不变。来源包只校验字节，不自动导入归档代码。详见[评测说明](../../../evals/README.md)。sdist/wheel显式排除IDE、密钥、数据库及本机验证结果，打包回归同时检查sdist构建链和直接wheel。
+新评测和收据记录原报告hash、实际catalog与评分源码hash、评分版本和来源包；旧报告保持不变。来源包只校验字节，不自动导入归档代码。详见[历史评测结果](INTERNAL_EVAL_RESULTS.md)。sdist/wheel显式排除IDE、密钥、数据库及本机验证结果，打包回归同时检查sdist构建链和直接wheel。
 
 Oracle在文件工具工作区外，不是恶意宿主代码的安全边界；更强评分隔离、DockerBackend、其他平台实测与重复/消融评测留作后续增强。当前已移除 GitHub Actions，检查由开发者手动运行；跨平台兼容性尚未通过完整验收。
 

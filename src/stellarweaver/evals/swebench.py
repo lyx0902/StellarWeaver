@@ -21,7 +21,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from stellarweaver.cli import build_provider, effective_config
-from stellarweaver.config import AppConfig, ExecutionConfig
+from stellarweaver.config import AppConfig, ExecutionConfig, LimitsConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.evals.swebench_official import GRADER_VERSION
 from stellarweaver.evals.swebench_pilot import checkout, digest, git, register_fixed_tools
@@ -71,7 +71,6 @@ OFFICIAL_REQUIRED = {
     "test_patch",
 }
 LIMITS = {
-    "max_model_calls": 16,
     "max_tool_calls": 50,
     "max_wall_seconds": 360,
     "max_input_tokens_total": 320_000,
@@ -220,6 +219,7 @@ def prepare(args: argparse.Namespace) -> None:
         if args.recipes
         else {}
     )
+    limits = LimitsConfig.model_validate({**LIMITS, "max_model_calls": args.max_model_calls})
     manifest: JSONDict = {
         "schema_version": 1,
         "dataset": "SWE-bench/SWE-bench_Lite",
@@ -227,7 +227,7 @@ def prepare(args: argparse.Namespace) -> None:
         "dataset_revision_verified": not args.legacy_dev,
         "dataset_sha256": args.dataset_sha256,
         "split": args.split,
-        "limits": LIMITS,
+        "limits": limits.model_dump(),
         "model": "deepseek-flash",
         "thinking": "enabled",
         "reasoning_effort": "high",
@@ -410,7 +410,9 @@ def visible_runner(recipe: Recipe, workspace: Path, assets: Path) -> CommandRunn
     return run
 
 
-async def solve_task(case: Path, attempt: Path, args: argparse.Namespace) -> None:
+async def solve_task(
+    case: Path, attempt: Path, args: argparse.Namespace, limits: LimitsConfig
+) -> None:
     task = Task.model_validate_json((case / "task.json").read_bytes())
     recipe = Recipe.model_validate_json((case / "recipe.json").read_bytes())
     await asyncio.to_thread(local_image, recipe.image)
@@ -428,7 +430,7 @@ async def solve_task(case: Path, attempt: Path, args: argparse.Namespace) -> Non
     )
     provider: Literal["deepseek", "fake"] = "deepseek" if args.live else "fake"
     config = effective_config(AppConfig(), provider, "workspace-edit", True)
-    config = config.model_copy(update={"limits": config.limits.model_copy(update=LIMITS)})
+    config = config.model_copy(update={"limits": limits})
     model = (
         build_provider(config, workspace, "deepseek", None, args.env_file, stream=True)
         if args.live
@@ -537,9 +539,11 @@ def saved_prediction(case: Path) -> Prediction | None:
 
 async def solve(root: Path, args: argparse.Namespace) -> None:
     keys = prepared_tasks(root)
+    limits = LimitsConfig.model_validate(read_json(root / "manifest.json")["limits"])
     settings_path = root / "run-settings.json"
     settings = {
         "provider": "deepseek" if args.live else "fake",
+        "limits": limits.model_dump(),
         "assets": str(args.assets),
         "fixtures": {
             key: digest((args.fake_scripts / f"{key}.json").read_bytes())
@@ -566,7 +570,7 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
         save(case / "solve.json", {"status": "running", "attempt": attempt.name})
         try:
             verify_inputs(root, case, "task.json", "recipe.json")
-            await solve_task(case, attempt, args)
+            await solve_task(case, attempt, args, limits)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             save(
                 case / "solve.json",
@@ -745,6 +749,11 @@ def parser() -> argparse.ArgumentParser:
     )
     prepare_cmd.add_argument("--instance-id", action="append")
     prepare_cmd.add_argument("--limit", type=int)
+    prepare_cmd.add_argument(
+        "--max-model-calls",
+        type=int,
+        help="Optional positive model-request limit per task (default: no request-count limit)",
+    )
     prepare_cmd.add_argument("--recipes", type=Path)
     solve_cmd = subs.add_parser("run", help="Run pending tasks with an explicit provider")
     provider = solve_cmd.add_mutually_exclusive_group(required=True)

@@ -1,4 +1,4 @@
-"""Fixed data for the local MCP symbol-lookup demonstration."""
+"""Fixed source for MCP symbol-lookup tests."""
 
 
 def add(left: int, right: int) -> int:

@@ -54,7 +54,6 @@ Desktop.ini
 *.log
 /demo-workspace/
 /.validation/
-/evals/runs/
 
 # Raw validation output contains host paths and references local session data.
 # Keep a reviewed public summary; preserve raw evidence locally.

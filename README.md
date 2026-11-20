@@ -67,7 +67,7 @@ React 负责账号登录、项目切换、线程管理、流式回复和审批�
 
 ### 验证与评测
 
-Agent 的运行终态、常规测试结果和独立评分各自记录。固定 20 题的评测入口根据改动范围、测试行为和文件证据判定结果，也可以对已保存的运行和工作区重评分。SWE-bench Lite 单题试跑还提供按需开启的缺陷复现检查，正式评分使用独立环境。 [评测手册](evals/README.md) · [验证与实验](docs/VALIDATION.md)
+SWE-bench Lite 批量评测按题准备隔离工作区，支持中断续跑、导出补丁和独立评分。Agent 的运行终态、可见测试和官方测试结果各自记录，已保存的补丁可以直接重评分。 [评测手册](docs/VALIDATION.md#swe-bench-lite-批量评测)
 
 ## 启动 Web 工作台
 
@@ -84,7 +84,7 @@ docker compose @dc up -d --build --wait
 
 ## 文档导航
 
-[完整文档](docs/README.md) · [数据库](docs/DATABASE.md) · [历史评测结果](evals/RESULTS.md) · [路线图与 Harness 对照](docs/ROADMAP.md) · [开发指南](CONTRIBUTING.md)
+[完整文档](docs/README.md) · [数据库](docs/DATABASE.md) · [历史评测结果](docs/archive/legacy/INTERNAL_EVAL_RESULTS.md) · [路线图与 Harness 对照](docs/ROADMAP.md) · [开发指南](CONTRIBUTING.md)
 
 ## 常用命令
 
@@ -97,7 +97,7 @@ uv run --locked stellarweaver chat --workspace . --provider deepseek --env-file 
 # 只读分析项目并输出 JSONL
 uv run --locked stellarweaver exec --workspace . --provider deepseek --env-file .env --policy read-only --json --prompt "梳理项目入口和核心调用链，给出文件路径与行号。"
 
-# 查看已保存的 CLI 会话和运行离线评测
+# 查看已保存的 CLI 会话和 SWE-bench 评测入口
 uv run --locked stellarweaver sessions list
-uv run --locked --offline python -m stellarweaver.evals run --provider fake
+uv run --locked --offline python -m stellarweaver.evals.swebench --help
 ```

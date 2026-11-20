@@ -20,7 +20,7 @@ from stellarweaver.runtime.loop import Agent
 from stellarweaver.session.store import SessionStore
 from stellarweaver.tools.registry import ToolRegistry
 
-SERVER = Path(__file__).parents[2] / "examples" / "mcp_server.py"
+SERVER = Path(__file__).parents[1] / "fixtures" / "mcp" / "server.py"
 
 
 def setup(
@@ -93,7 +93,7 @@ async def test_sdk_real_stdio_pagination_discovery_call_and_close(tmp_path: Path
             )
             assert result.status == "ok", result
             assert result.data["structured_content"]["matches"][0] == {
-                "path": "examples/fixtures/sample.py",
+                "path": "sample.py",
                 "line": 4,
                 "text": "def add(left: int, right: int) -> int:",
             }

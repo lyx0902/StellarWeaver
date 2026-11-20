@@ -37,4 +37,4 @@ uv run --offline python -m stellarweaver.demo
 | [验证与实验](VALIDATION.md) | 功能检查、真实模型评测、复现入口和下一批实验。 |
 | [实施阶段与 Harness 对照](ROADMAP.md) | M0–M5、G0–G5、工作台增量、能力差距和后续验收项。 |
 
-历史设计及交付记录见[归档](archive/README.md)。完整评测方法和历史数据见[评测目录](../evals/README.md)。
+历史设计及交付记录见[归档](archive/README.md)。当前实验入口和评分方法见[SWE-bench Lite 批量评测](VALIDATION.md#swe-bench-lite-批量评测)。

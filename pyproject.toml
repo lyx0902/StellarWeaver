@@ -57,14 +57,14 @@ exclude = [
 # session databases and machine-specific evaluation output from this checkout.
 [tool.hatch.build.targets.sdist]
 include = [
-  "/src", "/tests", "/examples", "/evals", "/docs",
+  "/src", "/tests", "/docs",
   "/frontend", "/deploy",
   "/README.md", "/CONTRIBUTING.md", "/pyproject.toml",
   "/uv.lock", "/stellarweaver.example.toml", "/.env.example", "/.gitignore", "/.dockerignore",
 ]
 exclude = [
   "/.idea", "/.vscode", "/.vs", "/.agents", "/.codex", "/.aws",
-  "/.validation", "/.stellarweaver", "/docs/validation", "/evals/runs",
+  "/.validation", "/.stellarweaver", "/docs/validation",
   "/frontend/node_modules", "/frontend/dist", "/frontend/test-results", "/frontend/playwright-report",
   "**/__pycache__", "**/*.pyc", "**/.pytest_cache", "**/.mypy_cache",
   "**/.ruff_cache", "**/.env", "**/.env.*", "!/.env.example",
@@ -78,7 +78,7 @@ asyncio_mode = "auto"
 markers = ["live_model: explicitly requested real provider checks", "postgres: requires a migrated PostgreSQL test database"]
 
 [tool.ruff]
-extend-exclude = ["CODING_AGENT_IMPLEMENTATION_SPEC.md", "docs/archive", "evals/fixtures", ".validation", "evals/runs", "docs/validation"]
+extend-exclude = ["CODING_AGENT_IMPLEMENTATION_SPEC.md", "docs/archive", ".validation", "docs/validation"]
 target-version = "py312"
 line-length = 100
 

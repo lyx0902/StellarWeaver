@@ -209,7 +209,7 @@ CLI 的单次执行与 Web 共用 Agent 装配。Web 按登记工作区创建一
 uv run python -m stellarweaver.extensions.demo
 ```
 
-完整离线suite：`uv run python -m stellarweaver.evals run --provider fake`。真实API与独立重评分步骤和口径见[evals/README.md](../../evals/README.md)、[实际结果](../../evals/RESULTS.md)；恢复/撤销规则见[CHANGES.md](legacy/CHANGES.md)。
+完整离线suite：`uv run python -m stellarweaver.evals run --provider fake`。真实 API 与独立重评分的历史口径见[实际结果](legacy/INTERNAL_EVAL_RESULTS.md)，恢复和撤销规则见[CHANGES.md](legacy/CHANGES.md)。
 
 ### 后续与未验证
 

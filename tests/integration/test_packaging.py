@@ -19,15 +19,16 @@ def test_source_and_wheel_exclude_local_material_and_keep_runtime_resources(tmp_
         "src/stellarweaver/__init__.py": '__version__ = "0.1.0"\n',
         "src/stellarweaver/cli.py": "def app(): pass\n",
         "src/stellarweaver/evals/catalog.json": json.dumps([{"task_id": "B01"}]),
-        "examples/mcp_server.py": "# local example\n",
-        "evals/fixtures/B01/target.py": "value = 1\n",
+        "src/stellarweaver/evals/swebench.py": "# SWE-bench worker\n",
+        "src/stellarweaver/evals/swebench_official.py": "# separate official grader\n",
+        "tests/fixtures/mcp/server.py": "# MCP test server\n",
         "docs/ARCHITECTURE.md": "# Architecture\n",
         ".env.example": "STELLARWEAVER_API_KEY=\n",
         ".env": "LOCAL_ONLY_TEST_CREDENTIAL=not-a-real-key\n",
         ".idea/workspace.xml": "LOCAL_ONLY_IDE_STATE",
         ".codex/session.json": "LOCAL_ONLY_CODEX_STATE",
         "docs/validation/session_report.json": "LOCAL_ONLY_MACHINE_REPORT",
-        "evals/runs/local/report.json": "LOCAL_ONLY_EVAL_RUN",
+        ".validation/swebench-run/report.json": "LOCAL_ONLY_EVAL_RUN",
         "docs/notes/.env": "LOCAL_ONLY_NESTED_CREDENTIAL",
         "docs/private.pem": "LOCAL_ONLY_PRIVATE_KEY",
         "src/stellarweaver/accidental.sqlite3": "LOCAL_ONLY_DATABASE",
@@ -59,8 +60,9 @@ def test_source_and_wheel_exclude_local_material_and_keep_runtime_resources(tmp_
         names = [member.name.split("/", 1)[1] for member in archive.getmembers() if member.isfile()]
         assert ".env.example" in names
         assert "src/stellarweaver/evals/catalog.json" in names
-        assert "examples/mcp_server.py" in names
-        assert "evals/fixtures/B01/target.py" in names
+        assert "src/stellarweaver/evals/swebench.py" in names
+        assert "src/stellarweaver/evals/swebench_official.py" in names
+        assert "tests/fixtures/mcp/server.py" in names
         assert "docs/ARCHITECTURE.md" in names
         for member in archive.getmembers():
             if member.isfile():
@@ -92,5 +94,7 @@ def test_source_and_wheel_exclude_local_material_and_keep_runtime_resources(tmp_
     for candidate in [wheel, *(tmp_path / "direct-wheel").glob("*.whl")]:
         with zipfile.ZipFile(candidate) as archive:
             assert "stellarweaver/evals/catalog.json" in archive.namelist()
+            assert "stellarweaver/evals/swebench.py" in archive.namelist()
+            assert "stellarweaver/evals/swebench_official.py" in archive.namelist()
             for name in archive.namelist():
                 assert b"LOCAL_ONLY_" not in archive.read(name), name

@@ -58,7 +58,9 @@ async def test_reported_token_overrun_blocks_every_side_effect(tmp_path: Path, b
         agent = Agent(
             model,
             tools,
-            limits=LimitsConfig(max_input_tokens_total=100000, max_output_tokens_total=100000),
+            limits=LimitsConfig(
+                max_model_calls=None, max_input_tokens_total=100000, max_output_tokens_total=100000
+            ),
             store=store,
         )
         outcome = await agent.run("write")

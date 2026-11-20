@@ -10,4 +10,4 @@
 | [V1 验收记录](V1_ACCEPTANCE.md) | 早期 CLI 版本的逐项核对及证据范围。 |
 | [阶段原稿](legacy) | G1–G5 操作说明、早期架构、Provider 与改动管理说明，以及首版 Harness 差距核对。 |
 
-历史评测和评分材料见[验证索引](../VALIDATION.md)和[评测目录](../../evals/README.md)。
+历史评测和评分材料见[验证索引](../VALIDATION.md)和[小型评测结果](legacy/INTERNAL_EVAL_RESULTS.md)。

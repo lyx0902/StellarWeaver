@@ -411,7 +411,8 @@ class Agent:
 
     def _checked_request(self, request: ModelRequest, input_estimate: int) -> ModelRequest:
         self._remaining()
-        if self._model_calls >= self.limits.max_model_calls:
+        model_limit = self.limits.max_model_calls
+        if model_limit is not None and self._model_calls >= model_limit:
             raise BudgetExceeded("max_model_calls")
         available = self.limits.max_output_tokens_total - self._output_tokens
         if available <= 0:
@@ -1150,7 +1151,8 @@ class Agent:
         await self._emit("reproduction.completed", record)
         if proof.status != "failed" or attempt != 1:
             return False
-        if self._model_calls >= self.limits.max_model_calls:
+        model_limit = self.limits.max_model_calls
+        if model_limit is not None and self._model_calls >= model_limit:
             raise BudgetExceeded("max_model_calls after failed completion verification")
         message = Message(
             "user",

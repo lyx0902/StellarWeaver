@@ -347,12 +347,16 @@ async def execute_chat(
                     if last is not None
                     else "No task submitted. "
                 )
+                model_limit = config.limits.max_model_calls
+                request_limit = (
+                    "no request-count limit" if model_limit is None else f"{model_limit} requests"
+                )
                 return (
                     f"Workspace: {workspace}\n"
                     f"Provider: {provider or config.model.provider}; model: {config.model.model}; "
                     f"backend: {config.execution.backend}; policy: {engine.preset}\n"
                     f"Session: {store.session_id}; evidence: {store.path}\n"
-                    f"Per-task limits: {config.limits.max_model_calls} requests, "
+                    f"Per-task limits: {request_limit}, "
                     f"{config.limits.max_tool_calls} tools, {config.limits.max_wall_seconds}s. "
                     + usage
                 )

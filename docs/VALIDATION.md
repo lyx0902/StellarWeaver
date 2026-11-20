@@ -14,7 +14,6 @@ uv run --locked --extra web mypy src/stellarweaver
 uv run --locked --extra web pytest -q -ra
 uv run --offline stellarweaver doctor --offline
 uv run --offline python -m stellarweaver.demo
-uv run --offline python -m stellarweaver.extensions.demo
 ```
 
 | 验证层 | 输入和条件 | 可检查结果 |
@@ -76,7 +75,7 @@ uv run python -m stellarweaver.evals run --provider fake
 uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --output .validation/live-eval
 ```
 
-待再次评测时使用新的输出目录。公开仓库提供用例、评分器和规则来源，历史原始报告、日志和工作区保存在本机。历史结果的时间、token、分母和规则修订见[评测结果](../evals/RESULTS.md)。重评分及来源记录见[评测手册](../evals/README.md)与[评分规则档案](../evals/provenance/README.md)。
+20 题入口使用 Python 包内的题库与评分器。历史报告、日志和工作区保存在本机，结果口径、token 用量和规则修订见[历史评测结果](archive/legacy/INTERNAL_EVAL_RESULTS.md)。
 
 ## SWE-bench Lite 单题复现试跑
 
@@ -97,6 +96,8 @@ uv run --locked python -m stellarweaver.evals.swebench_pilot agent `
 ## SWE-bench Lite 批量评测
 
 批量入口为 `python -m stellarweaver.evals.swebench`。它固定 SWE-bench Lite 修订 `b0dde1093fe417d83b7184254edf8199c1f0dff5`，逐一校验 `dev` 和 `test` 的 Parquet SHA-256、题数和题号。`prepare` 生成冻结清单，每题的公开题面与评分资料分别保存在 `task.json` 和 `scorer.json`。Agent 只加载公开题面，仓库目录仅包含题目指定的基线提交。
+
+新建批量实验时，模型请求次数默认不限。每题仍有 50 次工具调用、360 秒、累计 320,000 个输入 token 和 16,000 个输出 token 的上限。冒烟测试可以在 `prepare` 时指定 `--max-model-calls 16`。`run` 使用清单中冻结的预算，旧清单保留当时的配置。使用新默认值需要准备一个新的输出目录。上面的单题复现入口保留 16 次上限，以复现实验记录。
 
 准备独立 Python 环境并安装 `swebench==5.0.2`，将该环境的 Python 路径传给 `--grader-python`。评测前为所选题缓存两个环境。可见测试使用操作方指定的 Python 镜像 ID、公开依赖和 pytest 参数。官方评分使用题目对应的完整镜像摘要。`--recipes` 读取按题号或 `owner/repo` 索引的 JSON 对象，题号配置优先。各条配置字段如下。
 
@@ -155,4 +156,4 @@ uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
 | 平台、隔离与恢复 | Windows、Linux、macOS 分别运行适用套件。对审批前、写入后、验证中断和执行器重启各重复 3 次，并执行数据库与 worktree 联合恢复。 | 记录未授权写入、重复副作用、未确认结果、容器清理、历史续接与恢复时间。数据库和系统平台差异单独记录。 |
 | Harness 对照 | 匹配基线提交、任务、模型和预算后再比较相同操作，无法绑定同一模型时独立报告各产品配置。 | 按工作流记录是否完成、人工确认步骤、补丁可合并性、失败恢复和验证证据。产品能力另见[功能对照](ROADMAP.md#harness-能力对照)。 |
 
-新实验输出放在忽略提交的 `.validation/` 或 `evals/runs/`，公开文档记录可复现配置与汇总。阶段通过标准见[路线图](ROADMAP.md)。
+新实验输出放在忽略提交的 `.validation/`，公开文档记录可复现配置与汇总。阶段通过标准见[路线图](ROADMAP.md)。

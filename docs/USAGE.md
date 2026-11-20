@@ -43,7 +43,7 @@ uv run stellarweaver resume SESSION_ID --provider deepseek --env-file .env --pro
 | `/undo` | 按逆序撤销最后一项符合条件的内置修改。重新检查文件哈希、备份和授权，Git index 保持原状态。有后续外部修改时返回冲突，维护者按记录处理。 |
 | `/skill`、`/help`、`/exit` | 查看或选择技能、查询命令、退出交互。 |
 
-`read-only` 供源码阅读。`ask` 按策略请求确认。`workspace-edit` 允许受控文件编辑，命令仍走相应授权规则。需要交互批准的操作在无 TTY 时停止。可运行 `uv run --offline python -m stellarweaver.extensions.demo` 检查 Skills 和本地 stdio MCP 的发现、调用及关闭流程。配置字段见[示例配置](../stellarweaver.example.toml)，加载与协议边界见[架构](ARCHITECTURE.md#模型上下文与扩展)。
+`read-only` 供源码阅读。`ask` 按策略请求确认。`workspace-edit` 允许受控文件编辑，命令仍走相应授权规则。需要交互批准的操作在无 TTY 时停止。本地 stdio MCP 的发现、调用及关闭流程由[集成测试](../tests/integration/test_mcp_extensions.py)覆盖。配置字段见[示例配置](../stellarweaver.example.toml)，加载与协议边界见[架构](ARCHITECTURE.md#模型上下文与扩展)。
 
 ## Web 工作台
 
