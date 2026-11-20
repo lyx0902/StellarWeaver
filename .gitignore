@@ -56,6 +56,5 @@ Desktop.ini
 /.validation/
 
 # Raw validation output contains host paths and references local session data.
-# Keep a reviewed public summary; preserve raw evidence locally.
+# Public summaries are in docs/EVAL.md.
 /docs/validation/*
-!/docs/validation/README.md

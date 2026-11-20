@@ -2,7 +2,7 @@
 
 > 历史记录。现行说明见[项目文档](../README.md)。
 
-日期：2026-11-16。本文是总体规划，补充原 V1 规范。当前操作入口见 [G0 探针和 G1 只读工作台](legacy/WEB_G1_QUICKSTART.md)、[G2 本地审批与修复](legacy/WEB_G2_QUICKSTART.md)及 [G3 持久化任务队列](legacy/WEB_G3_QUEUE_QUICKSTART.md)。
+日期：2026-11-16。本文是总体规划，补充原 V1 规范。各阶段交付见[工作台进度](PROGRESS.md#web-工作台g0-g52026-11-16-至-2026-11-18)。现行操作与部署见[工作台指南](../USAGE.md#web-工作台)和[本机 Compose](../USAGE.md#本机-compose)。
 
 ## 1. 产品目标与交付形态
 
@@ -109,4 +109,4 @@ G3 接单设计：先在短事务中从队列表认领排队项，可用 `FOR UP
 
 初次实施预计新增共享运行服务、Web API、PostgreSQL 适配器与迁移目录、`frontend/` 和部署模板；实际目录名随 G0 依赖审计定稿。项目保持手动本地检查方式，不因本计划恢复 GitHub Actions。验收记录分开记：CLI 回归、真实 PostgreSQL、浏览器、Docker 环境、真实 DeepSeek；只报告已运行的项目。
 
-当前基线：[总体架构](legacy/ARCHITECTURE.md) · [Provider 兼容性](legacy/PROVIDER_COMPATIBILITY.md) · [V1 验收](V1_ACCEPTANCE.md)。接口参考：[FastAPI SSE](https://fastapi.tiangolo.com/tutorial/server-sent-events/) · [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)。
+项目参考见[总体架构](../ARCHITECTURE.md)、[模型协议验收](../EVAL.md#cli-与模型适配)和[V1 验收](01_CLI_AGENT_RES.md)。接口参考见 [FastAPI SSE](https://fastapi.tiangolo.com/tutorial/server-sent-events/)和 [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)。

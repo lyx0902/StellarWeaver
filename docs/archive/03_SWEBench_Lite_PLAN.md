@@ -99,7 +99,7 @@ flowchart TD
 
 **任务**
 
-- 检查 README、ARCHITECTURE、ROADMAP、VALIDATION、[历史评测结果](archive/legacy/INTERNAL_EVAL_RESULTS.md)以及关键模块，绘制真实数据流。
+- 检查 README、ARCHITECTURE、ROADMAP、VALIDATION、[历史评测结果](00_Sample_Run.md)以及关键模块，绘制真实数据流。
 - 跑现有单元测试、集成测试、构建；记录当前实际通过/跳过/失败数及环境依赖。
 - 核实 DeepSeek API 支持的 `thinking`、`reasoning.effort`、`reasoning_content`、流式 Tool Call 结构和缓存用量字段，不凭假设添加请求参数。
 - 记录基线 Git SHA，避免同时混入无关的 Web 或界面改动。
@@ -435,7 +435,7 @@ write_predictions = true
 
 > **建议第一条消息**：
 >
-> 请阅读 `StellarWeaver_SWEBench_Lite_Harness_Implementation_Plan.md`，结合当前仓库实际源码完成 **Phase 0 + Phase 1**。先输出真实的架构检查结果与具体修改计划，然后开始编码。只改必要模块，补齐 DeepSeek Flash Thinking + Tool Calling 协议和对应测试。要求流式与非流式一致、支持多轮工具消息回传、压缩/恢复后协议不坏、Non-thinking 不回归。运行可用的离线自动测试，真实 Key 测试如不可用则说明未运行。结束时给我变更摘要、测试结果、风险和 Phase 2 的具体下一步；**暂时不要运行收费的全量 Benchmark**。
+> 请阅读 `03_SWEBench_Lite_PLAN.md`，结合当前仓库实际源码完成 **Phase 0 + Phase 1**。先输出真实的架构检查结果与具体修改计划，然后开始编码。只改必要模块，补齐 DeepSeek Flash Thinking + Tool Calling 协议和对应测试。要求流式与非流式一致、支持多轮工具消息回传、压缩/恢复后协议不坏、Non-thinking 不回归。运行可用的离线自动测试，真实 Key 测试如不可用则说明未运行。结束时给我变更摘要、测试结果、风险和 Phase 2 的具体下一步；**暂时不要运行收费的全量 Benchmark**。
 
 > **第二条消息（Phase 1 验收后）**：
 >
@@ -459,7 +459,7 @@ write_predictions = true
 - DeepSeek Thinking + Tool Calling：https://api-docs.deepseek.com/guides/thinking_mode/
 - DeepSeek Chat Completion API：https://api-docs.deepseek.com/api/create-chat-completion/
 - StellarWeaver 架构：https://github.com/lyx0902/StellarWeaver/blob/master/docs/ARCHITECTURE.md
-- [StellarWeaver 既有评测](archive/legacy/INTERNAL_EVAL_RESULTS.md)
+- [StellarWeaver 既有评测](00_Sample_Run.md)
 - StellarWeaver 验证与后续计划：https://github.com/lyx0902/StellarWeaver/blob/master/docs/VALIDATION.md
 - 第三方 Yuki Flash 1017 SWE-bench Lite 记录（仅供参考）：https://github.com/YuanYeYouTao/Yuki/blob/main/docs/benchmarks/2026-10-20-yuki-flash-1017/README.md
 

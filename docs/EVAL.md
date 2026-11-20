@@ -31,7 +31,7 @@ uv run --offline python -m stellarweaver.demo
 
 ### CLI 与模型适配
 
-历史 V1 在 Windows 11 / Python 3.12.6 核对了 CLI 可执行入口、读改测、回放和恢复、工具边界、扩展以及分发。验收缺口修订后的全量检查记录为 471 通过、4 跳过。随后缺 Git 启动修复执行了 21 项专项回归。原始分阶段记录见[历史验收](archive/V1_ACCEPTANCE.md)和[开发记录](archive/PROGRESS.md)。
+历史 V1 在 Windows 11 / Python 3.12.6 核对了 CLI 可执行入口、读改测、回放和恢复、工具边界、扩展以及分发。验收缺口修订后的全量检查记录为 471 通过、4 跳过。随后缺 Git 启动修复执行了 21 项专项回归。原始分阶段记录见[历史验收](archive/01_CLI_AGENT_RES.md)和[开发记录](archive/PROGRESS.md)。
 
 模型协议测试使用实际 SDK 和 `httpx.MockTransport`，覆盖请求字段、流式分片、工具 ID 配对、缺失用量、截断、断连及错误重试。真实 M2 小任务记录了测试退出码 `1 → 0`、14 条独立行为断言通过，以及模型实际请求与工具结果。默认窗口随后从 32,768 调整为 100,000，历史真实任务保留原配置。
 
@@ -58,7 +58,7 @@ uv run --offline python -m stellarweaver.demo
 | 审阅反馈与补丁交接 | 本机账号发起同线程修订、选择改动复验、检查目标分支、导出经复验的补丁。 | Web 回归 26 项通过。最终换行兼容改动后重跑交接专项，并在 CRLF 工作区完成 1 项 Edge 端到端测试。覆盖跨账号拒绝、反馈幂等与过期反馈、本地改动、暂存和基线冲突。 |
 | 用量面板与 Skills 库 | 北京时间今日用量、UTC 额度、审计和读取时间的 30 秒刷新，已登录用户只读浏览技能。 | 相关 Python 回归 45 项通过，Edge 跨午夜刷新及技能浏览通过。G6 → G7 迁移验证已有事件的回填和缺少事件时的兼容处理。 |
 
-G5 组织身份使用签名测试服务完成验收。接入实际组织身份源、部署 HTTPS 和数据库与工作区卷的联合恢复仍是待验收项。浏览器自动化里的普通对话使用 FakeModel，当前工作台沿用 DeepSeek 配置。阶段明细见[历史进度](archive/PROGRESS.md)和[路线图](ROADMAP.md)。
+G5 组织身份使用签名测试服务完成验收。接入实际组织身份源、部署 HTTPS 和数据库与工作区卷的联合恢复仍是待验收项。浏览器自动化里的普通对话使用 FakeModel，当前工作台沿用 DeepSeek 配置。 [阶段交付](archive/PROGRESS.md) · [后续验收](ROADMAP.md#工作台后续验收)
 
 ## 20 题评测及评分口径
 
@@ -75,7 +75,7 @@ uv run python -m stellarweaver.evals run --provider fake
 uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --output .validation/live-eval
 ```
 
-20 题入口使用 Python 包内的题库与评分器。历史报告、日志和工作区保存在本机，结果口径、token 用量和规则修订见[历史评测结果](archive/legacy/INTERNAL_EVAL_RESULTS.md)。
+20 题入口使用 Python 包内的题库与评分器。历史报告、日志和工作区保存在本机，结果口径、token 用量和规则修订见[历史评测结果](archive/00_Sample_Run.md)。
 
 ## SWE-bench Lite 单题复现试跑
 
@@ -143,7 +143,7 @@ uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
 | Pydicom `1694` | Thinking High 试跑，16 次模型调用后耗尽预算，保存可应用补丁 | `resolved`，缺陷测试 1/1，回归测试 26/26 |
 | Astroid `1333` | Thinking High 试跑，16 次模型调用后耗尽预算，补丁为空 | `not_evaluated` |
 
-本机证据位于 `.validation/swebench-phase2-smoke-v2` 和 `.validation/swebench-phase2-official-sample`。重复执行 `evaluate` 已核对会保留先前的评分 ID。可见测试隔离调整后，使用 FakeModel 触发真实测试，Pydicom 基线通过 26 项，Astroid 在 Python 3.10 中通过 46 项。该检查使测试写入留在临时副本，Astroid 的真实模型尝试保持原记录。完整 `dev` 清单位于 `.validation/swebench-phase2-dev23`，剩余题目的环境配方和实跑仍待验收。
+本机证据位于 `.validation/swebench-phase2-smoke-v2` 和 `.validation/swebench-phase2-official-sample`。重复执行 `evaluate` 已核对会保留先前的评分 ID。可见测试隔离调整后，使用 FakeModel 触发真实测试，Pydicom 基线通过 26 项，Astroid 在 Python 3.10 中通过 46 项。测试写入留在临时副本，两项检查属于可见测试验收。按新默认预算冻结的 23 题清单位于 `.validation/swebench-phase2-dev23-uncapped`。已准备 3 个题目的执行配方，其余环境和完整实跑仍待验收。
 
 ## 后续实验
 
@@ -154,6 +154,6 @@ uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
 | 建立重复基线 | 同一模型、任务版本、授权和预算，每题先运行 3 次。保留运行顺序和失败记录。 | 报告独立评分通过率、受阻与失败数、工具错误、实际/估算 token、时长中位数及四分位间距。每次运行保存独立 report 与评分收据。 |
 | 组件消融 | 在固定任务和模型上分别切换 repo map、上下文压缩或工具策略。一次只改变一项，每设置每题 3 次。需要增加开关时先在实验配置中实现。 | 配对比较任务成功、工作区证据、请求数和用量，并记录各组可用权限。包含长会话和需要跨文件定位的用例。 |
 | 平台、隔离与恢复 | Windows、Linux、macOS 分别运行适用套件。对审批前、写入后、验证中断和执行器重启各重复 3 次，并执行数据库与 worktree 联合恢复。 | 记录未授权写入、重复副作用、未确认结果、容器清理、历史续接与恢复时间。数据库和系统平台差异单独记录。 |
-| Harness 对照 | 匹配基线提交、任务、模型和预算后再比较相同操作，无法绑定同一模型时独立报告各产品配置。 | 按工作流记录是否完成、人工确认步骤、补丁可合并性、失败恢复和验证证据。产品能力另见[功能对照](ROADMAP.md#harness-能力对照)。 |
+| Harness 对照 | 匹配基线提交、任务、模型和预算后比较相同操作，无法统一模型时各自报告配置。 | 按工作流记录完成状态、人工确认步骤、补丁可合并性、失败恢复和验证证据。 [功能对照](archive/04_HARNESS_GAP_AUDIT.md#对照与剩余差距) |
 
-新实验输出放在忽略提交的 `.validation/`，公开文档记录可复现配置与汇总。阶段通过标准见[路线图](ROADMAP.md)。
+新实验输出放在忽略提交的 `.validation/`，公开文档记录可复现配置与汇总。SWE-bench Lite 的分组和统计口径见[专题实施方案](EVAL_PLAN.md)，阶段顺序见[路线图](ROADMAP.md)。

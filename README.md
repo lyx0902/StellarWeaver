@@ -1,77 +1,14 @@
 # StellarWeaver
 
-StellarWeaver 是一个本地 Coding Agent，可以阅读 Git 项目、执行经授权的代码修改、运行测试并交付可审阅的补丁。命令行和浏览器工作台共用同一个 Python Agent 运行时。配置密钥后可使用 DeepSeek `deepseek-flash`，离线演示和测试使用可脚本化的 FakeModel。
+StellarWeaver 是一个以 **React 工作台**为主要入口的本地 Coding Agent。它能分析 Git 项目、执行经批准的修改、运行测试，并交付可审阅和复验的补丁。工作台也支持无项目的普通对话，CLI 则提供终端交互、单次任务和结构化输出。两种入口共用同一个 Python Agent 运行时。
 
-[使用与部署](docs/USAGE.md) · [架构与调用链](docs/ARCHITECTURE.md) · [验证与实验](docs/VALIDATION.md)
+[使用与部署](docs/USAGE.md) · [React 工作台调用链](docs/ARCHITECTURE.md#react-工作台调用链) · [评测记录](docs/EVAL.md)
 
 ## 快速开始
 
-从源码运行需要 **Python 3.12+、uv 和 Git**。可选安装 `rg`，缺少时使用 Python 搜索。
+### Web 工作台
 
-```powershell
-uv sync --locked
-uv run --locked stellarweaver doctor --offline
-uv run --locked --offline python -m stellarweaver.demo
-```
-
-演示在临时 Git 仓库内完成两次编辑，并在每次编辑后运行真实测试。第一次测试失败，Agent 根据结果修正代码并重跑。输出中 `demo_passed` 为 `true`，`test_exit_codes` 先后为 `1` 和 `0`。
-
-## Agent 模块设计
-
-StellarWeaver 把模型调用、工具执行和运行记录连成一个循环。CLI 在终端进程里直接装配 Agent，Web 把任务写入 PostgreSQL，由后台 Worker 调用同一个装配入口。两种入口因此共用模型协议、工具验证和预算控制。
-
-```mermaid
-flowchart LR
-    CLI["CLI chat / exec"] --> Agent["共享 Agent 运行时"]
-    UI["React 工作台"] -->|REST| API["FastAPI"]
-    API -->|任务入队| PG[(PostgreSQL)]
-    PG -->|任务领取| Worker["Worker"]
-    Worker --> Agent
-    Agent -->|请求与回复| Provider["模型适配器"]
-    Agent -->|调用与结果| Tools["工具注册与授权"]
-    Agent --> Journal["会话记录接口"]
-    Journal --> SQLite[(CLI SQLite)]
-    Journal --> PG
-    API -->|SSE| UI
-```
-
-### 入口与 Agent 运行时
-
-CLI 的 `chat` 保留交互状态，可以多轮追问和处理审批。`exec` 执行单个任务，适合脚本调用和 JSONL 输出。入口负责读取工作区配置、选择模型和授权策略，再把这些依赖传给 `build_agent`。运行时准备模型请求，收到回复后记录助手消息和计划执行的工具。工具结果按调用 ID 匹配并写回上下文，下一轮模型可以根据代码、差异或真实测试输出决定后续动作。模型请求数、工具次数、token 和运行时长都有预算。 [CLI](src/stellarweaver/cli.py) · [运行时](src/stellarweaver/runtime/loop.py) · [领域类型](src/stellarweaver/domain/__init__.py)
-
-### 模型适配与上下文
-
-模型适配器把内部消息和工具定义转换成 Chat Completions 请求，聚合流式文本及分片的工具参数，再把完整回复交给运行时。DeepSeek 和 OpenAI 兼容服务通过适配器接入。FakeModel 可以按脚本产生回复和工具调用，便于用同一执行链路复现成功、失败和授权阻断。 [模型适配器](src/stellarweaver/providers/)
-
-每次请求前，上下文模块组合当前任务、会话历史、适用的 `AGENTS.md`、工具定义和 Python 仓库索引。默认窗口配置为 100,000 tokens，触及本地估算阈值时，会缩短过长的工具输出，并按完整工具回合压缩旧历史。原始消息保留在会话记录中，压缩后的证据和覆盖位置写入检查点。 [上下文](src/stellarweaver/context/) · [项目指令](src/stellarweaver/instructions/)
-
-### 工具、权限与改动管理
-
-工具层提供文件枚举、读取、搜索、新建和精确编辑，以及命令执行、Git 状态和差异查询。注册表先校验参数并解析工作区路径，再由策略决定放行、请求审批或阻断。一次精确编辑会重新核对目标文件的 SHA-256，并要求旧文本唯一匹配。这样可以把并发改动和重复匹配报告为明确的冲突。CLI 的获准命令使用当前用户的宿主权限，Web 修复中的验证命令交给专用执行器。 [工具注册表](src/stellarweaver/tools/registry.py) · [权限策略](src/stellarweaver/policy/)
-
-使用 DeepSeek Flash 时，模型可在 CLI 和工作台按需调用 `ds_search` 搜索公开网页。工作台在「执行过程」展示实际返回的来源。
-
-`ChangesManager` 记录 CLI 启动时的 Git 状态，用它区分原有改动和会话中的变更。`/diff` 可以查看会话新增的变化，`/undo` 依据操作记录、文件哈希和备份回退符合条件的内置编辑。 [改动管理](src/stellarweaver/changes/)
-
-### 会话记录、恢复与扩展
-
-CLI 用 SQLite 保存消息、工具授权、执行意图、结果和检查点，Web 通过 PostgreSQL 实现同一个会话记录接口。写入类操作先记录意图，再执行并保存结果。中断后，文件操作可以用改动前后的哈希核对，已启动但结果未知的命令会保留为待核对项。CLI 提供回放、恢复和导出，Web 提供原线程追问和按事件游标补读。 [会话存储](src/stellarweaver/session/) · [Web Journal](src/stellarweaver/web/journal.py)
-
-CLI 可以按需加载 Skills，并把已配置的本地 stdio MCP 工具注册到同一个权限流程。Web 侧栏的 Skills 库提供本机技能目录和正文的只读浏览。 [CLI 扩展](src/stellarweaver/extensions/) · [Web Skills 库](src/stellarweaver/web/skills.py)
-
-### Web 工作台、执行隔离与补丁交付
-
-React 负责账号登录、项目切换、线程管理、流式回复和审批交互。FastAPI 校验租户、成员与工作区权限，把运行持久化到队列，并通过 SSE 把事件传回浏览器。Worker 领取任务后装配 Agent，同一项目线程的追问可继续使用对应工作区。普通对话沿用会话和模型链路，并关闭项目工具。PostgreSQL 还保存模型用量与成员操作审计。 [前端](frontend/src/) · [API](src/stellarweaver/web/app.py) · [Worker](src/stellarweaver/web/worker.py)
-
-一次 Web 修复从 Git 基线建立独立 worktree。用户批准编辑或测试后，Agent 修改该 worktree，验证执行器将工作区快照送入一次性 Linux 容器运行允许的命令。运行结束后，工作台展示文件差异、测试退出码和验证证据。用户可以选择改动块，在新的独立工作区里应用选中补丁并复验，再下载结果。 [任务隔离](src/stellarweaver/web/isolation.py) · [交付报告](src/stellarweaver/web/delivery.py) · [补丁复验](src/stellarweaver/web/execution.py)
-
-### 验证与评测
-
-SWE-bench Lite 批量评测按题准备隔离工作区，支持中断续跑、导出补丁和独立评分。Agent 的运行终态、可见测试和官方测试结果各自记录，已保存的补丁可以直接重评分。 [评测手册](docs/VALIDATION.md#swe-bench-lite-批量评测)
-
-## 启动 Web 工作台
-
-本机部署需要 Docker Compose 和 Linux 容器。首次使用时，按[部署指南](docs/USAGE.md#新机器首次配置)准备 `.env`、本机 Compose 配置和初始 Git 工作区。配置完成后，从仓库根目录启动。
+使用 Docker Compose 和 Linux 容器。首次启动需准备 `.env`、`.stellarweaver/workbench.compose.env`、成员配置和一个带已提交基线的 Git 项目。完成配置后，从 StellarWeaver 仓库根目录执行以下启动命令。 [首次部署配置](docs/USAGE.md#新机器首次配置)
 
 ```powershell
 $dc = @('--env-file', '.env', '--env-file', '.stellarweaver/workbench.compose.env',
@@ -80,24 +17,90 @@ $dc = @('--env-file', '.env', '--env-file', '.stellarweaver/workbench.compose.en
 docker compose @dc up -d --build --wait
 ```
 
-默认入口为 `http://127.0.0.1:8787/`。登录后可开始普通对话，或添加 Git 工作区后发起只读分析和审批式修复。
+打开 `http://127.0.0.1:8787/` 并注册或登录。可直接新建普通对话，也可添加 Git 工作区发起只读分析。启用 `SW_WORKBENCH_REPAIR=1` 后，项目任务可经审批修改代码和运行验证。
+
+### CLI 离线演示
+
+从源码运行需要 **Python 3.12+、uv 和 Git**。以下命令同步依赖、检查本地环境并运行 FakeModel 演示。
+
+```powershell
+uv sync --locked
+uv run --locked --offline stellarweaver doctor --offline
+uv run --locked --offline python -m stellarweaver.demo
+```
+
+演示在临时 Git 仓库中修改代码、实际执行测试，并根据第一次失败的结果继续修复。成功时 `demo_passed` 为 `true`，`test_exit_codes` 为 `[1, 0]`。
+
+## 工作台功能
+
+| 功能 | 使用方式 |
+| --- | --- |
+| 工作区与会话 | 从配置的项目目录选择 Git 仓库，设置工作区别名，按项目查看、归档及恢复会话。普通对话单独分组。 |
+| 流式运行与审批 | 在原线程继续提问，逐项批准编辑和测试。工作台实时显示回复与工具事件，在结束后折叠工具过程，并保留日志、用量和测试结果。 |
+| 隔离验证与补丁交付 | 项目线程在专属 Git worktree 中修改代码。验证命令在一次性 Linux 容器中运行。可按改动块反馈、选块复验，预检当前目标分支后导出补丁到 IDE 应用。 |
+| 账号与管理 | 本机使用账号密码登录。团队配置可接入 OIDC，并按项目分配成员权限、额度和审计访问。用量面板支持按日查看，Skills 库支持只读浏览。 |
+| 网页搜索 | 选用 DeepSeek Flash 时，模型可按需调用 `ds_search`，来源在对应的执行过程内查看。 |
+
+## Agent 模块设计
+
+```mermaid
+flowchart LR
+    UI["React 工作台"] -->|REST| API["FastAPI"]
+    API -->|任务入队| PG[(PostgreSQL)]
+    PG -->|任务领取| Worker["Worker"]
+    Worker --> Agent["共享 Agent 运行时"]
+    CLI["CLI chat / exec"] --> Agent
+    Agent -->|请求与回复| Provider["模型适配器"]
+    Agent -->|调用与结果| Tools["工具注册与授权"]
+    Agent --> Journal["会话记录接口"]
+    Journal -->|CLI| SQLite[(SQLite)]
+    Journal -->|Web| PG
+    API -->|SSE| UI
+```
+
+### 运行时与模型
+
+CLI 直接调用 `build_agent`，Web 则由 worker 从持久队列领取任务后调用同一入口。Agent 逐轮处理模型回复、工具调用和实际结果，并跟踪模型请求、工具次数、token 与运行时长预算。DeepSeek 默认使用 `deepseek-flash`，启用 Thinking，强度为 `high`。适配器在完整接收工具参数后才交给运行时处理，也支持配置 Chat Completions 兼容端点。FakeModel 可用脚本复现工具回合及失败场景。 [运行时](src/stellarweaver/runtime/loop.py) · [模型适配器](src/stellarweaver/providers/)
+
+### 上下文、工具与权限
+
+模型请求包含当前任务、会话历史、适用的 `AGENTS.md`、工具定义和 Python 仓库索引。默认上下文窗口配置为 100,000 tokens。接近估算上限时，系统压缩过长工具输出和较早的完整工具回合，原始证据保留在会话记录中。文件编辑需通过路径、授权、SHA-256 和唯一文本匹配检查。CLI 的 `/diff` 对照启动基线，`/undo` 可撤销符合条件的内置编辑。 [上下文](docs/ARCHITECTURE.md#上下文与指令) · [工具与权限](docs/ARCHITECTURE.md#工具与权限)
+
+### 会话恢复与扩展
+
+CLI 的 SQLite 和工作台的 PostgreSQL 各自保存消息、工具执行意图、授权、结果和检查点。CLI 支持回放、恢复和导出。Web 刷新后可按 SSE 游标补读，中断后的未确认操作会留给用户核对。CLI 可加载本机 Skills 和配置的 stdio MCP 工具，工作台提供独立的只读 Skills 库。 [会话持久化](docs/ARCHITECTURE.md#会话持久化) · [数据库](docs/DATABASE.md)
+
+## SWE-bench Lite 评测进展
+
+| 范围 | 当前状态 |
+| --- | --- |
+| 批量适配 | 固定数据集修订和仓库基线，分离公开任务与官方评分资料。支持中断续跑、导出 `predictions.jsonl`，以及使用已有补丁独立评分和重新汇总。 |
+| 三题开发集试跑 | Marshmallow 和 Pydicom 的候选补丁通过官方评分，Astroid 的旧尝试因预算用尽而未生成补丁，记为未评分。 |
+| 下一步 | 已冻结 23 道 `dev` 的清单，现有 3 道题的执行配方。待补齐其余环境并完成开发集验收，再推进 300 道 `test` 基线和 Harness 消融。 |
+
+[批量评测命令和试跑结果](docs/EVAL.md#swe-bench-lite-批量评测) · [评测实施计划](docs/EVAL_PLAN.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ## 文档导航
 
-[完整文档](docs/README.md) · [数据库](docs/DATABASE.md) · [历史评测结果](docs/archive/legacy/INTERNAL_EVAL_RESULTS.md) · [路线图与 Harness 对照](docs/ROADMAP.md) · [开发指南](CONTRIBUTING.md)
+| 文档 | 内容 |
+| --- | --- |
+| [使用与部署](docs/USAGE.md) | CLI 配置、工作台操作、Docker Compose 和团队账号。 |
+| [架构与调用链](docs/ARCHITECTURE.md) · [数据库](docs/DATABASE.md) | 运行流程、执行边界、表结构和迁移。 |
+| [实施进度](docs/archive/PROGRESS.md) · [路线图](docs/ROADMAP.md) | CLI M0–M5、Web G0–G5、后续交付与实验验收。 |
+| [Harness 差距审计](docs/archive/04_HARNESS_GAP_AUDIT.md) · [归档索引](docs/archive/README.md) | 当前能力对照、原始方案与历史记录。 |
 
 ## 常用命令
 
-使用 DeepSeek 前，首次配置时将 [`.env.example`](.env.example) 复制为仓库根目录的 `.env`，填写 `STELLARWEAVER_API_KEY`。可从 [配置模板](stellarweaver.example.toml) 开始设置本机模型、预算与策略。
+使用 DeepSeek 前，将 [`.env.example`](.env.example) 复制为仓库根目录的 `.env`，填写 `STELLARWEAVER_API_KEY`。模型、预算与策略可参考[配置模板](stellarweaver.example.toml)。
 
 ```powershell
-# 与真实模型交互
+# 与 DeepSeek 进行流式交互
 uv run --locked stellarweaver chat --workspace . --provider deepseek --env-file .env --stream
 
-# 只读分析项目并输出 JSONL
+# 只读分析当前项目，输出 JSONL
 uv run --locked stellarweaver exec --workspace . --provider deepseek --env-file .env --policy read-only --json --prompt "梳理项目入口和核心调用链，给出文件路径与行号。"
 
-# 查看已保存的 CLI 会话和 SWE-bench 评测入口
+# 查找现有 CLI 会话，查看 SWE-bench Lite 批量入口
 uv run --locked stellarweaver sessions list
 uv run --locked --offline python -m stellarweaver.evals.swebench --help
 ```

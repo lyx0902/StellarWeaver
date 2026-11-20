@@ -1,4 +1,4 @@
-# 架构与调用链
+# StellarWeaver 整体架构
 
 StellarWeaver 将一次编码任务组织为模型决策、受控工具执行和可核对的运行记录。CLI 在本机直接装配 Agent，Web 先持久化请求，再由 worker 装配同一套 Agent。模型适配器、工具注册表和 Journal 提供三个稳定接口，使运行时能复用同一套模型回合、权限判断和预算管理。
 
@@ -20,6 +20,44 @@ flowchart LR
     Tools -->|Web 验证命令| RunnerClient[执行器客户端]
     RunnerClient -->|文件快照与命令索引| Executor[专用执行服务]
     Executor --> Runner[一次性验证容器]
+```
+
+## React 工作台调用链
+
+本机 Compose 部署中，浏览器从 React 工作台发起项目任务和普通对话。两类运行共用队列与流式返回链路，项目任务还会准备独立的 Git worktree。
+
+```mermaid
+---
+config:
+  flowchart:
+    rankSpacing: 36
+    nodeSpacing: 30
+    wrappingWidth: 220
+---
+flowchart TB
+    Workbench["React 工作台<br/>浏览器主入口"]
+    API["FastAPI<br/>身份、工作区与任务接口"]
+    Store[("PostgreSQL<br/>任务队列与运行记录")]
+    Worker["应用 worker"]
+    Harness["StellarWeaver Harness<br/>Agent 循环 · 上下文 · 权限 · 预算"]
+    Model["DeepSeek / FakeModel"]
+    Worktree["Git worktree<br/>线程专属工作区"]
+    Executor["专用执行服务"]
+    Runner["一次性验证容器"]
+
+    Workbench -->|"REST · 提交、追问、审批"| API
+    API -.->|"SSE · 流式回复与运行事件"| Workbench
+    API -->|"事务入队与查询"| Store
+    Store -->|"排队任务"| Worker
+    Worker -.->|"PgJournal · 保存事件和结果"| Store
+    Worker -->|"准备会话并装配 Agent"| Harness
+    Harness -->|"ModelProvider"| Model
+    Harness -->|"文件与 Git 工具"| Worktree
+    Harness -->|"验证命令与工作区快照"| Executor
+    Executor -->|"隔离执行测试或构建"| Runner
+
+    classDef entry fill:#dbeafe,stroke:#1d4ed8,color:#0f172a,stroke-width:3px
+    class Workbench entry
 ```
 
 ## 模块职责
@@ -112,6 +150,8 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 
 `/undo` 从最近一次可撤销的内置写入开始。它核对当前内容是否仍匹配 `after` 哈希、文件类型与权限是否一致，以及编辑前备份是否匹配 `before` 哈希。用户重新授权后，`ChangesManager` 复检目标并记录撤销意图，再恢复旧内容或移除该操作创建的文件。每次只处理一项，Git 暂存区保持原样。若进程在恢复文件后退出，SQLite 的恢复逻辑可通过当前文件状态补记已完成结果。若用户同时写入了不同内容，则留下冲突记录。 [基线、差异和撤销](../src/stellarweaver/changes/__init__.py) · [会话协调](../src/stellarweaver/session/store.py) · [工作区锁](../src/stellarweaver/session/locking.py)
 
+旧会话缺少启动基线时，会将首次观察标记为 `after_recorded_operations`，表示观察发生在已记录操作之后。撤销只处理有完整证据的内置写入。命令、测试或 MCP 产生的其他变化由 `/diff` 与 Git 显示并交由维护者核对。工作区写锁约束采用相同锁协议的进程，写入前的目标复检可以发现已发生且可观测的外部修改。 [改动管理实现](../src/stellarweaver/changes/__init__.py)
+
 ### 扩展
 
 `ExtensionManager` 由 CLI 在任务或交互会话的生命周期内装配。它将 Skills 和 MCP 接入同一个工具注册表，因此扩展调用也会产生授权、执行和结果事件。
@@ -145,10 +185,11 @@ FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改�
 | `/api/v1` 接口 | 与界面的关系 |
 | --- | --- |
 | `auth/config`、`auth/login`、`auth/register` | 决定登录方式，建立账号及会话。 |
-| `workspaces`、`workspaces/folders`、`threads` | 提供工作区、可选择目录和线程列表。归档由 `PATCH /threads/{session_id}` 写入。 |
+| `workspaces`、`workspaces/folders`、`threads` | 提供工作区、可选择目录和线程列表。`PATCH /workspaces/{workspace_id}` 更新本机项目别名，`PATCH /threads/{session_id}` 更新线程归档状态。 |
 | `POST /runs`、`GET /runs/{run_id}` | 提交任务并取得运行标识，随后读取运行快照与待审批状态。排队部署返回 `202` 时，后台运行仍在处理。 |
 | `GET /runs/{run_id}/events` | 逐段接收可见文本与状态事件。断线可按最后处理的事件 `seq` 补读。 |
 | `report`、`patch`、`review` | 读取交付报告、下载补丁或发起所选改动的复验。复验资格由 API 判断。 |
+| `GET /experiment` | 按授权读取部署配置指定的本地实验报告。 |
 
 SSE 在服务端查询已提交的事件页，按 `seq` 递增发送。浏览器丢弃旧游标范围内的重复事件，连接中断后继续从上次已处理的序号获取。刷新时，可以先用 REST 恢复当前运行，再从持久事件重建过程。同一运行的页面重连和创建新运行是两个独立请求。 [前端连接与状态](../frontend/src/main.tsx) · [SSE 解码](../frontend/src/api.ts) · [API 与访问控制](../src/stellarweaver/web/app.py)
 
@@ -228,3 +269,7 @@ CLI `resume` 打开原 SQLite 会话并协调未闭合操作。Web worker 重启
 ## 模型上下文与扩展
 
 按请求进入模型的顺序，可从[扩展目录](#扩展)看本次允许的工具，接着从[上下文与指令](#上下文与指令)看请求如何取舍历史，然后到[模型适配](#模型)看协议转换。追踪一次工具修改时，从[领域与运行时](#领域与运行时)找到 `call_id`，到[工具与权限](#工具与权限)核对执行前检查，再到[会话持久化](#会话持久化)寻找对应的 `operation_id` 及终态。这两条阅读路线分别回答「模型为什么看到这些内容」和「一次副作用如何被执行、记录和恢复」。
+
+## SWE-bench Lite 评测调用链
+
+批量适配器从固定数据集修订生成实验清单，分开写入公开任务和评分输入。Agent 在题目指定的 Git 基线运行，共享模型与工具循环，可见测试由配方绑定到断网容器。生成候选后，独立评分环境加载官方测试字段和保存的补丁，记录应用与评分状态。汇总按清单列出全部题目。工作台实验入口按权限读取已发布的本地报告，日常项目运行继续使用 PostgreSQL Journal。 [批量适配器](../src/stellarweaver/evals/swebench.py) · [验证与复现](EVAL.md#swe-bench-lite-批量评测)

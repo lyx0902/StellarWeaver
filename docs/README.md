@@ -11,7 +11,7 @@ StellarWeaver 是一个本地 Coding Agent。它根据任务读取代码、提�
 | 权限与预算 | 支持只读、询问和工作区编辑策略。校验工具参数、文件哈希与运行预算。 | 编辑与测试逐项审批，支持取消、运行额度、DeepSeek 日用量与审计。 |
 | 测试和改动交付 | 使用 `/diff` 区分启动基线与会话增量。`/undo` 可撤销证据和当前文件匹配的内置编辑。 | 可配置验证命令，检查在一次性容器内执行。审阅改动块、导出补丁，并在新的独立工作区应用选中改动后重新验证。 |
 | 会话与恢复 | SQLite 会话记录，支持列表、回放、导出和恢复。 | PostgreSQL 持久队列及事件流。刷新按游标补读，中断后展示待核对操作。 |
-| 上下文与扩展 | 100,000 tokens 默认窗口配置，支持历史压缩、分目录 `AGENTS.md`、Python repo map、Skills 和本地 stdio MCP。 | 项目任务沿用共享上下文，输入框显示上下文用量和项目路径。普通对话关闭仓库上下文和工具。侧栏 Skills 库支持只读浏览明确配置的本机技能。 |
+| 上下文与扩展 | 100,000 tokens 默认窗口配置，支持历史压缩、分目录 `AGENTS.md`、Python repo map、Skills 和本地 stdio MCP。 | 项目任务沿用共享上下文。普通对话不加载仓库上下文和项目工具，使用 DeepSeek Flash 时可按需调用 `ds_search`。侧栏 Skills 库支持只读浏览已配置的技能。 |
 | 身份与部署 | 本机配置与当前操作系统用户权限。 | 本机 Compose 使用账号密码和会话 Cookie。可选团队配置支持 OIDC、成员角色和项目授权。 |
 
 当前本机入口为 `http://127.0.0.1:8787/`，使用 DeepSeek。项目源目录只读挂载，线程在持久卷中的独立 Git worktree 内编辑。专用执行服务接收该线程的快照并启动验证容器。普通对话可直接从侧栏「新任务」开始。
@@ -34,7 +34,9 @@ uv run --offline python -m stellarweaver.demo
 | [使用与部署](USAGE.md) | CLI 命令、模型配置、浏览器操作、Compose 与团队配置。 |
 | [架构与调用链](ARCHITECTURE.md) | 模块职责、同步与异步执行、授权边界和中断恢复。 |
 | [数据库](DATABASE.md) | PostgreSQL、SQLite、表关系、连接参数、迁移与恢复。 |
-| [验证与实验](VALIDATION.md) | 功能检查、真实模型评测、复现入口和下一批实验。 |
-| [实施阶段与 Harness 对照](ROADMAP.md) | M0–M5、G0–G5、工作台增量、能力差距和后续验收项。 |
+| [验证与实验](EVAL.md) | 功能检查、真实模型评测、复现入口和下一批实验。 |
+| [后续路线图](ROADMAP.md) | SWE-bench Lite 实验、工作台交付和后续验收项。 |
+| [开发进度](archive/PROGRESS.md) | M0–M5、G0–G5 和后续工作台增量。 |
+| [Harness 差距审计](archive/04_HARNESS_GAP_AUDIT.md) | 当前实现、已有证据及外部工作流对照。 |
 
-历史设计及交付记录见[归档](archive/README.md)。当前实验入口和评分方法见[SWE-bench Lite 批量评测](VALIDATION.md#swe-bench-lite-批量评测)。
+原始方案和历史验收见[归档索引](archive/README.md)。当前评测命令与后续实验设计分别见[SWE-bench Lite 批量评测](EVAL.md#swe-bench-lite-批量评测)和[专题实施方案](EVAL_PLAN.md)。
