@@ -4,6 +4,7 @@ export type Workspaces = {
   context_window_tokens: number; workspaces: Workspace[]
   can_submit?: boolean; account?: { name: string; role: 'admin' | 'member' | 'viewer' } | null
   manage_workspaces?: boolean
+  experiment_available?: boolean
 }
 export type AuthOptions = { oidc: boolean; bearer: boolean; password?: boolean }
 export type Thread = {

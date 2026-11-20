@@ -23,6 +23,7 @@ services:
       SW_WEB_AGENT_SKILLS_ROOT: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:+/installed-skills/agents}
       SW_WEB_NESTED_SKILLS_ROOT: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:+/installed-skills/agents/skills-codex}
       SW_WEB_CODEX_SKILLS_ROOT: ${SW_WORKBENCH_CODEX_SKILLS_ROOT:+/installed-skills/codex}
+      SW_WEB_EXPERIMENT_ROOT: ${SW_WORKBENCH_EXPERIMENT_ROOT:+/local-experiment}
     volumes:
       - *projects
       - type: bind
@@ -34,6 +35,12 @@ services:
       - type: bind
         source: ${SW_WORKBENCH_CODEX_SKILLS_ROOT:-../docs}
         target: /installed-skills/codex
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SW_WORKBENCH_EXPERIMENT_ROOT:-../docs}
+        target: /local-experiment
         read_only: true
         bind:
           create_host_path: false

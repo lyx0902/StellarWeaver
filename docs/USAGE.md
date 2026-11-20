@@ -57,6 +57,8 @@ Enter 提交，Shift+Enter 换行。运行中的线程可以编辑追问草稿�
 
 左侧用户名上方的「Skills 库」可搜索、查看和刷新本机技能。正文以只读文档展示，列表同时给出来源和扫描提示。可在本机 Compose 配置中将 `SW_WORKBENCH_AGENT_SKILLS_ROOT`、`SW_WORKBENCH_CODEX_SKILLS_ROOT` 指向希望提供给工作台已登录用户浏览的目录。Agents 根目录下已有的 `skills-codex` 会作为独立来源扫描。路径通过 API 容器只读挂载，每个来源扫描一级子目录中的 `SKILL.md`。
 
+本机初始管理员可在左侧「实验记录」查看已发布的离线运行，包括会话消息、工具参数和结果、事件、候选补丁及独立评分。`SW_WORKBENCH_EXPERIMENT_ROOT` 指向包含 `report.json` 的本机目录，API 只读挂载该目录。该记录保存在文件中。
+
 ## 本机 Compose
 
 ### 已部署实例

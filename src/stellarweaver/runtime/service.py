@@ -7,7 +7,7 @@ from stellarweaver.config import AppConfig
 from stellarweaver.policy import Approval, PolicyEngine
 from stellarweaver.providers.base import ModelProvider
 from stellarweaver.runtime.budget import Preflight
-from stellarweaver.runtime.loop import Agent, DeltaSink, EventSink
+from stellarweaver.runtime.loop import Agent, CompletionCheck, DeltaSink, EventSink
 from stellarweaver.session.journal import RunJournal
 from stellarweaver.tools.commands import CommandRunner
 from stellarweaver.tools.registry import ToolRegistry
@@ -26,6 +26,7 @@ def build_agent(
     preflight: Callable[[ToolRegistry], Preflight] | None = None,
     stream: bool = True,
     command_runner: CommandRunner | None = None,
+    completion_check: CompletionCheck | None = None,
     chat_only: bool = False,
 ) -> Agent:
     engine = PolicyEngine(
@@ -62,4 +63,5 @@ def build_agent(
         if chat_only
         else None,
         project_context=not chat_only,
+        completion_check=completion_check,
     )

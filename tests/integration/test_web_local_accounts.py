@@ -7,6 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 from threading import Event, Thread
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -24,9 +25,39 @@ from stellarweaver.web import db  # noqa: E402
 from stellarweaver.web.app import LOCAL_TENANT, create_app  # noqa: E402
 from stellarweaver.web.isolation import DockerRunner, Isolation  # noqa: E402
 from stellarweaver.web.local_accounts import LocalConfig  # noqa: E402
+from stellarweaver.web.oidc import SESSION_COOKIE  # noqa: E402
 from stellarweaver.web.worker import run_team_worker  # noqa: E402
 
 HEADERS = {"X-StellarWeaver-Request": "1"}
+
+
+def test_experiment_file_is_visible_only_to_initial_local_owner(tmp_path, monkeypatch):
+    from stellarweaver.web import app as web_app
+
+    owner, other_tenant = uuid4(), uuid4()
+    config = LocalConfig(tmp_path, "D:/Projects", LOCAL_TENANT, owner, str(uuid4()), "legacy")
+    identity = {"owner": (str(LOCAL_TENANT), str(owner)), "other": (str(other_tenant), str(owner))}
+    monkeypatch.setattr(web_app, "session_member", lambda _, cookie: identity.get(cookie))
+    monkeypatch.setattr(web_app.local_accounts, "lookup", lambda *_: "Local Admin")
+    monkeypatch.setattr(web_app.local_accounts, "projects", lambda *_: [])
+    report = tmp_path / "report.json"
+    report.write_text('{"schema_version":1,"instance_id":"trial"}', encoding="utf-8")
+    app = create_app(
+        Mock(), {}, tmp_path, queued=True, isolated=True, local=config, experiment_file=report
+    )
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    assert client.get("/api/v1/experiment").status_code == 401
+    client.cookies.set(SESSION_COOKIE, "other")
+    assert client.get("/api/v1/workspaces").json()["experiment_available"] is False
+    assert client.get("/api/v1/experiment").status_code == 404
+    client.cookies.set(SESSION_COOKIE, "owner")
+    assert client.get("/api/v1/workspaces").json()["experiment_available"] is True
+    response = client.get("/api/v1/experiment")
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json()["instance_id"] == "trial"
+    report.write_text("invalid", encoding="utf-8")
+    assert client.get("/api/v1/experiment").status_code == 503
 
 
 def git_repo(root: Path, name: str) -> None:

@@ -271,6 +271,7 @@ def main() -> None:
             if (path := os.getenv(name))
             and (name != "SW_WEB_NESTED_SKILLS_ROOT" or Path(path).exists())
         ]
+        experiment_root = os.getenv("SW_WEB_EXPERIMENT_ROOT")
         app = create_app(
             engine,
             bearers,
@@ -286,6 +287,7 @@ def main() -> None:
             legacy_owner=local_owner[1] if local_owner else None,
             local=local,
             skill_roots=skill_roots,
+            experiment_file=Path(experiment_root) / "report.json" if experiment_root else None,
         )
         uvicorn.run(
             app, host=args.host, port=args.port, proxy_headers=False, access_log=oidc is None

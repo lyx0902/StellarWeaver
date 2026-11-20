@@ -9,7 +9,7 @@ import math
 import random
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -44,6 +44,16 @@ from stellarweaver.tools.workspace import ToolError
 
 EventSink = Callable[[AgentEvent], None | Awaitable[None]]
 DeltaSink = Callable[[TextDelta], None | Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class CompletionProof:
+    status: Literal["passed", "failed", "unavailable"]
+    reason: str
+    evidence: JSONDict
+
+
+CompletionCheck = Callable[[float], Awaitable[CompletionProof]]
 
 SYSTEM = """You are StellarWeaver, a local coding assistant.
 Inspect relevant files before editing. Use expected_sha256 from read_file for edits.
@@ -100,6 +110,7 @@ class Agent:
         max_retry_delay_seconds: float = 30.0,
         context_config: ContextConfig | None = None,
         preflight: Preflight | None = None,
+        completion_check: CompletionCheck | None = None,
         system_prompt: str | None = None,
         project_context: bool = True,
     ) -> None:
@@ -134,6 +145,7 @@ class Agent:
         self.max_retry_delay_seconds = max_retry_delay_seconds
         self.context_config = context_config or ContextConfig()
         self.preflight = preflight or empty_preflight
+        self.completion_check = completion_check
         self._context = ContextManager()
         self._instructions = InstructionLoader(registry.workspace)
         self._repo_map = RepoMap(registry.workspace)
@@ -160,6 +172,8 @@ class Agent:
         self._operations: dict[str, str] = {}
         self._cancel_requested = False
         self._model_calls = self._tool_calls = self._input_tokens = self._output_tokens = 0
+        self._completion_attempts = 0
+        self._completion_proofs: list[JSONDict] = []
         self._estimated = self._usage_incomplete = False
         self._start = 0.0
         self._last_failure: str | None = None
@@ -271,6 +285,7 @@ class Agent:
         evidence: list[JSONDict] = []
         if self._recovery_report is not None:
             evidence.append({"kind": "recovery", **self._recovery_report})
+        evidence.extend({"kind": "completion_check", **item} for item in self._completion_proofs)
         checks: dict[str, ToolResult] = {}
         for result in self.results:
             if result.tool_name in {"create_file", "edit_file"} and result.status == "ok":
@@ -341,7 +356,7 @@ class Agent:
             dispatch_task: asyncio.Task[ToolResult] | None = None
             try:
                 remaining = self._remaining()
-                if self._tool_calls >= self.limits.max_tool_calls:
+                if self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls:
                     raise BudgetExceeded("max_tool_calls")
                 self._tool_calls += 1
                 dispatch_task = asyncio.create_task(
@@ -1067,6 +1082,37 @@ class Agent:
             if self._owns_store:
                 self.store.close()
 
+    async def _check_completion(self) -> bool:
+        """Run the opt-in verifier and request at most one repair in this run."""
+        assert self.completion_check is not None
+        if self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls:
+            raise BudgetExceeded("max_tool_calls before completion verification")
+        remaining = self._remaining()
+        self._completion_attempts += 1
+        attempt = self._completion_attempts
+        await self._emit("reproduction.started", {"attempt": attempt})
+        proof = await self.completion_check(remaining)
+        record = {"attempt": attempt, **asdict(proof)}
+        self._completion_proofs.append(record)
+        await self._emit("reproduction.completed", record)
+        if proof.status != "failed" or attempt != 1:
+            return False
+        if self._model_calls >= self.limits.max_model_calls:
+            raise BudgetExceeded("max_model_calls after failed completion verification")
+        message = Message(
+            "user",
+            "StellarWeaver completion verification failed. Continue the current repair, using "
+            "the observed result below as evidence. The existing permissions and budget still apply.\n"
+            + json.dumps(
+                {"reason": proof.reason, "diagnostic": proof.evidence.get("diagnostic")},
+                ensure_ascii=False,
+            ),
+        )
+        self.store.append_message(message)
+        self.messages.append(message)
+        await self._emit("reproduction.feedback", {"attempt": attempt})
+        return True
+
     async def _drive(self) -> tuple[RunStatus, str, str]:
         while True:
             schemas = tuple(self.registry.schemas())
@@ -1128,4 +1174,8 @@ class Agent:
                 return self._completion(*initial_stop, final_text=reply.text)
             if reply.stop_reason == "tool_calls":
                 return self._completion("failed", "tool_calls stop without calls")
-            return self._completion("completed", "model finished", reply.text)
+            if self.completion_check is None:
+                return self._completion("completed", "model finished", reply.text)
+            if not await self._check_completion():
+                status = self._completion_proofs[-1]["status"]
+                return self._completion("completed", f"reproduction {status}", reply.text)

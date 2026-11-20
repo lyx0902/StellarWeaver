@@ -239,6 +239,7 @@ def create_app(
     legacy_owner: Principal | None = None,
     local: local_accounts.LocalConfig | None = None,
     skill_roots: Sequence[tuple[str, Path]] = (),
+    experiment_file: Path | None = None,
 ) -> FastAPI:
     identities = (*principals.values(), *(subjects or {}).values())
     if isolated and not queued:
@@ -382,6 +383,16 @@ def create_app(
     def require_write(p: Principal) -> None:
         if not p.can_write:
             raise HTTPException(403, "This account has read-only project access")
+
+    def may_view_experiment(p: Principal) -> bool:
+        return (
+            experiment_file is not None
+            and local is not None
+            and p.local_projects is not None
+            and p.tenant == local.legacy_tenant
+            and p.member is not None
+            and p.member.id == local.legacy_member
+        )
 
     @app.get("/api/v1/auth/config")
     def auth_config() -> JSONDict:
@@ -532,6 +543,7 @@ def create_app(
             "isolated": isolated,
             "workspaces": projects,
             "manage_workspaces": p.local_projects is not None,
+            "experiment_available": may_view_experiment(p),
         }
 
     @app.get("/api/v1/workspaces/folders")
@@ -1005,6 +1017,28 @@ def create_app(
         if p.member is None or p.member.role != "admin" or p.access is None:
             raise HTTPException(403, "Administrator access required")
         return await asyncio.to_thread(db.usage_today, engine, str(p.tenant), p.access)
+
+    @app.get("/api/v1/experiment")
+    def local_experiment(p: Principal = require_principal) -> Response:
+        if not may_view_experiment(p) or experiment_file is None:
+            raise HTTPException(404)
+        limit = 8 * 1024 * 1024
+        try:
+            with experiment_file.open("rb") as report:
+                content = report.read(limit + 1)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "实验记录尚未发布。") from exc
+        except OSError as exc:
+            raise HTTPException(503, "无法读取实验记录。") from exc
+        if len(content) > limit:
+            raise HTTPException(413, "实验记录超出 8 MiB。")
+        try:
+            data = json.loads(content)
+        except (ValueError, RecursionError) as exc:
+            raise HTTPException(503, "实验记录格式不正确。") from exc
+        if not isinstance(data, dict) or data.get("schema_version") != 1:
+            raise HTTPException(503, "实验记录格式不受支持。")
+        return Response(content, media_type="application/json")
 
     @app.get("/api/v1/skills")
     def list_skills(p: Principal = require_principal, refresh: bool = False) -> JSONDict:

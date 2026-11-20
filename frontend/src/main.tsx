@@ -6,6 +6,7 @@ import { ApprovalCard, ContextMeter, Turn, runLabel } from './conversation'
 import { Inspector, type InspectorTab } from './inspector'
 import { ProjectPicker, WorkspaceGroup } from './projects'
 import { SkillsPanel } from './skills'
+import { ExperimentPanel } from './experiment'
 import './style.css'
 
 const tokenKey = 'stellarweaver.local-token'
@@ -24,6 +25,7 @@ function App() {
   const [browserSession, setBrowserSession] = useState(false)
   const [showAdmin, setShowAdmin] = useState(false)
   const [showSkills, setShowSkills] = useState(false)
+  const [showExperiment, setShowExperiment] = useState(false)
   const [listing, setListing] = useState<Workspaces | null>(null)
   const [workspace, setWorkspace] = useState('')
   const [threads, setThreads] = useState<Thread[]>([])
@@ -314,6 +316,7 @@ function App() {
     setMode('read-only')
     setShowAdmin(false)
     setShowSkills(false)
+    setShowExperiment(false)
     setShowPicker(false)
     openRun('', null, true)
     setError('')
@@ -475,6 +478,8 @@ function App() {
         {!threads.length && <p className="sidebar-empty">还没有线程。</p>}
       </nav>
       <div className="sidebar-footer">
+        {listing.experiment_available && <button type="button" className="sidebar-experiment"
+          onClick={() => setShowExperiment(true)}>实验记录</button>}
         <button type="button" className="sidebar-skills" onClick={() => setShowSkills(true)}>Skills 库</button>
         <span className="local-indicator"><i />{listing.account?.name ?? '本机工作台'}</span>
         {listing.account?.role === 'admin' && <button type="button" onClick={() => setShowAdmin(true)}>审计与用量</button>}
@@ -598,6 +603,8 @@ function App() {
     </>}
     {showAdmin && <AdminPanel token={token} onClose={() => setShowAdmin(false)} />}
     {showSkills && <SkillsPanel token={token} onClose={() => setShowSkills(false)} />}
+    {showExperiment && listing.experiment_available &&
+      <ExperimentPanel token={token} onClose={() => setShowExperiment(false)} />}
     {showPicker && <ProjectPicker onClose={() => setShowPicker(false)} onCreate={createProject} />}
   </main>
 }

@@ -67,6 +67,20 @@ uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --o
 
 待再次评测时使用新的输出目录。公开仓库提供用例、评分器和规则来源，历史原始报告、日志和工作区保存在本机。历史结果的时间、token、分母和规则修订见[评测结果](../evals/RESULTS.md)。重评分及来源记录见[评测手册](../evals/README.md)与[评分规则档案](../evals/provenance/README.md)。
 
+## SWE-bench Lite 单题复现试跑
+
+`stellarweaver.evals.swebench_pilot` 支持 Marshmallow 开发题 `marshmallow-code__marshmallow-1359`。从本机试跑资料读取公开题目、基线 checkout 和测试依赖，为每次运行新建工作区。`replay` 可对原始基线或通过 `--patch` 提供的补丁执行复现。`agent` 使用现有 DeepSeek 配置，可加 `--no-gate` 运行对照组，两种配置提供相同的测试命令。
+
+复现脚本来自公开 issue，运行器在修改前确认预期异常。候选补丁准备交付时，在断网容器里运行同一份只读脚本。首次复现失败会追加一次修复机会，模型请求、执行工具和复现都在原有运行预算内。报告保留脚本哈希、候选快照、退出码和异常摘要。官方测试补丁及评分留在单独的评分环境。
+
+本机试跑资料位于 `.validation/swebench-lite-pilot`，其中 `agent-input.json` 只含题号和公开题面，`marshmallow-1359` 保存基线提交，`test-deps` 包含该题测试依赖。已有资料时，可在新的输出目录重跑。
+
+```powershell
+uv run --locked python -m stellarweaver.evals.swebench_pilot agent `
+  --assets .validation/swebench-lite-pilot `
+  --output .validation/swebench-gate-next --env-file .env
+```
+
 ## 后续实验
 
 先冻结任务、评分器、预算及运行配置，再逐步扩大覆盖。每轮保留项目提交、平台、依赖、模型、权限、请求用量和评分器哈希。

@@ -48,6 +48,13 @@ a { color: var(--accent); }
 .admin-panel h3 { margin: 14px 0 6px; }
 .admin-panel table { width: 100%; border-collapse: collapse; }
 .admin-panel :is(td, th) { border-bottom: 1px solid var(--line); text-align: left; padding: 5px 7px; }
+.experiment-panel { width: min(960px, 94vw); }
+.experiment-panel h3 { overflow-wrap: anywhere; }
+.experiment-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.experiment-tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--paper); }
+.experiment-evidence { margin: 8px 0; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }
+.experiment-evidence summary { cursor: pointer; overflow-wrap: anywhere; }
+.experiment-evidence pre { max-height: 40dvh; margin-bottom: 0; white-space: pre-wrap; overflow: auto; overflow-wrap: anywhere; }
 .panel-actions { display: flex; gap: 6px; }
 .usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(230px, 100%), 1fr)); gap: 12px; }
 .usage-cards section { border: 1px solid var(--line); padding: 0 12px 12px; border-radius: 8px; }
@@ -111,7 +118,7 @@ a { color: var(--accent); }
 .local-indicator i { width: 7px; height: 7px; border-radius: 50%; background: #79d8ad; }
 .sidebar-footer button { padding: 4px 9px; }
 .sidebar-footer { flex-wrap: wrap; }
-.sidebar-footer .sidebar-skills { flex-basis: 100%; justify-content: flex-start; text-align: left; }
+.sidebar-footer :is(.sidebar-skills, .sidebar-experiment) { flex-basis: 100%; justify-content: flex-start; text-align: left; }
 .nav-toggle, .nav-scrim, .panel-scrim { display: none; }
 .conversation { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
 .topbar { display: flex; align-items: center; gap: 10px; padding: 10px 21px; min-height: 60px; background: var(--paper); border-bottom: 1px solid var(--line); }
