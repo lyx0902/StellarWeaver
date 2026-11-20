@@ -222,7 +222,7 @@ class SessionSnapshot:
     def as_dict(self) -> JSONDict:
         return {
             "metadata": self.metadata,
-            "messages": [asdict(item) for item in self.messages],
+            "messages": [item.recorded() for item in self.messages],
             "events": [asdict(item) for item in self.events],
             "tool_executions": list(self.tool_executions),
             "tool_results": [asdict(item) for item in self.results],
@@ -477,7 +477,7 @@ class SessionStore:
             "SELECT COALESCE(MAX(position),-1)+1 FROM messages"
         ).fetchone()[0]
         self.connection.execute(
-            "INSERT INTO messages VALUES(?,?,?)", (message_id, position, _json(asdict(message)))
+            "INSERT INTO messages VALUES(?,?,?)", (message_id, position, _json(message.recorded()))
         )
         return message_id
 
@@ -506,7 +506,7 @@ class SessionStore:
                         call.arguments_json,
                     ),
                 )
-            self._event("assistant.completed", asdict(message))
+            self._event("assistant.completed", message.recorded())
         return message_id
 
     def operation_id_for(self, assistant_id: str, call_id: str) -> str:

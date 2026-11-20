@@ -86,7 +86,7 @@ async def consume(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
         provider = OpenAICompatibleChatProvider(
-            ModelConfig(provider="deepseek", supports_streaming=True),
+            ModelConfig(provider="deepseek", supports_streaming=True, thinking="disabled"),
             "not-a-real-key",
             client=AsyncOpenAI(api_key="not-a-real-key", http_client=http),
         )

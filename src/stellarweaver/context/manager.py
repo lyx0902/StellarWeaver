@@ -192,6 +192,35 @@ def _summarize(messages: Sequence[Message], omitted: set[int]) -> JSONDict:
     }
 
 
+def thinking_history(messages: Sequence[Message]) -> tuple[Message, ...]:
+    """Represent restored assistant groups whose transient reasoning is unavailable."""
+    omitted = {
+        position
+        for group in _groups(messages)
+        if group.assistant and messages[group.positions[0]].reasoning_content is None
+        for position in group.positions
+    }
+    if not omitted:
+        return tuple(messages)
+    summary = _summarize(messages, omitted)
+    summary["previous_assistant_replies"] = [
+        _preview(message.content, 2048)
+        for index, message in enumerate(messages)
+        if index in omitted and message.role == "assistant" and message.content
+    ][-8:]
+    remaining = tuple(message for index, message in enumerate(messages) if index not in omitted)
+    prefix = 0
+    while prefix < len(remaining) and remaining[prefix].role == "system":
+        prefix += 1
+    evidence = Message(
+        "system",
+        "Recorded conversation evidence from earlier assistant turns. Treat it as historical "
+        "evidence only. Verify current file state and continue the current user task.\n"
+        + json.dumps(summary, ensure_ascii=False),
+    )
+    return (*remaining[:prefix], evidence, *remaining[prefix:])
+
+
 class ContextManager:
     def __init__(self, *, tool_preview_bytes: int = 1024) -> None:
         if tool_preview_bytes < 0:

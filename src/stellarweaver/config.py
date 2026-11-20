@@ -13,13 +13,21 @@ class StrictConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+def _default_output_tokens(data: dict[str, object]) -> int:
+    if data.get("provider") == "deepseek" and data.get("thinking") == "enabled":
+        return 8192
+    return 4096
+
+
 class ModelConfig(StrictConfig):
     provider: Literal["fake", "deepseek", "openai-compatible-chat"] = "fake"
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-flash"
     api_key_env: str = "STELLARWEAVER_API_KEY"
+    thinking: Literal["enabled", "disabled"] = "enabled"
+    reasoning_effort: Literal["low", "high", "max"] = "high"
     context_window_tokens: int = Field(default=100_000, ge=2048)
-    max_output_tokens: int = Field(default=4096, ge=1)
+    max_output_tokens: int = Field(default_factory=_default_output_tokens, ge=1)
     request_timeout_seconds: int = Field(default=90, ge=1, le=600)
     supports_streaming: bool = False
     supports_tools: bool = True

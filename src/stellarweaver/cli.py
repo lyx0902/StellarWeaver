@@ -20,7 +20,7 @@ from rich.console import Console
 
 from stellarweaver import __version__
 from stellarweaver.changes import ChangeObservationUnknown, ChangesManager
-from stellarweaver.config import AppConfig, env_file_path, get_api_key, load_config
+from stellarweaver.config import AppConfig, ModelConfig, env_file_path, get_api_key, load_config
 from stellarweaver.context import ContextBudgetExceeded, ContextManager
 from stellarweaver.domain import Message, ModelRequest, RunOutcome
 from stellarweaver.extensions import ExtensionManager
@@ -85,7 +85,7 @@ def build_provider(
     overrides: dict[str, object] = {"provider": selected}
     if stream is not None:
         overrides["supports_streaming"] = stream
-    model = config.model.model_copy(update=overrides)
+    model = ModelConfig.model_validate({**config.model.model_dump(exclude_unset=True), **overrides})
     key = get_api_key(model, workspace, env_file)
     if key is None:
         raise ValueError(
@@ -102,8 +102,9 @@ def effective_config(
     stream: bool | None,
 ) -> AppConfig:
     """Include explicit CLI overrides in the reproducible credential-free snapshot."""
-    model = config.model.model_copy(
-        update={
+    model = ModelConfig.model_validate(
+        {
+            **config.model.model_dump(exclude_unset=True),
             "provider": provider or config.model.provider,
             **({"supports_streaming": stream} if stream is not None else {}),
         }

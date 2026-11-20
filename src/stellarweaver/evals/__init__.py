@@ -352,7 +352,12 @@ async def run_suite(
         raise ValueError("Provider must be fake or deepseek")
     settings = load_config(Path.cwd())
     model_config = settings.model.model_copy(
-        update={"provider": "deepseek", "supports_streaming": True, "max_output_tokens": 2048}
+        update={
+            "provider": "deepseek",
+            "supports_streaming": True,
+            "max_output_tokens": 2048,
+            "thinking": "disabled",
+        }
     )
     key = get_api_key(model_config, Path.cwd(), env_file) if provider == "deepseek" else None
     if provider == "deepseek" and not key:
@@ -465,6 +470,7 @@ async def run_suite(
             "timestamp_utc": datetime.now(UTC).isoformat(),
             "provider": provider,
             "model": model_config.model if provider == "deepseek" else "scripted-reference",
+            "thinking": model_config.thinking if provider == "deepseek" else None,
             "environment": {"python": sys.version.split()[0], "platform": platform.platform()},
             "catalog_sha256": provenance["catalog_sha256"],
             "scoring_provenance": provenance,

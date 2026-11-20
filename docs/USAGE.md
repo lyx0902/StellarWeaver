@@ -20,6 +20,10 @@ uv run stellarweaver exec --workspace . --provider deepseek --env-file .env --po
 
 `doctor --offline` 检查本机配置和可执行文件。`doctor --check-model` 显式发送一条短模型请求。DeepSeek 默认模型为 `deepseek-flash`，协议为 Chat Completions。`openai-compatible-chat` 接受自定义模型和服务地址，具体能力由实际 endpoint 决定。可通过 `--stream` 或 `--no-stream` 覆盖 CLI 的流式选择。
 
+CLI 和 Web 的 DeepSeek 默认启用 Thinking，强度为 `high`。CLI 通过 `[model]` 的 `thinking` 和 `reasoning_effort` 调整。设置 `thinking = "disabled"` 可运行 Non-thinking，启用时强度可选 `low`、`high`、`max`。原始推理只在当前进程的工具对话中回传，界面、持久化会话和导出记录保存可见回复与工具证据。
+
+DeepSeek Thinking 默认单次输出上限为 8,192 token，包含推理和可见文本。CLI 保留配置中显式设置的 `max_output_tokens`。模型输出仍受整轮运行预算限制。
+
 ### 会话、策略和改动
 
 下列命令使用既有 CLI 会话的 ID。`replay` 读取历史并输出事件，`resume` 进入恢复流程。`export` 支持导出持久会话记录。
@@ -85,6 +89,7 @@ Docker Desktop 使用 Linux 容器。先拉取验证镜像 `docker pull python:3
 | `SW_PG_ADMIN_PASSWORD`、`SW_PG_APP_PASSWORD` | 为首次创建的数据库分别设置密码。管理员供迁移，应用角色供日常运行。 |
 | `SW_WORKBENCH_WORKSPACE`、`SW_WORKBENCH_PROJECTS_ROOT` | 初始 Git 项目的绝对路径，以及允许用户浏览选择的上级项目目录。用正斜杠表示 Windows 路径，例如 `D:/Projects/Example` 与 `D:/Projects`。 |
 | `SW_WORKBENCH_PROVIDER`、`SW_WORKBENCH_REPAIR` | `fake` 用于离线演示，`deepseek` 使用 `.env` 中的模型密钥。`1` 启用经审批的修复模式。 |
+| `SW_WEB_DEEPSEEK_THINKING`、`SW_WEB_DEEPSEEK_REASONING_EFFORT` | 默认为 `enabled`、`high`。在 Compose 的环境配置中修改后重新创建 API 和 worker，直接启动 Web 时可使用同名进程环境变量。 |
 | `SW_G5_LOCAL_OWNER_ID`、`SW_G5_MEMBERS_FILE` | 为初始本机管理员选一个固定 UUID。成员文件使用绝对路径，示例见下方。已有实例保留原 UUID。 |
 | `SW_G5_EXECUTOR_TOKEN` | 生成一个至少 32 字符的随机执行服务凭据，供 worker 和执行器内部通信。浏览器使用账号密码。 |
 | `SW_WORKBENCH_PORT`、`SW_PG_PORT` | 本机覆盖层默认分别为 `8787`、`55434`。配置中的显式端口优先生效。 |

@@ -66,7 +66,9 @@ flowchart LR
 
 ### 模型
 
-`ModelProvider` 公开 `capabilities`、`complete` 和 `stream`，让运行时先检查是否支持工具、流式和上下文窗口。`OpenAICompatibleChatProvider` 将领域消息转换为 Chat Completions 输入，保留原始工具参数和结果 ID。DeepSeek 专属的 thinking 参数由适配器设置，领域层只接收可见文本、工具调用、停止原因和公开用量。
+`ModelProvider` 公开 `capabilities`、`complete` 和 `stream`，让运行时先检查是否支持工具、流式和上下文窗口。`OpenAICompatibleChatProvider` 将领域消息转换为 Chat Completions 输入，保留原始工具参数和结果 ID。适配器为 DeepSeek 显式发送 `thinking` 和启用时的 `reasoning_effort`，CLI 与 Web 默认使用 `enabled`、`high`。
+
+DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`，其中包括有工具调用和无工具调用的助手回复。流式和非流式路径将这部分数据留在进程内。持久化、导出和文本增量只保留公开内容。预算压缩整体保留或移除助手及其工具结果。跨进程续接缺少原始推理时，运行时以历史回复和工具证据生成模型上下文，并移除已归纳的旧助手及工具消息。Journal 仍保存可供核对的回复和工具记录。 [DeepSeek Thinking 协议](https://api-docs.deepseek.com/guides/thinking_mode/)
 
 流式响应经过 `ChatCompletionAccumulator`。文本片段可在到达时以 `text.delta` 通知界面。工具片段按索引合并 ID、函数名和参数，聚合器核对完成标记、工具 ID 与资源上限，随后提交完整的 `AssistantReply`。工具执行位于聚合之后。部分流中断时，事件可记录已经显示的片段，当前不完整回复不会进入工具执行阶段。Provider 能力或用户配置关闭流式时，Agent 使用一次非流式请求。
 
@@ -78,7 +80,7 @@ flowchart LR
 
 - **指令加载。** `InstructionLoader` 按工作区根和已操作路径的祖先目录加载 `AGENTS.md`，记录来源、范围和文件哈希。准备修改时，`_before_execute` 根据目标路径判定模型是否已看到适用指令。用户批准后，`_after_authorize` 再检查一次指令指纹。等待期间指令变动会以 `INSTRUCTIONS_UPDATED` 返回，让下一轮先看到新增要求，再决定操作。
 - **仓库索引。** `RepoMap` 在工作区文件约束下枚举候选路径，以 Python AST 提取函数、类、签名和行号。显式路径、曾访问位置和关键词影响排序。索引按预算截取，提供下一步搜索和读文件的线索。实际文件内容由工具读取，编辑依据最新文件哈希执行。
-- **窗口计算。** 默认配置下，`100000 − 4096 − 2048 = 93856` 是模型输出预留与安全余量扣除后的估算输入额度。工具 schema 同样占用窗口。计量采用保守的 UTF-8 JSON 字节估算，实际服务端用量进入独立字段。
+- **窗口计算。** DeepSeek Thinking 默认从 100,000 token 窗口中预留 8,192 token 输出和 2,048 token 安全余量，估算输入额度为 89,760 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。计量采用保守的 UTF-8 JSON 字节估算，实际服务端用量进入独立字段。
 - **历史压缩。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。分组保留最新用户任务、系统消息、最近的完整 assistant 回合和最近的完整工具组。过长工具输出以有界摘要进入请求，其中保留路径、哈希、操作 ID、证据位置和关键结果。更早的回合按组移出，生成带来源标记的摘要并记录检查点。原始消息仍在 Journal。必需数据放不进窗口时，运行以预算超限结束。
 
 窗口大小约束一次请求。`LimitsConfig` 还分别约束整次任务的模型调用数、工具调用数、累计输入输出用量和墙钟时长。默认单次任务上限为 30 次模型请求、100 次工具调用和 900 秒，累计输入和输出预算分别为 1,000,000 与 30,000 tokens。一次请求适配窗口后，仍需通过整次运行的剩余额度检查。 [指令加载](../src/stellarweaver/instructions/__init__.py) · [仓库索引](../src/stellarweaver/context/repo_map.py) · [历史投影](../src/stellarweaver/context/manager.py) · [运行预算](../src/stellarweaver/runtime/loop.py)

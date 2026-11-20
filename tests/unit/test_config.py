@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from stellarweaver.cli import effective_config
 from stellarweaver.config import AppConfig, ExecutionConfig, ModelConfig, get_api_key, load_config
 
 
@@ -23,6 +24,19 @@ def test_load_toml_and_missing_explicit_config(tmp_path: Path) -> None:
     assert load_config(tmp_path).model.provider == "deepseek"
     with pytest.raises(FileNotFoundError):
         load_config(tmp_path, tmp_path / "absent.toml")
+
+
+def test_deepseek_thinking_output_default_and_explicit_cli_override() -> None:
+    selected = effective_config(AppConfig(), "deepseek", None, None).model
+    assert (selected.thinking, selected.reasoning_effort, selected.max_output_tokens) == (
+        "enabled",
+        "high",
+        8192,
+    )
+    assert ModelConfig(provider="deepseek", thinking="disabled").max_output_tokens == 4096
+    assert ModelConfig(provider="openai-compatible-chat").max_output_tokens == 4096
+    config = AppConfig(model=ModelConfig(max_output_tokens=512))
+    assert effective_config(config, "deepseek", None, None).model.max_output_tokens == 512
 
 
 def test_env_credentials_do_not_leak_to_environment(

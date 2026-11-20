@@ -11,12 +11,14 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import uvicorn
+from pydantic import ValidationError
 from sqlalchemy import URL
 from sqlalchemy.exc import OperationalError
 
-from stellarweaver.config import ModelConfig, get_api_key
+from stellarweaver.config import get_api_key
 from stellarweaver.web import db
 from stellarweaver.web.app import LOCAL_TENANT, Principal, create_app
+from stellarweaver.web.execution import web_model_config
 from stellarweaver.web.identity import Member, load_members
 from stellarweaver.web.isolation import Isolation
 from stellarweaver.web.local_accounts import LocalConfig, is_project
@@ -159,12 +161,14 @@ def main() -> None:
         parser.error("Set STELLARWEAVER_DATABASE_DSN")
     if args.command == "serve" and not token and not members and local is None:
         parser.error("Set STELLARWEAVER_WEB_TOKEN")
+    try:
+        model = web_model_config(args.provider)
+    except ValidationError:
+        parser.error(
+            "Set SW_WEB_DEEPSEEK_THINKING to enabled or disabled and effort to low, high or max"
+        )
     needs_key = args.provider == "deepseek" and (args.command == "worker" or not args.queued)
-    key = (
-        get_api_key(ModelConfig(provider="deepseek"), Path.cwd(), args.env_file)
-        if needs_key
-        else None
-    )
+    key = get_api_key(model, Path.cwd(), args.env_file) if needs_key else None
     if needs_key and not key:
         parser.error(
             "DeepSeek key missing in launcher configuration; use --provider fake for the offline demo"

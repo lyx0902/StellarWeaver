@@ -162,7 +162,7 @@ class PgJournal:
             INSERT INTO sw.messages(tenant_id,run_id,id,body)
             VALUES(:tenant,:run,:id,CAST(:body AS jsonb))
         """),
-            {**self._keys, "id": identifier, "body": pack(asdict(message))},
+            {**self._keys, "id": identifier, "body": pack(message.recorded())},
         )
         return identifier
 
@@ -242,7 +242,7 @@ class PgJournal:
                         "args": call.arguments_json,
                     },
                 )
-            self.add_event_in_transaction(conn, "assistant.completed", asdict(message))
+            self.add_event_in_transaction(conn, "assistant.completed", message.recorded())
             return identifier
 
     def operation_id_for(self, assistant_id: str, call_id: str) -> str:

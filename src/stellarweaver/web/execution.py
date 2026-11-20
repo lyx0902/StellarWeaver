@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 from threading import Event
 from typing import cast
 from uuid import uuid4
@@ -35,6 +36,22 @@ from stellarweaver.web.review import apply_selection
 Runner = DockerRunner | RemoteRunner
 
 
+def web_model_config(provider: str) -> ModelConfig:
+    if provider == "fake":
+        return ModelConfig(supports_streaming=True)
+    overrides = {
+        field: os.environ[name]
+        for field, name in (
+            ("thinking", "SW_WEB_DEEPSEEK_THINKING"),
+            ("reasoning_effort", "SW_WEB_DEEPSEEK_REASONING_EFFORT"),
+        )
+        if name in os.environ
+    }
+    return ModelConfig.model_validate(
+        {"provider": "deepseek", "supports_streaming": True, **overrides}
+    )
+
+
 def offline_repository_model() -> FakeModel:
     return FakeModel(
         [
@@ -64,9 +81,7 @@ async def run(
     if journal.delivery:
         journal.delivery.begin()
     config = AppConfig(
-        model=ModelConfig(
-            provider="fake" if provider == "fake" else "deepseek", supports_streaming=True
-        ),
+        model=web_model_config(provider),
         policy=PolicyConfig(preset="ask" if repair else "read-only"),
     )
     commands = runner.isolation.commands if runner else (tuple(VERIFY_ARGV),)

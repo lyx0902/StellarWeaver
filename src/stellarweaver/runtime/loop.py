@@ -16,6 +16,7 @@ from uuid import uuid4
 from stellarweaver.changes import ChangeObservationUnknown
 from stellarweaver.config import ContextConfig, LimitsConfig
 from stellarweaver.context import ContextBudgetExceeded, ContextManager, ContextProtocolError
+from stellarweaver.context.manager import thinking_history
 from stellarweaver.context.repo_map import RepoMap
 from stellarweaver.domain import (
     AgentEvent,
@@ -442,12 +443,18 @@ class Agent:
         self._output_tokens += completion
         self._estimated |= estimated
         self._usage_incomplete |= incomplete and estimated
+        breakdown = {
+            key: data[key]
+            for key in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "reasoning_tokens")
+            if type(data.get(key)) is int and data[key] >= 0
+        }
         return {
             "input_tokens": prompt,
             "input_estimated": input_estimated,
             "output_tokens": completion,
             "estimated": estimated,
             "usage_incomplete": incomplete and estimated,
+            **breakdown,
         }
 
     async def _consume_stream(self, request: ModelRequest) -> AssistantReply:
@@ -479,7 +486,8 @@ class Agent:
         self, initial_request: ModelRequest, input_estimate: int
     ) -> AssistantReply:
         request = initial_request
-        streaming = self.stream and self.provider.capabilities().streaming
+        capabilities = self.provider.capabilities()
+        streaming = self.stream and capabilities.streaming
         for retry_index in range(self.max_retries + 1):
             request = self._checked_request(request, input_estimate)
             self._model_calls += 1
@@ -491,10 +499,11 @@ class Agent:
                     "retry_index": retry_index,
                     "streaming": streaming,
                     "stream_fallback": self.stream and not streaming,
-                    "context_window_tokens": self.provider.capabilities().context_window_tokens,
+                    "context_window_tokens": capabilities.context_window_tokens,
                     "input_tokens": input_estimate,
                     "max_output_tokens": request.max_output_tokens,
                     "input_estimated": True,
+                    **capabilities.request_settings,
                 },
             )
             try:
@@ -607,6 +616,11 @@ class Agent:
             accounting = self._account_usage(
                 reply.usage, input_estimate, estimate_tokens(asdict(reply))
             )
+            response_identity = {}
+            if reply.provider_model is not None:
+                response_identity["response_model"] = reply.provider_model
+            if reply.provider_fingerprint is not None:
+                response_identity["system_fingerprint"] = reply.provider_fingerprint
             await self._emit(
                 "model.completed",
                 {
@@ -614,6 +628,7 @@ class Agent:
                     "stop_reason": reply.stop_reason,
                     "usage": reply.usage,
                     **accounting,
+                    **response_identity,
                 },
             )
             return reply
@@ -703,6 +718,8 @@ class Agent:
             )
             self._instruction_logged = fingerprint
         history = self.projected_history()
+        if schemas and self.provider.capabilities().requires_reasoning_history:
+            history = thinking_history(history)
         goal = next((item.content for item in reversed(history) if item.role == "user"), "")
         repo = (
             self._repo_map.build(
@@ -1146,7 +1163,9 @@ class Agent:
                     if reply.stop_reason not in {"stop", "tool_calls", "end_turn"}
                     else "invalid or duplicate tool call IDs",
                 )
-            assistant = Message("assistant", reply.text, reply.tool_calls)
+            assistant = Message(
+                "assistant", reply.text, reply.tool_calls, reasoning_content=reply.reasoning_content
+            )
             self.messages.append(assistant)
             self._assistant_id = self.store.record_assistant(assistant)
             self._operations = {

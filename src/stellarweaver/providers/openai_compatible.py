@@ -12,6 +12,7 @@ from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolUnionParam
 
 from stellarweaver.config import ModelConfig
+from stellarweaver.context.manager import thinking_history
 from stellarweaver.domain import (
     AssistantReply,
     JSONDict,
@@ -22,7 +23,7 @@ from stellarweaver.domain import (
     ToolCall,
 )
 from stellarweaver.providers.base import ProviderError
-from stellarweaver.providers.streaming import ChatCompletionAccumulator
+from stellarweaver.providers.streaming import ChatCompletionAccumulator, usage_fields
 
 
 def parse_retry_after(value: str | None, *, now: datetime | None = None) -> float | None:
@@ -127,8 +128,10 @@ def _provider_failure(
     return ProviderError(message, retryable=retryable, usage=usage, partial_stream=partial_stream)
 
 
-def serialize_message(message: Message) -> JSONDict:
+def serialize_message(message: Message, *, include_reasoning: bool = False) -> JSONDict:
     value: JSONDict = {"role": message.role, "content": message.content}
+    if include_reasoning and message.role == "assistant":
+        value["reasoning_content"] = message.reasoning_content
     if message.tool_calls:
         value["tool_calls"] = [
             {
@@ -167,26 +170,50 @@ class OpenAICompatibleChatProvider:
         )
 
     def capabilities(self) -> ModelCapabilities:
+        settings: JSONDict = {"model": self.config.model}
+        if self.config.provider == "deepseek":
+            settings["thinking"] = self.config.thinking
+            if self._thinking_enabled:
+                settings["reasoning_effort"] = self.config.reasoning_effort
         return ModelCapabilities(
             tool_calling=self.config.supports_tools,
             streaming=self.config.supports_streaming,
             parallel_tool_calls=False,
             context_window_tokens=self.config.context_window_tokens,
+            requires_reasoning_history=self._thinking_enabled,
+            request_settings=settings,
+        )
+
+    @property
+    def _thinking_enabled(self) -> bool:
+        return self.config.provider == "deepseek" and self.config.thinking == "enabled"
+
+    def _vendor_parameters(self) -> JSONDict | None:
+        if self.config.provider != "deepseek":
+            return None
+        body: JSONDict = {"thinking": {"type": self.config.thinking}}
+        if self._thinking_enabled:
+            body["reasoning_effort"] = self.config.reasoning_effort
+        return body
+
+    def _messages(self, request: ModelRequest) -> list[ChatCompletionMessageParam]:
+        include_reasoning = self._thinking_enabled and bool(request.tools)
+        history = thinking_history(request.messages) if include_reasoning else request.messages
+        return cast(
+            list[ChatCompletionMessageParam],
+            [
+                serialize_message(message, include_reasoning=include_reasoning)
+                for message in history
+            ],
         )
 
     async def complete(self, request: ModelRequest) -> AssistantReply:
         if request.tools and not self.config.supports_tools:
             raise ProviderError("Configured provider does not support function tools")
-        extra_body = (
-            {"thinking": {"type": "disabled"}} if self.config.provider == "deepseek" else None
-        )
         try:
             response = await self._client.chat.completions.create(
                 model=self.config.model,
-                messages=cast(
-                    list[ChatCompletionMessageParam],
-                    [serialize_message(message) for message in request.messages],
-                ),
+                messages=self._messages(request),
                 tools=(
                     cast(list[ChatCompletionToolUnionParam], list(request.tools))
                     if request.tools
@@ -194,7 +221,7 @@ class OpenAICompatibleChatProvider:
                 ),
                 max_tokens=min(request.max_output_tokens, self.config.max_output_tokens),
                 stream=False,
-                extra_body=extra_body,
+                extra_body=self._vendor_parameters(),
             )
         except (APIError, httpx.HTTPError) as exc:
             raise _provider_failure(exc) from exc
@@ -212,19 +239,31 @@ class OpenAICompatibleChatProvider:
                 raise ProviderError("Provider returned an invalid or duplicate tool call ID")
             seen.add(call.id)
             calls.append(ToolCall(call.id, call.function.name, call.function.arguments))
-        usage: JSONDict | None = None
-        if response.usage is not None:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
-        # Deliberately do not read or re-transmit vendor hidden reasoning fields.
+        usage = usage_fields(response.usage) if response.usage is not None else None
+        if choice.finish_reason != "length" and bool(calls) != (
+            choice.finish_reason == "tool_calls"
+        ):
+            raise ProviderError(
+                "Model response tool calls do not match its stop reason", usage=usage
+            )
+        reasoning = None
+        if self._thinking_enabled and request.tools:
+            value = getattr(choice.message, "reasoning_content", None)
+            if isinstance(value, str):
+                reasoning = value
+            elif choice.finish_reason in {"stop", "tool_calls", "end_turn"}:
+                raise ProviderError(
+                    "DeepSeek thinking response omitted the reasoning field required for tool conversations",
+                    usage=usage,
+                )
         return AssistantReply(
             text=choice.message.content or "",
             tool_calls=tuple(calls),
             stop_reason=choice.finish_reason,
             usage=usage,
+            reasoning_content=reasoning,
+            provider_model=response.model,
+            provider_fingerprint=response.system_fingerprint,
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -237,18 +276,13 @@ class OpenAICompatibleChatProvider:
         if request.tools and not self.config.supports_tools:
             raise ProviderError("Configured provider does not support function tools")
         accumulator = ChatCompletionAccumulator(
-            max_output_tokens=min(request.max_output_tokens, self.config.max_output_tokens)
-        )
-        extra_body = (
-            {"thinking": {"type": "disabled"}} if self.config.provider == "deepseek" else None
+            max_output_tokens=min(request.max_output_tokens, self.config.max_output_tokens),
+            capture_reasoning=self._thinking_enabled and bool(request.tools),
         )
         try:
             response = await self._client.chat.completions.create(
                 model=self.config.model,
-                messages=cast(
-                    list[ChatCompletionMessageParam],
-                    [serialize_message(message) for message in request.messages],
-                ),
+                messages=self._messages(request),
                 tools=(
                     cast(list[ChatCompletionToolUnionParam], list(request.tools))
                     if request.tools
@@ -257,7 +291,7 @@ class OpenAICompatibleChatProvider:
                 max_tokens=min(request.max_output_tokens, self.config.max_output_tokens),
                 stream=True,
                 stream_options={"include_usage": True},
-                extra_body=extra_body,
+                extra_body=self._vendor_parameters(),
             )
             async with response:
                 async for chunk in response:

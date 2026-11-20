@@ -1,6 +1,6 @@
 """SDK-, UI- and storage-independent domain contracts."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 JSONDict = dict[str, Any]
@@ -33,6 +33,16 @@ class Message:
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
+    reasoning_content: str | None = field(default=None, repr=False, compare=False)
+
+    def recorded(self) -> JSONDict:
+        """Stable public journal shape, excluding provider-only reasoning."""
+        return {
+            "role": self.role,
+            "content": self.content,
+            "tool_calls": tuple(asdict(call) for call in self.tool_calls),
+            "tool_call_id": self.tool_call_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,9 @@ class AssistantReply:
     tool_calls: tuple[ToolCall, ...] = ()
     stop_reason: str = "stop"
     usage: JSONDict | None = None
+    reasoning_content: str | None = field(default=None, repr=False, compare=False)
+    provider_model: str | None = None
+    provider_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +69,8 @@ class ModelCapabilities:
     streaming: bool = False
     parallel_tool_calls: bool = False
     context_window_tokens: int | None = 100_000
+    requires_reasoning_history: bool = False
+    request_settings: JSONDict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

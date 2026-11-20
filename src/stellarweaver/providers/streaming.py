@@ -3,9 +3,31 @@
 from dataclasses import dataclass, field
 
 from openai.types.chat import ChatCompletionChunk
+from openai.types.completion_usage import CompletionUsage
 
 from stellarweaver.domain import AssistantReply, JSONDict, ToolCall
 from stellarweaver.providers.base import ProviderError
+
+
+def usage_fields(usage: CompletionUsage) -> JSONDict:
+    fields = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    optional = {
+        "prompt_cache_hit_tokens": getattr(usage, "prompt_cache_hit_tokens", None),
+        "prompt_cache_miss_tokens": getattr(usage, "prompt_cache_miss_tokens", None),
+        "reasoning_tokens": getattr(usage.completion_tokens_details, "reasoning_tokens", None),
+    }
+    if optional["prompt_cache_hit_tokens"] is None:
+        optional["prompt_cache_hit_tokens"] = getattr(
+            usage.prompt_tokens_details, "cached_tokens", None
+        )
+    for name, value in optional.items():
+        if type(value) is int and value >= 0:
+            fields[name] = value
+    return fields
 
 
 @dataclass
@@ -22,7 +44,13 @@ class ChatCompletionAccumulator:
     JSON/schema validation belongs to dispatch after this entire response commits.
     """
 
-    def __init__(self, *, max_output_tokens: int, max_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_output_tokens: int,
+        max_bytes: int | None = None,
+        capture_reasoning: bool = False,
+    ) -> None:
         self.max_bytes = (
             max_bytes
             if max_bytes is not None
@@ -32,10 +60,14 @@ class ChatCompletionAccumulator:
             raise ValueError("Stream byte limit must be positive")
         self._bytes = 0
         self._text: list[str] = []
+        self._capture_reasoning = capture_reasoning
+        self._reasoning: list[str] = []
         self._calls: dict[int, _CallFragments] = {}
         self._ids: dict[str, int] = {}
         self._stop_reason: str | None = None
         self.usage: JSONDict | None = None
+        self._provider_model: str | None = None
+        self._provider_fingerprint: str | None = None
         self.partial = False
 
     def _fail(self, message: str) -> ProviderError:
@@ -49,11 +81,9 @@ class ChatCompletionAccumulator:
     def feed(self, chunk: ChatCompletionChunk) -> str:
         """Consume an SDK-decoded chunk and return only displayable text."""
         if chunk.usage is not None:
-            self.usage = {
-                "prompt_tokens": chunk.usage.prompt_tokens,
-                "completion_tokens": chunk.usage.completion_tokens,
-                "total_tokens": chunk.usage.total_tokens,
-            }
+            self.usage = usage_fields(chunk.usage)
+        self._provider_model = chunk.model or self._provider_model
+        self._provider_fingerprint = chunk.system_fingerprint or self._provider_fingerprint
         if not chunk.choices:
             return ""
         if len(chunk.choices) != 1 or chunk.choices[0].index != 0:
@@ -66,6 +96,14 @@ class ChatCompletionAccumulator:
             raise self._fail("Model stream returned a non-assistant role")
         if delta.function_call is not None:
             raise self._fail("Model stream used unsupported legacy function calls")
+        if self._capture_reasoning:
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning is not None:
+                if not isinstance(reasoning, str):
+                    raise self._fail("DeepSeek returned an invalid reasoning field")
+                self._count(reasoning)
+                self._reasoning.append(reasoning)
+                self.partial |= bool(reasoning)
         text = delta.content or ""
         if text:
             self._count(text)
@@ -100,7 +138,6 @@ class ChatCompletionAccumulator:
                     fragments.arguments.append(call.function.arguments)
         if choice.finish_reason is not None:
             self._stop_reason = choice.finish_reason
-        # Vendor reasoning_content is intentionally never read or retained.
         return text
 
     def finish(self) -> AssistantReply:
@@ -124,9 +161,20 @@ class ChatCompletionAccumulator:
                 )
             if not calls and self._stop_reason == "tool_calls":
                 raise self._fail("Model stream finished tool calls without any calls")
+        if (
+            self._capture_reasoning
+            and not self._reasoning
+            and self._stop_reason in {"stop", "tool_calls", "end_turn"}
+        ):
+            raise self._fail(
+                "DeepSeek thinking response omitted the reasoning field required for tool conversations"
+            )
         return AssistantReply(
             text="".join(self._text),
             tool_calls=calls,
             stop_reason=self._stop_reason,
             usage=self.usage,
+            reasoning_content="".join(self._reasoning) if self._reasoning else None,
+            provider_model=self._provider_model,
+            provider_fingerprint=self._provider_fingerprint,
         )

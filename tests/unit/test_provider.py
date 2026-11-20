@@ -90,7 +90,9 @@ async def test_real_sdk_serializes_round_and_maps_multi_calls_without_reasoning(
             max_retries=0,
         )
         provider = OpenAICompatibleChatProvider(
-            ModelConfig(provider="deepseek"), "test-not-a-real-key", client=client
+            ModelConfig(provider="deepseek", thinking="disabled"),
+            "test-not-a-real-key",
+            client=client,
         )
         messages = (
             Message("system", "system"),
