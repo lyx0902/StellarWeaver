@@ -154,7 +154,12 @@ a { color: var(--accent); }
 .answer pre code { overflow-wrap: normal; }
 .answer img { max-width: 100%; }
 .answer blockquote { border-left: 3px solid var(--line); margin-left: 0; padding-left: 11px; color: var(--muted); }
-.live-answer { border-left: 2px solid #8496e0; padding-left: 11px; }
+.answer-table { max-width: 100%; overflow-x: auto; margin: 0 0 9px; }
+.answer-table table { min-width: 100%; width: max-content; border-collapse: collapse; }
+.answer-table :is(th, td) { max-width: 24rem; padding: 6px 10px; border: 1px solid var(--line); vertical-align: top; }
+.answer-table th { background: #edf1f8; text-align: start; }
+.answer-table tbody tr:nth-child(even) { background: var(--canvas); }
+.live-answer { min-width: 0; border-left: 2px solid #8496e0; padding-left: 11px; }
 .wait-state { color: var(--muted); }
 .turn-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .process { border: 1px solid var(--line); background: #f9fbfd; border-radius: 8px; color: #44546c; }

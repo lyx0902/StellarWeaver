@@ -1,9 +1,20 @@
 import { useState } from 'react'
-import Markdown from 'react-markdown'
+import Markdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import type { Approval, Run, RunEvent } from './api'
 
+const markdownComponents: Components = {
+  table: ({ children }) => <div className="answer-table" role="region" aria-label="回复表格" tabIndex={0}>
+    <table>{children}</table>
+  </div>,
+  th: ({ node: _node, ...props }) => <th scope="col" {...props} />,
+}
+
 export function Answer({ text }: { text: string }) {
-  return <div className="answer"><Markdown skipHtml disallowedElements={['img']}>{text}</Markdown></div>
+  return <div className="answer">
+    <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}
+      skipHtml disallowedElements={['img']}>{text}</Markdown>
+  </div>
 }
 
 const stateNames: Record<string, string> = {
