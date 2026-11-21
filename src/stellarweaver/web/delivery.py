@@ -100,7 +100,7 @@ class Delivery:
         self.baseline = self.snapshot()
 
     def started(self, payload: JSONDict) -> None:
-        if payload.get("tool") == "run_command":
+        if payload.get("tool") in {"run_command", "run_tests", "check_syntax", "run_linter"}:
             self.test_inputs[payload["operation_id"]] = manifest_sha(self.snapshot())
 
     def result(self, result: ToolResult) -> None:
@@ -114,13 +114,19 @@ class Delivery:
                     "diff": clip(data.get("diff", ""), MAX_PATCH),
                 }
             )
-        if result.tool_name == "run_command" and "exit_code" in data:
+        if (
+            result.tool_name in {"run_command", "run_tests", "check_syntax", "run_linter"}
+            and "exit_code" in data
+        ):
             verified = self.test_inputs.pop(result.operation_id, None)
             after = manifest_sha(self.snapshot())
             summary = re.findall(r"^Ran (\d+) tests? in ", data.get("stderr", ""), re.MULTILINE)
             self.checks.append(
                 {
                     "operation_id": result.operation_id,
+                    "tool": result.tool_name,
+                    "supplemental": result.tool_name != "run_command",
+                    "diagnostic": data.get("diagnostic"),
                     "edit_generation": self.edits,
                     "exit_code": data["exit_code"],
                     "status": result.status,
@@ -178,14 +184,18 @@ class Delivery:
             effective = "stale" if not fresh and state in {"passed", "failed"} else state
             checks.append({**check, "state": effective, "observed": state})
         if self.isolated:
-            latest = {tuple(check["argv"] or ()): check["state"] for check in checks}
+            latest = {
+                tuple(check["argv"] or ()): check["state"]
+                for check in checks
+                if not check["supplemental"]
+            }
             verification = next(
                 (
                     state
                     for state in ("failed", "timed_out", "cancelled", "unconfirmed", "stale")
                     if state in latest.values()
                 ),
-                "passed" if latest else "not_run",
+                "passed" if latest else "unconfirmed" if checks else "not_run",
             )
             if verification == "passed" and not latest.keys() >= set(self.required_commands):
                 verification = "unconfirmed"

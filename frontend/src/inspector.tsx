@@ -182,9 +182,9 @@ export function Inspector({ active, onSelect, onClose, delivery, events, canAppl
           {canApply && reviewed && all.length > 0 && <button type="button" onClick={() => onSelect('changes')}>预检并交接到 IDE</button>}
           {!delivery.checks.length && <p className="muted">本轮没有运行验证命令。</p>}
           {delivery.checks.map(check => <details className="check" key={check.operation_id}>
-            <summary>退出码 {check.exit_code ?? '无'} · {check.state}
+            <summary>{check.tool && check.tool !== 'run_command' && check.tool + ' · '}退出码 {check.exit_code ?? '无'} · {check.state}
               {check.state === 'stale' && '（原始结果 ' + check.observed + '）'}</summary>
-            <pre>{JSON.stringify(check.argv)}{'\n'}cwd: {check.cwd}{'\n'}{check.stdout}{check.stderr}</pre>
+            <pre>{check.diagnostic ? check.diagnostic.framework + ' ' + check.diagnostic.target : JSON.stringify(check.argv)}{'\n'}cwd: {check.cwd}{'\n'}{check.stdout}{check.stderr}</pre>
           </details>)}
         </> : <>
           {!delivery.baseline_comparable && <p className="muted">工作区快照不完整，无法列出全部变更。</p>}

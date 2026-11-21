@@ -116,7 +116,7 @@ class RepoMap:
             and not self.workspace.is_ignored(relative)
         )
 
-    def _paths(self) -> tuple[list[str], bool]:
+    def paths(self) -> tuple[list[str], bool]:
         paths: list[str] = []
         for directory, folders, files in os.walk(self.workspace.root, followlinks=False):
             parent = Path(directory)
@@ -174,7 +174,7 @@ class RepoMap:
     ) -> RepoMapProjection:
         if max_tokens < 1:
             return RepoMapProjection(None, (), 0, True)
-        paths, scan_truncated = self._paths()
+        paths, scan_truncated = self.paths()
         explicit = {path.replace("\\", "/") for path in explicit_paths}
         visited = {path.replace("\\", "/") for path in visited_paths}
         # A user-supplied file remains discoverable even if the bounded general

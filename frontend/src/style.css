@@ -48,8 +48,32 @@ a { color: var(--accent); }
 .admin-panel h3 { margin: 14px 0 6px; }
 .admin-panel table { width: 100%; border-collapse: collapse; }
 .admin-panel :is(td, th) { border-bottom: 1px solid var(--line); text-align: left; padding: 5px 7px; }
-.experiment-panel { width: min(960px, 94vw); }
+.experiment-panel { width: min(1180px, 95vw); }
 .experiment-panel h3 { overflow-wrap: anywhere; }
+.experiment-layout { display: grid; grid-template-columns: minmax(160px, 210px) minmax(0, 1fr); gap: 18px; margin-top: 14px; }
+.experiment-index { display: grid; gap: 8px; align-content: start; }
+.experiment-index button { display: grid; justify-content: start; text-align: left; padding: 10px 12px; overflow-wrap: anywhere; }
+.experiment-index button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.experiment-index small, .experiment-metrics dt { color: var(--muted); }
+.experiment-detail { border: 1px solid var(--line); padding: 14px; border-radius: 10px; min-width: 0; }
+.experiment-heading, .experiment-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.experiment-heading { justify-content: space-between; }
+.experiment-heading h3 { margin: 0; }
+.experiment-controls { margin: 12px 0; }
+.experiment-controls :is(input, select), .experiment-index select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; min-width: 0; background: var(--paper); }
+.experiment-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.experiment-metrics div { border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); padding: 8px 12px; }
+.experiment-metrics dd { font-size: 21px; font-variant-numeric: tabular-nums; font-weight: 650; margin: 0; overflow-wrap: anywhere; }
+.experiment-table { overflow: auto; max-height: 44dvh; }
+.experiment-table thead { position: sticky; top: 0; background: var(--paper); z-index: 1; }
+.experiment-table .experiment-evidence { margin: 2px 0; }
+.experiment-compare { border-top: 1px solid var(--line); margin-top: 12px; }
+.experiment-digest { margin-top: 12px; overflow-wrap: anywhere; }
+@media (max-width: 720px) {
+  .experiment-layout { grid-template-columns: minmax(0, 1fr); }
+  .experiment-index { max-height: 26dvh; overflow: auto; }
+  .experiment-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .experiment-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
 .experiment-tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--paper); }
 .experiment-evidence { margin: 8px 0; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; }

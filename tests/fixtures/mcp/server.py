@@ -83,7 +83,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
 async def main() -> None:
     # stderr is deliberately separate from the JSON-RPC stdout channel.
     print("local fixture initialized", file=sys.stderr, flush=True)
-    if token := os.environ.get("STELLARWEAVER_FIXTURE_LOG_TOKEN"):
+    if token := os.environ.get("STELLARWEAVER_FIXTURE_LOG_MARKER"):
         print(token, file=sys.stderr, flush=True)
     if count := os.environ.get("STELLARWEAVER_FIXTURE_STDERR_BYTES"):
         print("x" * min(int(count), 100000), file=sys.stderr, flush=True)

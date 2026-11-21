@@ -1,5 +1,6 @@
 """G5 authorization, per-member accounting, and signed OIDC acceptance."""
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -8,6 +9,7 @@ import os
 import tarfile
 import time
 from pathlib import Path
+from threading import Event
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
@@ -25,8 +27,10 @@ from sqlalchemy import text  # noqa: E402
 
 from stellarweaver.domain import Message, ToolCall  # noqa: E402
 from stellarweaver.runtime.loop import BudgetExceeded  # noqa: E402
+from stellarweaver.tools.development import decode_development  # noqa: E402
 from stellarweaver.web import db  # noqa: E402
 from stellarweaver.web.app import Principal, create_app  # noqa: E402
+from stellarweaver.web.approval import ApprovalGate, DecisionConflict, decide, pending  # noqa: E402
 from stellarweaver.web.broker import create_broker  # noqa: E402
 from stellarweaver.web.identity import Member  # noqa: E402
 from stellarweaver.web.isolation import DockerRunner, Isolation  # noqa: E402
@@ -63,6 +67,56 @@ def test_executor_passes_validated_archive_to_child_from_start(monkeypatch: pyte
     assert response.status_code == 200 and response.json()["status"] == "ok"
 
 
+def test_executor_accepts_structured_action_without_raw_argv(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(Isolation, "reap", lambda _: None)
+    actions = []
+
+    async def verify(_self, archive, argv, **_kwargs):
+        operation = decode_development(argv)
+        assert operation is not None
+        action, arguments = operation
+        assert archive.tell() == 0
+        actions.append((action, arguments.target, arguments.framework))
+        return {"status": "ok", "data": {"process_management": {"cleanup_confirmed": True}}}
+
+    monkeypatch.setattr(DockerRunner, "run_archive", verify)
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as content:
+        entry = tarfile.TarInfo("test_fixture.py")
+        entry.size = 5
+        content.addfile(entry, io.BytesIO(b"pass\n"))
+    token = uuid4().hex
+    app = create_broker(
+        Isolation("sha256:" + "a" * 64, (("python", "-V"),), "fixture", development=True),
+        token,
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+
+        def request(**params):
+            return client.post(
+                f"/verify/{uuid4()}",
+                params={"timeout": 5, **params},
+                content=archive.getvalue(),
+                headers={"Authorization": "Bearer " + token},
+            )
+
+        assert (
+            request(
+                action="discover_tests", target="test_fixture.py", framework="unittest"
+            ).status_code
+            == 200
+        )
+        assert (
+            request(action="run_tests", target=".", framework="unittest", command=0).status_code
+            == 422
+        )
+        assert (
+            request(action="check_syntax", target="../outside.py", framework="unittest").status_code
+            == 422
+        )
+    assert actions == [("discover_tests", "test_fixture.py", "unittest")]
+
+
 @pytest.fixture
 def engine():
     dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
@@ -85,6 +139,91 @@ def account(tenant: UUID, path: Path, role: str, name: str, **extra) -> Principa
         }
     )
     return Principal(tenant, (path.resolve(),), member=member)
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("scenario", ["replay", "expired", "fingerprint_changed"])
+async def test_one_shot_search_approval_is_bound_to_run_tenant_and_intent(
+    engine, tmp_path: Path, scenario: str
+) -> None:
+    tenant = str(uuid4())
+    workspace = str(uuid4())
+
+    def start_run(tenant_id: str) -> PgJournal:
+        db.register(engine, tenant_id, {workspace: "Fixture"})
+        ids, _ = db.submit(engine, tenant_id, workspace, str(uuid4()), "Fixture", "fake")
+        return PgJournal(engine, tenant_id, ids["session_id"], ids["run_id"], tmp_path, tmp_path)
+
+    journal = start_run(tenant)
+    other_run = start_run(tenant)
+    other_tenant = PgJournal(
+        engine, str(uuid4()), journal.session_id, journal.run_id, tmp_path, tmp_path
+    )
+    query = "Python numeric types documentation"
+    message = Message(
+        "assistant", "", tool_calls=(ToolCall("search", "ds_search", json.dumps({"query": query})),)
+    )
+    assistant = journal.record_assistant(message)
+    operation = journal.operation_id_for(assistant, "search")
+    invocation = {
+        "tool": "ds_search",
+        "operation_id": operation,
+        "query": query,
+        "policy_binding": "fixture-policy",
+        "security": {"level": "L2", "capabilities": ["network:public-search-query"]},
+    }
+    gate = ApprovalGate(journal, Event(), 20.0)
+    async with asyncio.TaskGroup() as group:
+        approval = group.create_task(gate.approve(invocation))
+        async with asyncio.timeout(3):
+            while True:
+                with db.scoped(engine, tenant) as conn:
+                    preview = pending(conn, journal.run_id)
+                if preview is not None:
+                    break
+                await asyncio.sleep(0.02)
+        assert preview["query"] == query
+        assert preview["security"]["level"] == "L2"
+        for unrelated in (other_run, other_tenant):
+            with pytest.raises(DecisionConflict):
+                decide(unrelated, operation, "approve")
+        if scenario == "expired":
+            with db.scoped(engine, tenant) as conn:
+                conn.execute(
+                    text("UPDATE sw.approvals SET expires_at=clock_timestamp() WHERE id=:id"),
+                    {"id": operation},
+                )
+            with pytest.raises(DecisionConflict):
+                decide(journal, operation, "approve")
+        elif scenario == "fingerprint_changed":
+            with db.scoped(engine, tenant) as conn:
+                conn.execute(
+                    text("UPDATE sw.approvals SET fingerprint='different' WHERE id=:id"),
+                    {"id": operation},
+                )
+            decide(journal, operation, "approve")
+        else:
+            decide(journal, operation, "approve")
+        assert await approval == ("once" if scenario == "replay" else "deny")
+        with db.scoped(engine, tenant) as conn:
+            state = conn.execute(
+                text("SELECT state FROM sw.approvals WHERE id=:id"), {"id": operation}
+            ).scalar_one()
+        assert (
+            state
+            == {"replay": "consumed", "expired": "expired", "fingerprint_changed": "cancelled"}[
+                scenario
+            ]
+        )
+        event_type = {
+            "replay": "approval.consumed",
+            "expired": "approval.expired",
+            "fingerprint_changed": "approval.invalidated",
+        }[scenario]
+        assert any(event.type == event_type for event in journal.load_events())
+        with pytest.raises(DecisionConflict):
+            decide(journal, operation, "approve")
+        assert await gate.approve(invocation) == "deny"
 
 
 @pytest.mark.postgres

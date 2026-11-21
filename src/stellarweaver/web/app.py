@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
@@ -42,6 +42,12 @@ from stellarweaver.web.approval import (
     request_cancel,
 )
 from stellarweaver.web.execution import execute
+from stellarweaver.web.experiment_records import (
+    ExperimentTooLarge,
+    PublishedExperiments,
+    read_legacy,
+    redact,
+)
 from stellarweaver.web.identity import Access, Member
 from stellarweaver.web.journal import PgJournal
 from stellarweaver.web.oidc import (
@@ -186,6 +192,9 @@ def public_event(event: JSONDict) -> JSONDict:
             visible["content"] = str(payload.get("content", ""))[:12000]
             if payload.get("tool_name") == DS_SEARCH:
                 visible["sources"] = payload.get("data", {}).get("sources", [])
+            if payload.get("tool_name") == "stage_patch":
+                visible["staged_patch"] = payload.get("data", {}).get("patch")
+                visible["patch_sha256"] = payload.get("data", {}).get("patch_sha256")
         else:
             visible["code"] = payload.get("data", {}).get("code")
             visible["exit_code"] = payload.get("data", {}).get("exit_code")
@@ -207,7 +216,44 @@ def public_event(event: JSONDict) -> JSONDict:
         for key in ("status_code", "request_index", "retryable"):
             if key in payload:
                 visible[key] = payload[key]
-    elif kind in {"approval.requested", "approval.decided", "approval.expired"}:
+    elif kind == "repair.diagnostic":
+        visible = {
+            "code": payload["category"],
+            "tool_name": payload["tool"],
+            "operation_id": payload["operation_id"],
+            "exit_code": payload.get("exit_code"),
+            "content": payload.get("next_step", ""),
+            "repeat_count": payload.get("repeat_count"),
+        }
+    elif kind == "harness.profile":
+        visible = {
+            key: payload[key]
+            for key in (
+                "development_tools",
+                "issue_navigation",
+                "repair_controller",
+                "patch_staging",
+                "task_evidence",
+                "budget_guidance",
+            )
+            if key in payload
+        }
+    elif kind == "budget.guidance":
+        visible = {
+            "content": f"{payload['phase']} · 剩余工具调用 {payload['tool_calls_remaining']}",
+            "code": "BUDGET_LOW" if payload["capacity_limited"] else None,
+        }
+    elif kind == "task.evidence":
+        visible = {
+            "content": f"{len(payload['files'])} 个已复核文件 · {len(payload['observations'])} 条工具证据",
+        }
+    elif kind in {
+        "approval.requested",
+        "approval.decided",
+        "approval.expired",
+        "approval.consumed",
+        "approval.invalidated",
+    }:
         visible = payload
     elif kind.startswith("run."):
         visible = {
@@ -1043,27 +1089,58 @@ def create_app(
             raise HTTPException(403, "Administrator access required")
         return await asyncio.to_thread(db.usage_today, engine, str(p.tenant), p.access)
 
-    @app.get("/api/v1/experiment")
-    def local_experiment(p: Principal = require_principal) -> Response:
+    def published_experiments(p: Principal) -> PublishedExperiments:
         if not may_view_experiment(p) or experiment_file is None:
             raise HTTPException(404)
-        limit = 8 * 1024 * 1024
+        return PublishedExperiments(experiment_file)
+
+    @app.get("/api/v1/experiment")
+    def local_experiment(p: Principal = require_principal) -> JSONDict:
+        library = published_experiments(p)
         try:
-            with experiment_file.open("rb") as report:
-                content = report.read(limit + 1)
+            return read_legacy(library.legacy)
         except FileNotFoundError as exc:
             raise HTTPException(404, "实验记录尚未发布。") from exc
+        except ExperimentTooLarge as exc:
+            raise HTTPException(413, "实验记录超出 8 MiB。") from exc
         except OSError as exc:
             raise HTTPException(503, "无法读取实验记录。") from exc
-        if len(content) > limit:
-            raise HTTPException(413, "实验记录超出 8 MiB。")
-        try:
-            data = json.loads(content)
         except (ValueError, RecursionError) as exc:
             raise HTTPException(503, "实验记录格式不正确。") from exc
-        if not isinstance(data, dict) or data.get("schema_version") != 1:
-            raise HTTPException(503, "实验记录格式不受支持。")
-        return Response(content, media_type="application/json")
+
+    @app.get("/api/v1/experiments")
+    def experiment_catalog(p: Principal = require_principal) -> JSONDict:
+        return published_experiments(p).list()
+
+    @app.get("/api/v1/experiments/compare")
+    def compare_experiments(
+        left: str,
+        right: str,
+        vary: str = "",
+        p: Principal = require_principal,
+    ) -> JSONDict:
+        library = published_experiments(p)
+        try:
+            return cast(
+                JSONDict,
+                redact(library.comparison(left, right, frozenset(filter(None, vary.split(","))))),
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "实验记录尚未发布。") from exc
+        except (ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+            raise HTTPException(422, "记录或对照变量无法比较。") from exc
+
+    @app.get("/api/v1/experiments/{name}")
+    def experiment_detail(name: str, p: Principal = require_principal) -> JSONDict:
+        library = published_experiments(p)
+        try:
+            return library.detail(name)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "实验记录尚未发布。") from exc
+        except ExperimentTooLarge as exc:
+            raise HTTPException(413, "实验记录超出 8 MiB。") from exc
+        except (ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
+            raise HTTPException(503, "实验记录格式不正确。") from exc
 
     @app.get("/api/v1/skills")
     def list_skills(p: Principal = require_principal, refresh: bool = False) -> JSONDict:

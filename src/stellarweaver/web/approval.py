@@ -1,8 +1,6 @@
 """Run-bound one-shot approval, backed by the same durable event log."""
 
 import asyncio
-import hashlib
-import json
 import sys
 from threading import Event
 from typing import Literal
@@ -11,6 +9,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from stellarweaver.domain import JSONDict
+from stellarweaver.policy import DS_SEARCH
+from stellarweaver.policy.risk import fingerprint
+from stellarweaver.tools.development import decode_development
 from stellarweaver.web.db import audit, scoped
 from stellarweaver.web.journal import PgJournal, pack
 
@@ -59,10 +60,10 @@ def decide(journal: PgJournal, identifier: str, decision: Literal["approve", "de
         state = "approved" if decision == "approve" else "denied"
         accepted = conn.execute(
             text("""
-            UPDATE sw.approvals SET state=:state WHERE run_id=:run AND id=:id
+            UPDATE sw.approvals SET state=:state WHERE tenant_id=:tenant AND run_id=:run AND id=:id
               AND state='pending' AND expires_at>clock_timestamp() RETURNING id
         """),
-            {"state": state, "run": journal.run_id, "id": identifier},
+            {"state": state, "tenant": journal.tenant, "run": journal.run_id, "id": identifier},
         ).scalar_one_or_none()
         if accepted is None:
             raise DecisionConflict()
@@ -114,44 +115,68 @@ class ApprovalGate:
         stop: Event,
         ttl: float,
         commands: tuple[tuple[str, ...], ...] = (tuple(VERIFY_ARGV),),
+        *,
+        development: bool = False,
     ) -> None:
         self.journal, self.stop, self.ttl = journal, stop, ttl
         self.commands = commands
+        self.development = development
 
     async def approve(self, invocation: JSONDict) -> str:
         tool = invocation["tool"]
         if tool == "run_command":
             argv = invocation["argv"]
-            if tuple(argv) not in self.commands or invocation.get("cwd") != ".":
+            check = decode_development(argv) if self.development else None
+            if (
+                invocation.get("cwd") != "."
+                or (check is None and tuple(argv) not in self.commands)
+                or (check is not None and invocation.get("development_action") != check[0])
+            ):
                 return "deny"
             preview = {
-                "tool": tool,
-                "argv": argv,
+                "tool": check[0] if check else tool,
+                "argv": [check[1].framework, check[1].target] if check else argv,
                 "cwd": ".",
                 "timeout_seconds": invocation["timeout_seconds"],
             }
-        elif tool in {"edit_file", "create_file"}:
+        elif tool in {"edit_file", "create_file", "stage_patch"}:
             patch = invocation.get("preview")
             if not isinstance(patch, str) or len(patch.encode()) > 64 * 1024:
                 # A partial patch is not a sufficient consent preview.
                 return "deny"
             preview = {
                 "tool": tool,
-                "path": invocation["path"],
                 "diff": patch,
-                "before_sha256": invocation.get("before_sha256"),
-                "after_sha256": invocation.get("after_sha256"),
             }
+            if tool == "stage_patch":
+                preview.update(
+                    {key: invocation[key] for key in ("base_commit", "patch_sha256", "paths")}
+                )
+            else:
+                preview.update(
+                    path=invocation["path"],
+                    before_sha256=invocation.get("before_sha256"),
+                    after_sha256=invocation.get("after_sha256"),
+                )
+        elif tool == DS_SEARCH:
+            preview = {"tool": tool, "query": invocation["query"]}
         else:
             return "deny"
+        if "security" in invocation:
+            preview["security"] = invocation["security"]
         operation = invocation["operation_id"]
-        fingerprint = hashlib.sha256(json.dumps(invocation, sort_keys=True).encode()).hexdigest()
         params = {
             "tenant": self.journal.tenant,
             "run": self.journal.run_id,
             "id": operation,
             "preview": pack(preview),
-            "fingerprint": fingerprint,
+            "fingerprint": fingerprint(
+                {
+                    "tenant": self.journal.tenant,
+                    "run": self.journal.run_id,
+                    "invocation": invocation,
+                }
+            ),
             "ttl": self.ttl,
         }
         with self.journal.execution_scope() as conn:
@@ -167,10 +192,12 @@ class ApprovalGate:
                 INSERT INTO sw.approvals(tenant_id,run_id,id,state,expires_at,preview,fingerprint)
                 VALUES(:tenant,:run,:id,'pending',clock_timestamp()+CAST(:ttl AS double precision)*interval '1 second',
                        CAST(:preview AS jsonb),:fingerprint)
-                RETURNING expires_at
+                ON CONFLICT (tenant_id,run_id,id) DO NOTHING RETURNING expires_at
             """),
                 params,
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if expiry is None:
+                return "deny"
             self.journal.add_event_in_transaction(
                 conn,
                 "approval.requested",
@@ -188,7 +215,7 @@ class ApprovalGate:
                 expired = conn.execute(
                     text("""
                     UPDATE sw.approvals SET state='expired'
-                    WHERE run_id=:run AND id=:id AND state IN ('pending','approved')
+                    WHERE tenant_id=:tenant AND run_id=:run AND id=:id AND state IN ('pending','approved')
                         AND expires_at<=clock_timestamp() RETURNING id
                 """),
                     params,
@@ -201,20 +228,34 @@ class ApprovalGate:
                 used = conn.execute(
                     text("""
                     UPDATE sw.approvals SET state='consumed'
-                    WHERE run_id=:run AND id=:id AND state='approved'
+                    WHERE tenant_id=:tenant AND run_id=:run AND id=:id AND state='approved'
                         AND fingerprint=:fingerprint AND expires_at>clock_timestamp() RETURNING id
                 """),
                     params,
                 ).scalar_one_or_none()
                 if used is not None:
+                    self.journal.add_event_in_transaction(
+                        conn, "approval.consumed", {"id": operation}
+                    )
                     return "once"
                 state = conn.execute(
                     text("""
-                    SELECT state FROM sw.approvals WHERE run_id=:run AND id=:id
+                    SELECT state FROM sw.approvals WHERE tenant_id=:tenant AND run_id=:run AND id=:id
                 """),
                     params,
                 ).scalar_one()
-                if state not in {"pending", "approved"}:
+                if state == "approved":
+                    conn.execute(
+                        text("""
+                        UPDATE sw.approvals SET state='cancelled'
+                        WHERE tenant_id=:tenant AND run_id=:run AND id=:id AND state='approved'
+                        """),
+                        params,
+                    )
+                    self.journal.add_event_in_transaction(
+                        conn, "approval.invalidated", {"id": operation}
+                    )
+                if state != "pending":
                     return "deny"
             await asyncio.sleep(0.15)
         raise asyncio.CancelledError()

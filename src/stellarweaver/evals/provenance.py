@@ -24,6 +24,13 @@ def digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def canonical_json(value: Any) -> bytes:
+    """Stable JSON bytes for metadata identity and reproducible reports."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    ).encode("utf-8")
+
+
 def sources(catalog_path: Path | None = None) -> dict[str, bytes]:
     package = Path(__file__).parent
     selected = catalog_path or package / "catalog.json"

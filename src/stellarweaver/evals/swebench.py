@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from stellarweaver.cli import build_provider, effective_config
 from stellarweaver.config import AppConfig, ExecutionConfig, LimitsConfig
 from stellarweaver.domain import JSONDict
+from stellarweaver.evals.provenance import canonical_json
 from stellarweaver.evals.swebench_official import GRADER_VERSION
 from stellarweaver.evals.swebench_pilot import checkout, digest, git, register_fixed_tools
 from stellarweaver.providers.fake import FakeModel
@@ -32,6 +33,7 @@ from stellarweaver.session.locking import WriterLock
 from stellarweaver.session.store import SessionStore
 from stellarweaver.tools.commands import CommandRunner, controlled_environment, execute_command
 from stellarweaver.tools.workspace import ToolError
+from stellarweaver.web.isolation import DockerRunner, Isolation
 
 DATASET_REVISION = "b0dde1093fe417d83b7184254edf8199c1f0dff5"
 UPSTREAM_SHA256 = {
@@ -90,6 +92,15 @@ sys.path[:0] = [work + '/src', work]
 site.addsitedir('/deps')
 runpy.run_module('pytest', run_name='__main__')
 """
+SANDBOX_PYTEST = """\
+import os, pathlib, sys
+sys.path.append('/deps')
+os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+import pytest
+root = pathlib.Path.cwd()
+sys.path[:0] = [str(root / 'src'), str(root)]
+raise SystemExit(pytest.main(sys.argv[1:]))
+"""
 
 
 class Task(BaseModel):
@@ -121,21 +132,14 @@ class Prediction(BaseModel):
 
 def execution_fingerprint() -> JSONDict:
     package = Path(__file__).resolve().parents[1]
-    components = (
-        "evals/swebench.py",
-        "evals/swebench_pilot.py",
-        "evals/swebench_official.py",
-        "runtime/loop.py",
-        "runtime/service.py",
-        "config.py",
-        "tools/registry.py",
-        "providers/openai_compatible.py",
-    )
     root = package.parents[1]
     revision = git(root, "rev-parse", "HEAD").decode().strip() if (root / ".git").exists() else None
     return {
         "code_sha": revision,
-        "source_sha256": {path: digest((package / path).read_bytes()) for path in components},
+        "source_sha256": {
+            path.relative_to(package).as_posix(): digest(path.read_bytes())
+            for path in sorted(package.rglob("*.py"))
+        },
     }
 
 
@@ -418,19 +422,63 @@ async def solve_task(
     await asyncio.to_thread(local_image, recipe.image)
     workspace = attempt / "checkout"
     await asyncio.to_thread(git_base, task, args.assets, workspace)
-    runner = visible_runner(recipe, workspace, args.assets)
     argv = ["pytest", *recipe.pytest_args]
+    sandbox = getattr(args, "sandbox_commands", False)
+    development = getattr(args, "development_tools", False)
+    if development and not sandbox:
+        raise ValueError("Development tools require --sandbox-commands")
+    runner: CommandRunner
+    if sandbox:
+        dependency = None
+        if recipe.dependencies:
+            dependency = (args.assets / recipe.dependencies).resolve(strict=True)
+            if (
+                dependency == args.assets
+                or not dependency.is_relative_to(args.assets)
+                or not dependency.is_dir()
+                or any(char in str(dependency) for char in (",", '"'))
+            ):
+                raise ValueError(
+                    "Dependency directory must be inside the dedicated assets directory"
+                )
+        argv = [
+            "python",
+            "-I",
+            "-B",
+            "-c",
+            SANDBOX_PYTEST,
+            "-p",
+            "no:cacheprovider",
+            *recipe.pytest_args,
+        ]
+        runner = DockerRunner(
+            workspace,
+            Isolation(
+                recipe.image, (tuple(argv),), "stellarweaver-swe-fixture", development=development
+            ),
+            dependency,
+        )
+    else:
+        runner = visible_runner(recipe, workspace, args.assets)
     policy = attempt / "policy.json"
-    save(
-        policy,
-        {
-            "workspace": str(workspace),
-            "grants": [{"tool": "run_command", "argv": argv, "cwd": "."}],
-        },
-    )
+    grants = [{"tool": "run_command", "argv": argv, "cwd": "."}]
+    save(policy, {"workspace": str(workspace), "grants": grants})
     provider: Literal["deepseek", "fake"] = "deepseek" if args.live else "fake"
     config = effective_config(AppConfig(), provider, "workspace-edit", True)
-    config = config.model_copy(update={"limits": limits})
+    config = config.model_copy(
+        update={
+            "limits": limits,
+            "harness": config.harness.model_copy(
+                update={
+                    "development_tools": development,
+                    "issue_navigation": getattr(args, "issue_navigation", False),
+                    "repair_controller": getattr(args, "repair_controller", "off"),
+                    "task_evidence": getattr(args, "task_evidence", False),
+                    "budget_guidance": getattr(args, "budget_guidance", False),
+                }
+            ),
+        }
+    )
     model = (
         build_provider(config, workspace, "deepseek", None, args.env_file, stream=True)
         if args.live
@@ -445,7 +493,15 @@ async def solve_task(
     try:
         with SessionStore(workspace, data_dir=attempt / "state") as store:
             store.set_config(config.model_dump())
-            agent = build_agent(config, model, store, policy_file=policy)
+            agent = build_agent(
+                config,
+                model,
+                store,
+                policy_file=policy,
+                command_runner=runner if sandbox else None,
+                command_boundary=digest(canonical_json(recipe.model_dump())) if sandbox else None,
+                allow_sandbox_development=development,
+            )
             register_fixed_tools(
                 agent.registry,
                 runner,
@@ -456,12 +512,32 @@ async def solve_task(
                     )
                 },
             )
-            tools_sha256 = digest(json.dumps(agent.registry.schemas(), sort_keys=True).encode())
+            tools_sha256 = digest(canonical_json(agent.registry.schemas()))
             outcome = await agent.run(prompt)
+            requests = [
+                event
+                for event in store.load_events()
+                if event.type in {"model.completed", "model.failed"}
+            ]
+            cached = [
+                count
+                for event in requests
+                if type(count := event.payload.get("prompt_cache_hit_tokens")) is int
+            ]
             evidence = {
                 "session_id": store.session_id,
                 "outcome": asdict(outcome),
                 "tools": [asdict(tool) for tool in agent.results],
+                "cached_input_tokens": (
+                    sum(cached) if requests and len(cached) == len(requests) else None
+                ),
+                "failure_category": (
+                    "provider_error"
+                    if outcome.run_status == "failed"
+                    and requests
+                    and requests[-1].type == "model.failed"
+                    else None
+                ),
             }
     finally:
         if isinstance(model, OpenAICompatibleChatProvider):
@@ -497,6 +573,11 @@ async def solve_task(
             "reasoning_effort": config.model.reasoning_effort,
             "prompt_sha256": digest(prompt.encode()),
             "tools_sha256": tools_sha256,
+            "config_sha256": digest(canonical_json(config.model_dump(mode="json"))),
+            "policy_sha256": digest(
+                canonical_json({"preset": config.policy.preset, "grants": grants})
+            ),
+            "sandbox_profile": "sandbox-workspace" if sandbox else "swebench-visible-pytest-v1",
             "agent_image": recipe.image,
             "patch_sha256": digest(patch) if patch else None,
             "candidate_status": candidate,
@@ -511,6 +592,9 @@ def state(case: Path) -> JSONDict:
     value: JSONDict = read_json(pointer)
     if value["status"] == "running":
         attempt = case / value["attempt"]
+        if (attempt / "attempt.json").is_file():
+            receipt: JSONDict = read_json(attempt / "attempt.json")
+            return receipt
         if (attempt / "agent-report.json").is_file():
             report = read_json(attempt / "agent-report.json")
             return {
@@ -520,6 +604,18 @@ def state(case: Path) -> JSONDict:
             }
         return {**value, "status": "interrupted"}
     return value
+
+
+def finish_attempt(case: Path, result: JSONDict) -> None:
+    """Commit the attempt's own receipt before advancing the case pointer."""
+    receipt = case / result["attempt"] / "attempt.json"
+    if receipt.exists():
+        if read_json(receipt) != result:
+            raise ValueError(f"Attempt receipt changed for {case.name}")
+    else:
+        # The batch entry point holds its experiment lock across this transition.
+        save(receipt, result)
+    save(case / "solve.json", result)
 
 
 def saved_prediction(case: Path) -> Prediction | None:
@@ -538,6 +634,8 @@ def saved_prediction(case: Path) -> Prediction | None:
 
 
 async def solve(root: Path, args: argparse.Namespace) -> None:
+    if getattr(args, "development_tools", False) and not getattr(args, "sandbox_commands", False):
+        raise ValueError("Development tools require --sandbox-commands")
     keys = prepared_tasks(root)
     limits = LimitsConfig.model_validate(read_json(root / "manifest.json")["limits"])
     settings_path = root / "run-settings.json"
@@ -552,6 +650,16 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
         },
         **execution_fingerprint(),
     }
+    for name in (
+        "sandbox_commands",
+        "development_tools",
+        "issue_navigation",
+        "repair_controller",
+        "task_evidence",
+        "budget_guidance",
+    ):
+        if (value := getattr(args, name, None)) not in (None, False, "off"):
+            settings[name] = value
     if settings_path.exists() and read_json(settings_path) != settings:
         raise ValueError(
             "Run settings changed. Use a new experiment for a different configuration."
@@ -560,11 +668,14 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
         save(settings_path, settings)
     for key in keys:
         case = root / "cases" / key
-        prior = state(case)["status"]
+        previous = state(case)
+        prior = previous["status"]
         if prior != "not_run" and not (
             args.retry_interrupted and prior in {"interrupted", "environment_error"}
         ):
             continue
+        if prior != "not_run":
+            finish_attempt(case, previous)
         attempt = case / f"agent-{uuid4().hex}"
         attempt.mkdir()
         save(case / "solve.json", {"status": "running", "attempt": attempt.name})
@@ -572,8 +683,8 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
             verify_inputs(root, case, "task.json", "recipe.json")
             await solve_task(case, attempt, args, limits)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            save(
-                case / "solve.json",
+            finish_attempt(
+                case,
                 {
                     "status": "environment_error",
                     "attempt": attempt.name,
@@ -582,7 +693,7 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
             )
             print(key, "environment_error", type(exc).__name__, flush=True)
         else:
-            save(case / "solve.json", state(case))
+            finish_attempt(case, state(case))
             print(key, state(case)["status"], flush=True)
 
 
@@ -603,8 +714,8 @@ def import_predictions(root: Path, source: Path) -> None:
         attempt = case / f"import-{uuid4().hex}"
         attempt.mkdir()
         save(attempt / "prediction.json", row.model_dump())
-        save(
-            case / "solve.json",
+        finish_attempt(
+            case,
             {
                 "status": "imported",
                 "attempt": attempt.name,
@@ -625,26 +736,57 @@ def evaluate(root: Path, args: argparse.Namespace) -> None:
         patch_sha = digest(prediction.model_patch.encode())
         if previous and previous["patch_sha256"] != patch_sha:
             raise ValueError(f"Previously graded patch changed for {key}")
-        if previous.get("status") in {"resolved", "unresolved"} and not args.rescore:
-            continue
         inputs = (
             ("scorer.json", "recipe.json") if (case / "recipe.json").is_file() else ("scorer.json",)
         )
         verify_inputs(root, case, *inputs)
-        result_dir = case / f"grade-{uuid4().hex}"
-        result_dir.mkdir()
         public_recipe = read_json(case / "recipe.json") if (case / "recipe.json").is_file() else {}
         oracle = case / "scorer.json"
         scorer = read_json(oracle)
         image = public_recipe.get("grader_image") or scorer.get("image")
-        result: JSONDict = {
-            "status": "evaluation_error",
-            "resolved": None,
-            "run_id": result_dir.name,
+        attempt_id = state(case)["attempt"]
+        binding = {
             "patch_sha256": patch_sha,
             "image": image,
             "scorer_sha256": digest(oracle.read_bytes()),
             "grader_version": GRADER_VERSION,
+        }
+        if previous.get("status") in {"resolved", "unresolved"} and not args.rescore:
+            if any(previous.get(name) != expected for name, expected in binding.items()) or (
+                previous.get("attempt_id", attempt_id) != attempt_id
+                or previous.get("instance_id", key) != key
+            ):
+                raise ValueError(f"Cached score identity mismatch for {key}")
+            score_id = previous.get("run_id")
+            if not isinstance(score_id, str) or not re.fullmatch(r"grade-[a-f0-9]{32}", score_id):
+                raise ValueError(f"Cached score ID is invalid for {key}")
+            cached_dir = case / score_id
+            if (
+                read_json(cached_dir / "evaluation.json") != previous
+                or previous.get("raw_report") != f"{score_id}/report.json"
+            ):
+                raise ValueError(f"Cached score does not match its evidence for {key}")
+            saved_bytes = (cached_dir / "report.json").read_bytes()
+            saved_sha = digest(saved_bytes)
+            saved_report = json.loads(saved_bytes).get(key)
+            if (
+                previous.get("raw_report_sha256", saved_sha) != saved_sha
+                or not isinstance(saved_report, dict)
+                or saved_report.get("infra_failure")
+                or saved_report.get("resolved") is not (previous["status"] == "resolved")
+                or previous.get("resolved") is not saved_report.get("resolved")
+            ):
+                raise ValueError(f"Cached verdict does not match its report for {key}")
+            continue
+        result_dir = case / f"grade-{uuid4().hex}"
+        result_dir.mkdir()
+        result: JSONDict = {
+            **binding,
+            "status": "evaluation_error",
+            "resolved": None,
+            "run_id": result_dir.name,
+            "attempt_id": attempt_id,
+            "instance_id": key,
         }
         save(path, {**result, "status": "evaluating"})
         if not OFFICIAL_REQUIRED <= scorer.keys():
@@ -678,8 +820,11 @@ def evaluate(root: Path, args: argparse.Namespace) -> None:
                             timeout=args.timeout + 150,
                             check=True,
                         )
-                        official = read_json(result_dir / "report.json")[key]
+                        raw_report = result_dir / "report.json"
+                        raw_bytes = raw_report.read_bytes()
+                        official = json.loads(raw_bytes)[key]
                         result["raw_report"] = f"{result_dir.name}/report.json"
+                        result["raw_report_sha256"] = digest(raw_bytes)
                         if (
                             official.get("infra_failure")
                             or type(official.get("resolved")) is not bool
@@ -756,6 +901,14 @@ def parser() -> argparse.ArgumentParser:
     )
     prepare_cmd.add_argument("--recipes", type=Path)
     solve_cmd = subs.add_parser("run", help="Run pending tasks with an explicit provider")
+    solve_cmd.add_argument("--sandbox-commands", action="store_true")
+    solve_cmd.add_argument("--development-tools", action="store_true")
+    solve_cmd.add_argument("--issue-navigation", action="store_true")
+    solve_cmd.add_argument("--task-evidence", action="store_true")
+    solve_cmd.add_argument("--budget-guidance", action="store_true")
+    solve_cmd.add_argument(
+        "--repair-controller", choices=("off", "feedback", "enforce"), default="off"
+    )
     provider = solve_cmd.add_mutually_exclusive_group(required=True)
     provider.add_argument("--live", action="store_true")
     provider.add_argument("--fake-scripts", type=Path)

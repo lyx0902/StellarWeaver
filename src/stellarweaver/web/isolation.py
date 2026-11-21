@@ -6,12 +6,13 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 from uuid import UUID, uuid4
 
 from stellarweaver.domain import JSONDict
@@ -21,13 +22,25 @@ from stellarweaver.tools.workspace import ToolError, Workspace
 _MAX_FILES = 6000
 _MAX_BYTES = 32 * 1024 * 1024
 _BOOTSTRAP = """
-import os, pathlib, sys, tarfile
+import os, pathlib, stat, sys, tarfile
 root = pathlib.Path("/tmp/work")
 root.mkdir(mode=0o700)
 with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
     archive.extractall(root, filter="data")
-os.chdir(root / sys.argv[1])
-os.execvpe(sys.argv[2], sys.argv[2:], {
+if sys.argv[1] == "sandbox-read-only":
+    for directory, _, files in os.walk(root, topdown=False):
+        for name in files:
+            path = pathlib.Path(directory) / name
+            path.chmod(0o555 if path.stat().st_mode & stat.S_IXUSR else 0o444)
+        pathlib.Path(directory).chmod(0o555)
+    os.setgroups([])
+    os.setgid(65534)
+    os.setuid(65534)
+work = (root / sys.argv[2]).resolve(strict=True)
+if not work.is_relative_to(root) or not work.is_dir():
+    raise SystemExit("Invalid sandbox cwd")
+os.chdir(work)
+os.execvpe(sys.argv[3], sys.argv[3:], {
     "PATH": os.environ["PATH"], "HOME": "/tmp", "TMPDIR": "/tmp",
     "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
 })
@@ -164,12 +177,39 @@ def snapshot_hashes(root: Path) -> dict[str, str] | None:
 
 
 def _archive(root: Path, target: BinaryIO) -> None:
+    workspace = Workspace(root)
+    size = 0
     with tarfile.open(fileobj=target, mode="w") as archive:
         for relative, path in snapshot_paths(root):
-            info = archive.gettarinfo(str(path), relative)
+            original = path.lstat()
             with path.open("rb") as source:
+                current = os.fstat(source.fileno())
+                if (
+                    not stat.S_ISREG(original.st_mode)
+                    or not os.path.samestat(original, current)
+                    or workspace.resolve(relative) != path
+                    or current.st_nlink != 1
+                ):
+                    raise ToolError("SNAPSHOT_UNSAFE_ENTRY", "The snapshot file identity changed.")
+                info = archive.gettarinfo(fileobj=source, arcname=relative)
+                if not info.isfile():
+                    raise ToolError(
+                        "SNAPSHOT_UNSAFE_ENTRY", "Snapshot entries must be regular files."
+                    )
+                size += info.size
+                if size > _MAX_BYTES:
+                    raise ToolError("WORKTREE_LIMIT", "The test snapshot exceeds the size limit.")
                 archive.addfile(info, source)
     target.seek(0)
+
+
+def _archive_digest(archive: BinaryIO) -> str:
+    archive.seek(0)
+    digest = hashlib.sha256()
+    while block := archive.read(64 * 1024):
+        digest.update(block)
+    archive.seek(0)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -177,6 +217,18 @@ class Isolation:
     image: str
     commands: tuple[tuple[str, ...], ...]
     namespace: str
+    profile: Literal["sandbox-workspace", "sandbox-read-only"] = "sandbox-workspace"
+    allow_argv: bool = False
+    development: bool = False
+
+    def permits(self, argv: list[str]) -> bool:
+        from stellarweaver.tools.development import decode_development
+
+        return (
+            self.allow_argv
+            or tuple(argv) in self.commands
+            or (self.development and decode_development(argv) is not None)
+        )
 
     @classmethod
     def from_environment(cls) -> "Isolation | None":
@@ -194,7 +246,17 @@ class Isolation:
         commands = tuple(tuple(RunCommandArgs(argv=argv).argv) for argv in raw)
         if len(set(commands)) != len(commands):
             raise ValueError("Verification commands must be unique")
-        return cls(image, commands, namespace)
+        development = os.getenv("SW_WEB_DEVELOPMENT_TOOLS", "0") == "1"
+        if development and not re.fullmatch(r"(?:[a-z0-9._:/-]+@)?sha256:[a-f0-9]{64}", image):
+            raise ValueError("Web development tools require a pinned runner image")
+        profile = os.getenv("SW_WEB_SANDBOX_PROFILE", "sandbox-workspace")
+        if profile == "sandbox-read-only":
+            return cls(
+                image, commands, namespace, profile="sandbox-read-only", development=development
+            )
+        if profile != "sandbox-workspace":
+            raise ValueError("Unknown web sandbox profile")
+        return cls(image, commands, namespace, development=development)
 
     def reap(self) -> None:
         listed = subprocess.check_output(
@@ -221,6 +283,7 @@ class Isolation:
 class DockerRunner:
     root: Path
     isolation: Isolation
+    dependencies: Path | None = None
 
     async def __call__(
         self,
@@ -231,8 +294,12 @@ class DockerRunner:
         artifacts_dir: Path | None = None,
         timeout_seconds: float | None = None,
     ) -> JSONDict:
-        if tuple(argv) not in self.isolation.commands or cwd != self.root:
+        cwd = await asyncio.to_thread(cwd.resolve, strict=True)
+        if not self.isolation.permits(argv) or not cwd.is_relative_to(self.root):
             raise ToolError("COMMAND_NOT_CONFIGURED", "Select a configured verification command.")
+        relative = cwd.relative_to(self.root).as_posix()
+        if relative != "." and not self.isolation.allow_argv:
+            raise ToolError("COMMAND_NOT_CONFIGURED", "Use the sandbox workspace root.")
         with (
             tempfile.TemporaryDirectory() as scratch,
             (Path(scratch) / "input.tar").open("w+b") as archive,
@@ -249,6 +316,7 @@ class DockerRunner:
                 config=config,
                 artifacts_dir=artifacts_dir,
                 timeout_seconds=timeout_seconds,
+                **({"cwd": relative} if relative != "." else {}),
             )
 
     async def run_archive(
@@ -259,9 +327,16 @@ class DockerRunner:
         config: Any = None,
         artifacts_dir: Path | None = None,
         timeout_seconds: float | None = None,
+        cwd: str = ".",
     ) -> JSONDict:
-        if tuple(argv) not in self.isolation.commands:
+        if not self.isolation.permits(argv) or (cwd != "." and not self.isolation.allow_argv):
             raise ToolError("COMMAND_NOT_CONFIGURED", "Select a configured verification command.")
+        hashing = asyncio.create_task(asyncio.to_thread(_archive_digest, archive))
+        try:
+            snapshot = await asyncio.shield(hashing)
+        except asyncio.CancelledError:
+            await _wait_cleanup(hashing)
+            raise
         name = f"sw-g4-{uuid4().hex}"
         image = await execute_command(
             ["docker", "image", "inspect", "--format", "{{json .}}", self.isolation.image],
@@ -283,6 +358,21 @@ class DockerRunner:
                 "RUNNER_IMAGE_UNAVAILABLE",
                 "Load a trusted runner image with no declared volumes.",
             )
+        if self.isolation.image.startswith("sha256:") and self.isolation.image != image_id:
+            raise ToolError(
+                "RUNNER_IMAGE_UNAVAILABLE", "Runner image does not match the pinned ID."
+            )
+        readonly = self.isolation.profile == "sandbox-read-only"
+        identity = (
+            ["--user", "0:0", "--cap-add", "SETUID", "--cap-add", "SETGID"]
+            if readonly
+            else ["--user", "65534:65534"]
+        )
+        mounts = (
+            ["--mount", f"type=bind,src={self.dependencies},dst=/deps,readonly"]
+            if self.dependencies is not None
+            else []
+        )
         try:
             create = asyncio.create_task(
                 execute_command(
@@ -299,8 +389,7 @@ class DockerRunner:
                         "--network",
                         "none",
                         "--read-only",
-                        "--user",
-                        "65534:65534",
+                        *identity,
                         "--workdir",
                         "/tmp",
                         "--no-healthcheck",
@@ -318,13 +407,15 @@ class DockerRunner:
                         "1",
                         "--tmpfs",
                         "/tmp:rw,nosuid,nodev,mode=1777,size=128m",
+                        *mounts,
                         "--entrypoint",
                         "python",
                         image_id,
                         "-I",
                         "-c",
                         _BOOTSTRAP,
-                        ".",
+                        self.isolation.profile,
+                        cwd,
                         *argv,
                     ],
                     self.root.parent,
@@ -350,7 +441,17 @@ class DockerRunner:
             cleanup = await _wait_cleanup(self._remove(name))
         result["data"].update(
             argv=argv,
-            cwd=".",
+            cwd=cwd,
+            sandbox_profile=self.isolation.profile,
+            image_id=image_id,
+            snapshot_sha256=snapshot,
+            network="none",
+            limits={
+                "cpus": 1,
+                "memory_bytes": 512 * 1024**2,
+                "pids": 128,
+                "tmp_bytes": 128 * 1024**2,
+            },
             process_cleanup="docker",
             process_management={"backend": "docker", "cleanup_confirmed": cleanup},
         )

@@ -34,6 +34,8 @@ const eventNames: Record<string, string> = {
   'approval.decided': '收到审批决定', 'approval.expired': '审批已过期',
   'review.applying': '正在应用补丁', 'review.applied': '已应用补丁',
   'verification.started': '开始验证', 'verification.completed': '验证完成',
+  'repair.diagnostic': '修复诊断', 'harness.profile': '运行配置',
+  'task.evidence': '任务证据', 'budget.guidance': '预算提示',
 }
 
 export function eventLabel(event: RunEvent) {
@@ -61,6 +63,14 @@ function Process({ events, settled, onLogs }: {
             ? <Answer text={event.payload.content ?? ''} />
             : <><strong>{eventLabel(event)}</strong>{event.payload.status && <span>{event.payload.status}</span>}
               {event.payload.code && <code>{event.payload.code}</code>}
+              {event.payload.staged_patch && <button type="button" onClick={() => {
+                const url = URL.createObjectURL(new Blob([event.payload.staged_patch ?? ''], { type: 'text/x-diff' }))
+                const link = document.createElement('a')
+                link.href = url
+                link.download = 'stellarweaver-staged.diff'
+                link.click()
+                setTimeout(() => URL.revokeObjectURL(url), 0)
+              }}>下载待审补丁</button>}
               {event.payload.sources?.length ? <details>
                 <summary>查看搜索来源（{event.payload.sources.length}）</summary>
                 <div className="search-sources">{event.payload.sources.map(source =>
@@ -80,7 +90,11 @@ export function ApprovalCard({ item, busy, onDecision }: {
   return <section className="approval" aria-label="待审批操作">
     <h3>待审批操作</h3>
     <p><code>{item.tool}</code> {item.path}</p>
-    <pre>{item.diff ?? JSON.stringify(item.argv)}</pre>
+    {item.paths && <p>{item.paths.join(' · ')}</p>}
+    {item.patch_sha256 && <p>补丁 SHA-256 <code>{item.patch_sha256}</code></p>}
+    {item.query && <p>以下查询将发送给 DeepSeek 网页搜索</p>}
+    <pre>{item.query ?? item.diff ?? JSON.stringify(item.argv)}</pre>
+    {item.security && <p>风险等级 {item.security.level} · {item.security.capabilities.join(' · ')}</p>}
     {item.argv && <p>工作目录 {item.cwd} · 超时 {item.timeout_seconds} 秒</p>}
     {(item.before_sha256 || item.after_sha256) && <details><summary>文件哈希</summary>
       {item.before_sha256 && <p>原始 <code>{item.before_sha256}</code></p>}

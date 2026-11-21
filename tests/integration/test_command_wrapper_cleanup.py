@@ -80,12 +80,16 @@ async def test_real_cleanup_query_failure_stops_agent_and_followup_command(
         assert raw["data"]["exit_code"] in ({0} if tool == "search_text" else {0, 1})
         assert not raw["data"]["process_management"]["cleanup_confirmed"]
         assert agent.results[0].status == "unknown"
-        assert agent.results[0].data == raw["data"]
         assert agent.results[1].status == "blocked"
         assert len(store.load_results()) == 2
         assert not any(event.type == "run.completed" for event in store.load_events())
         if tool == "search_text":
-            assert "needle" in agent.results[0].data["stdout"]
+            reported = agent.results[0].data
+            assert reported["process_management"] == raw["data"]["process_management"]
+            assert reported["code"] == raw["data"]["code"]
+            assert "needle" in raw["data"]["stdout"]
+            assert "stdout" not in reported
         else:
             # Unknown filter enumeration must never start git status/diff itself.
+            assert agent.results[0].data == raw["data"]
             assert "config" in raw["data"]["argv"]

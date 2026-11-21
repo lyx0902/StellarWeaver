@@ -12,6 +12,7 @@ import httpx
 from stellarweaver.config import ExecutionConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.commands import _wait_cleanup
+from stellarweaver.tools.development import decode_development
 from stellarweaver.tools.workspace import ToolError
 from stellarweaver.web.isolation import Isolation, _archive
 
@@ -32,11 +33,17 @@ class RemoteRunner:
         artifacts_dir: Path | None = None,
         timeout_seconds: float | None = None,
     ) -> JSONDict:
-        if cwd != self.root or tuple(argv) not in self.isolation.commands:
+        development = decode_development(argv) if self.isolation.development else None
+        if cwd != self.root or (development is None and tuple(argv) not in self.isolation.commands):
             raise ToolError("COMMAND_NOT_CONFIGURED", "Select a configured verification command.")
         timeout = timeout_seconds or (config or ExecutionConfig()).default_timeout_seconds
         key = self.endpoint.rstrip("/") + "/verify/" + str(uuid4())
-        index = self.isolation.commands.index(tuple(argv))
+        params: JSONDict = {"timeout": timeout}
+        if development is not None:
+            action, args = development
+            params.update(action=action, target=args.target, framework=args.framework)
+        else:
+            params["command"] = self.isolation.commands.index(tuple(argv))
         with (
             tempfile.TemporaryDirectory() as directory,
             (Path(directory) / "source.tar").open("w+b") as archive,
@@ -60,7 +67,7 @@ class RemoteRunner:
                 try:
                     response = await client.post(
                         key,
-                        params={"command": index, "timeout": timeout},
+                        params=params,
                         content=chunks(),
                         headers={"Content-Type": "application/x-tar"},
                     )

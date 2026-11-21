@@ -169,7 +169,7 @@ function App() {
               const item = event.payload as Approval
               if (Date.parse(item.expires_at) > Date.now()) setApproval(item)
             }
-            if (event.type === 'approval.decided' || event.type === 'approval.expired') {
+              if (['approval.decided', 'approval.expired', 'approval.consumed', 'approval.invalidated'].includes(event.type)) {
               setApproval(prior => prior?.id === event.payload.id ? null : prior)
             }
             if (event.type === 'run.cancel_requested') {

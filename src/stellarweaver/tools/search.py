@@ -88,6 +88,8 @@ async def _rg_search(
         | {
             ".aws",
             ".ssh",
+            ".codex",
+            ".agents",
             ".env",
             ".env.*",
             "credentials",
@@ -109,7 +111,7 @@ async def _rg_search(
         }
     )
     for pattern in excluded:
-        argv.extend(["--glob", f"!{pattern}"])
+        argv.extend(["--iglob", f"!{pattern}"])
     for protected in ctx.workspace.protected_roots:
         if protected.is_relative_to(ctx.workspace.root):
             relative = ctx.workspace.relative(protected)
@@ -132,7 +134,26 @@ async def _rg_search(
         and not any(data.get(key) for key in ("timed_out", "cancelled", "output_incomplete"))
     )
     if outcome["status"] != "ok" and not no_matches:
-        return outcome
+        # An incomplete subprocess stream has not passed workspace filtering.
+        return {
+            "status": outcome["status"],
+            "content": "Workspace search did not complete.",
+            "data": {
+                key: data[key]
+                for key in (
+                    "code",
+                    "exit_code",
+                    "cancelled",
+                    "timed_out",
+                    "output_incomplete",
+                    "process_management",
+                    "process_cleanup",
+                    "stdout_truncated",
+                    "stderr_truncated",
+                )
+                if key in data
+            },
+        }
     if data["cancelled"] or data["timed_out"] or data["exit_code"] not in {0, 1}:
         raise ToolError(
             data.get("code", "SEARCH_FAILED"),
@@ -182,6 +203,7 @@ async def prepare_search_text(args: SearchTextArgs, ctx: ToolContext) -> Prepare
         raise ToolError("INVALID_ARGUMENTS", f"Invalid regular expression: {exc}") from exc
 
     async def execute() -> dict[str, Any]:
+        ctx.workspace.recheck(args.path, root, allow_directory=True)
         executable = shutil.which("rg")
         if executable is not None:
             return await _rg_search(executable, args, ctx, root)
@@ -193,7 +215,8 @@ async def prepare_search_text(args: SearchTextArgs, ctx: ToolContext) -> Prepare
             if args.glob is not None and not fnmatch.fnmatch(relative, args.glob):
                 continue
             try:
-                with candidate.open("r", encoding="utf-8", newline="") as stream:
+                checked = ctx.workspace.resolve(relative)
+                with checked.open("r", encoding="utf-8", newline="") as stream:
                     number = 0
                     while text := stream.readline(65537):
                         number += 1
@@ -218,7 +241,7 @@ async def prepare_search_text(args: SearchTextArgs, ctx: ToolContext) -> Prepare
                             )
                             if len(text.rstrip("\r\n")) > 4000:
                                 truncated = True
-            except (UnicodeDecodeError, OSError):
+            except (UnicodeDecodeError, OSError, ToolError):
                 skipped.append(relative)
             if len(matches) >= args.max_matches:
                 truncated = True

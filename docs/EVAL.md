@@ -77,6 +77,23 @@ uv run python -m stellarweaver.evals run --provider deepseek --env-file .env --o
 
 20 题入口使用 Python 包内的题库与评分器。历史报告、日志和工作区保存在本机，结果口径、token 用量和规则修订见[历史评测结果](archive/00_Sample_Run.md)。
 
+## 修复过程的离线夹具
+
+`locate-edit-recover` 在包含目标源码和无关说明文件的临时工作区运行。固定 FakeModel 依次枚举、搜索和读取，先用过期版本哈希尝试精确编辑，再用正确版本编辑并读取结果。参考目标和预期内容由运行器独立核验。
+
+```powershell
+uv run --locked --offline python -m stellarweaver.evals.local_fixtures
+```
+
+| 指标 | 判定依据 |
+| --- | --- |
+| 文件定位 Top-1 | 第一个去重后的搜索路径是否匹配预注册目标。 |
+| 编辑可靠性 | 目标文件最终 SHA-256 是否匹配预期内容。 |
+| 失败到恢复 | Journal 是否记录 `FILE_CHANGED`，重试后最终字节是否通过独立判定。 |
+| 工具效率 | 从运行结果读取模型调用和工具调用数，从审批回调记录人工交互次数。 |
+
+该夹具用于验收定位、编辑和冲突反馈能否贯通。定位泛化、真实任务修复率、多文件原子性和沙箱资源限制各有独立验收口径。真实 SWE-bench 结果使用清单分母和独立评分。 [夹具源码](../src/stellarweaver/evals/local_fixtures.py) · [统一评测协议](EVAL_PROTOCOL.md) · [安全边界夹具](SECURITY.md#本地工具边界评测)
+
 ## SWE-bench Lite 单题复现试跑
 
 `stellarweaver.evals.swebench_pilot` 支持 Marshmallow 开发题 `marshmallow-code__marshmallow-1359`。从本机试跑资料读取公开题目、固定基线和测试依赖，为每次运行新建工作区。`replay` 可对原始基线或通过 `--patch` 提供的补丁执行复现。`agent` 默认使用现有 DeepSeek 配置，也可传 `--fake-script PATH` 离线回放 FakeModel。加 `--no-gate` 运行对照组，两组提供同样的模型工具。
@@ -94,6 +111,8 @@ uv run --locked python -m stellarweaver.evals.swebench_pilot agent `
 ```
 
 ## SWE-bench Lite 批量评测
+
+M1 的标准报告可从现有实验制品离线生成，包含尝试和评分身份、证据摘要、计划分母及配对统计。 [统一评测协议](EVAL_PROTOCOL.md) · [M0–M1 源码审计与验收](HARNESS_ACCEPTANCE.md#m0-m1-审计与评测契约)
 
 批量入口为 `python -m stellarweaver.evals.swebench`。它固定 SWE-bench Lite 修订 `b0dde1093fe417d83b7184254edf8199c1f0dff5`，逐一校验 `dev` 和 `test` 的 Parquet SHA-256、题数和题号。`prepare` 生成冻结清单，每题的公开题面与评分资料分别保存在 `task.json` 和 `scorer.json`。Agent 只加载公开题面，仓库目录仅包含题目指定的基线提交。
 

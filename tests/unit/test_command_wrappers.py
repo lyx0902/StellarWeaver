@@ -59,9 +59,15 @@ async def test_command_state_survives_wrapper_without_second_command(
     context = ToolContext(Workspace(tmp_path), tmp_path / "artifacts")
     if tool == "search_text":
         result = await _rg_search("rg", SearchTextArgs(pattern="needle"), context, tmp_path)
+        assert result["status"] == status
+        assert result["data"] == {
+            key: value for key, value in raw["data"].items() if key not in {"stdout", "stderr"}
+        }
+        assert "artifact_ids" not in result
     elif tool == "git_status":
         result = await (await prepare_git_status(GitStatusArgs(), context)).execute()
     else:
         result = await (await prepare_git_diff(GitDiffArgs(), context)).execute()
-    assert result is raw
+    if tool != "search_text":
+        assert result is raw
     assert calls == 1

@@ -4,13 +4,14 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import asdict
 from threading import Event
 from typing import cast
 from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from stellarweaver.config import AppConfig, ModelConfig, PolicyConfig
+from stellarweaver.config import AppConfig, HarnessConfig, ModelConfig, PolicyConfig
 from stellarweaver.domain import (
     AssistantReply,
     JSONDict,
@@ -20,6 +21,7 @@ from stellarweaver.domain import (
     ToolResult,
     ToolStatus,
 )
+from stellarweaver.policy.risk import fingerprint
 from stellarweaver.providers.base import ModelProvider
 from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
@@ -83,6 +85,20 @@ async def run(
     config = AppConfig(
         model=web_model_config(provider),
         policy=PolicyConfig(preset="ask" if repair else "read-only"),
+        harness=HarnessConfig(
+            development_tools=bool(repair and runner and runner.isolation.development),
+            issue_navigation=os.getenv("SW_WEB_ISSUE_NAVIGATION") == "1",
+            patch_staging=bool(repair and os.getenv("SW_WEB_PATCH_STAGING") == "1"),
+            task_evidence=os.getenv("SW_WEB_TASK_EVIDENCE") == "1",
+            budget_guidance=os.getenv("SW_WEB_BUDGET_GUIDANCE") == "1",
+            repair_controller=(
+                "enforce"
+                if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "enforce"
+                else "feedback"
+                if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "feedback"
+                else "off"
+            ),
+        ),
     )
     commands = runner.isolation.commands if runner else (tuple(VERIFY_ARGV),)
     if runner and journal.delivery is not None:
@@ -104,7 +120,13 @@ async def run(
             else:
                 assert api_key is not None
                 model = OpenAICompatibleChatProvider(config.model, api_key)
-            gate = ApprovalGate(journal, stop, approval_ttl, commands)
+            gate = ApprovalGate(
+                journal,
+                stop,
+                approval_ttl,
+                commands,
+                development=config.harness.development_tools,
+            )
 
             def on_delta(delta: TextDelta) -> None:
                 for offset in range(0, len(delta.text), 4096):
@@ -120,10 +142,20 @@ async def run(
                 config,
                 model,
                 journal,
-                interactive=repair,
-                approval=gate.approve if repair else None,
+                interactive=True,
+                approval=gate.approve,
                 on_delta=on_delta,
                 command_runner=runner,
+                command_boundary=fingerprint(
+                    {
+                        "isolation": asdict(runner.isolation),
+                        "transport": runner.endpoint
+                        if isinstance(runner, RemoteRunner)
+                        else "docker",
+                    }
+                )
+                if runner is not None
+                else None,
                 chat_only=journal.chat,
                 enable_web_search=True,
             )

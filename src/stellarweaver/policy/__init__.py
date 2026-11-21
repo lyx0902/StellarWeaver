@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-DS_SEARCH = "ds_search"
+from stellarweaver.policy.risk import DS_SEARCH as DS_SEARCH
+from stellarweaver.policy.risk import POLICY_VERSION, assess, fingerprint
+
 READ_TOOLS = frozenset(
-    {"list_files", "read_file", "search_text", "git_status", "git_diff", "load_skill", DS_SEARCH}
+    {
+        "list_files",
+        "read_file",
+        "search_text",
+        "git_status",
+        "git_diff",
+        "load_skill",
+        "find_symbol",
+        "find_references",
+        "find_related_tests",
+        DS_SEARCH,
+    }
 )
 EDIT_TOOLS = frozenset({"create_file", "edit_file"})
 
@@ -44,6 +58,7 @@ class FrozenGrant:
 
 
 Approval = Callable[[dict[str, Any]], Awaitable[str]]
+ApprovalCheck = Callable[[], Awaitable[None]]
 
 
 class PolicyEngine:
@@ -55,6 +70,7 @@ class PolicyEngine:
         interactive: bool = False,
         approval: Approval | None = None,
         policy_file: Path | None = None,
+        allow_sandbox_development: bool = False,
     ) -> None:
         if preset not in {"ask", "read-only", "workspace-edit"}:
             raise ValueError("Unknown policy preset")
@@ -62,6 +78,7 @@ class PolicyEngine:
         self.workspace = workspace.resolve() if workspace else None
         self.interactive = interactive
         self.approval = approval
+        self.allow_sandbox_development = allow_sandbox_development
         self._grants: tuple[FrozenGrant, ...] = ()
         self._session: set[str] = set()
         if policy_file is not None:
@@ -117,6 +134,11 @@ class PolicyEngine:
                     "cwd",
                     "server_id",
                     "arguments_json",
+                    "registered_tool",
+                    "executor",
+                    "command_boundary",
+                    "policy_binding",
+                    "hooks_binding",
                 )
             },
             sort_keys=True,
@@ -146,44 +168,87 @@ class PolicyEngine:
                     arguments = json.loads(invocation.get("arguments_json", "null"))
                 except (ValueError, TypeError):
                     continue
-                if invocation.get("server_id") == grant.server_id and arguments == grant.arguments:
+                if invocation.get("server_id") == grant.server_id and fingerprint(
+                    arguments
+                ) == fingerprint(grant.arguments):
                     return True
         return False
 
-    async def decide(self, invocation: dict[str, Any]) -> dict[str, Any]:
+    def binding(self) -> str:
+        return fingerprint(
+            {
+                "version": POLICY_VERSION,
+                "workspace": str(self.workspace),
+                "preset": self.preset,
+                "interactive": self.interactive,
+                "allow_sandbox_development": self.allow_sandbox_development,
+                "grants": [asdict(grant) for grant in self._grants],
+            }
+        )
+
+    def prohibition(self, invocation: dict[str, Any]) -> str | None:
         tool = invocation["tool"]
         if self.workspace is not None and Path(invocation["workspace"]) != self.workspace:
-            return {"decision": "deny", "reason": "Workspace does not match frozen policy"}
-        if tool == DS_SEARCH:
-            return {"decision": "allow", "reason": "DeepSeek public web search"}
-        if tool in READ_TOOLS:
-            return {"decision": "allow", "reason": "Built-in workspace read"}
-        if invocation.get("remote") and invocation.get("confirmed_read_only"):
-            return {
-                "decision": "allow",
-                "reason": "User configuration confirms this MCP tool is read-only",
-            }
-        # Starting a server has its own exact program grant even in plan mode.
+            return "Workspace does not match frozen policy"
+        if assess(invocation).recommendation == "deny":
+            return "Operation is prohibited by the capability boundary"
+        if self.preset != "read-only" or tool in READ_TOOLS:
+            return None
         if tool == "mcp_start" and self._matches(invocation):
-            return {
-                "decision": "allow",
-                "reason": "Explicit server startup argv/cwd/server_id grant",
-            }
-        if self.preset == "read-only":
-            return {"decision": "deny", "reason": "read-only policy forbids this tool"}
+            return None
+        if invocation.get("remote") and invocation.get("confirmed_read_only"):
+            return None
+        return "read-only policy forbids this tool"
+
+    async def decide(
+        self,
+        invocation: dict[str, Any],
+        *,
+        force_approval: bool = False,
+        before_approval: ApprovalCheck | None = None,
+    ) -> dict[str, Any]:
+        tool = invocation["tool"]
+        blocked = self.prohibition(invocation)
+        if blocked:
+            return {"decision": "deny", "reason": blocked}
+        # Model-authored queries cross a separate boundary even in read-only mode.
+        if tool == DS_SEARCH:
+            return await self._ask(invocation, one_shot=True, check=before_approval)
+        if tool in READ_TOOLS and not force_approval:
+            return {"decision": "allow", "reason": "Built-in workspace read"}
+        if (
+            not force_approval
+            and self.allow_sandbox_development
+            and tool == "run_command"
+            and invocation.get("executor") == "configured"
+            and invocation.get("development_action") == invocation.get("registered_tool")
+            and invocation.get("development_action") is not None
+        ):
+            return {"decision": "allow", "reason": "Frozen benchmark development scope"}
         scope = self._scope(invocation)
-        if self._matches(invocation) or scope in self._session:
+        one_shot = force_approval or assess(invocation).level == "L2"
+        if not force_approval and (
+            self._matches(invocation) or (not one_shot and scope in self._session)
+        ):
             return {"decision": "allow", "reason": "Explicit scoped grant"}
-        if self.preset == "workspace-edit" and tool in EDIT_TOOLS:
+        if not force_approval and self.preset == "workspace-edit" and tool in EDIT_TOOLS:
             return {"decision": "allow", "reason": "workspace-edit allows built-in edits"}
-        if not self.interactive or self.approval is None:
+        return await self._ask(invocation, one_shot=one_shot, check=before_approval)
+
+    async def _ask(
+        self, invocation: dict[str, Any], *, one_shot: bool, check: ApprovalCheck | None
+    ) -> dict[str, Any]:
+        approval = self.approval
+        if not self.interactive or approval is None:
             return {
                 "decision": "blocked",
                 "reason": "Approval required; no interactive TTY or matching grant",
             }
-        answer = await self.approval(invocation)
-        if answer in {"session", "allow-session"}:
-            self._session.add(scope)
+        if check is not None:
+            await check()
+        answer = await approval({**deepcopy(invocation), "one_shot": one_shot})
+        if not one_shot and answer in {"session", "allow-session"}:
+            self._session.add(self._scope(invocation))
             return {"decision": "allow", "reason": "User allowed this session scope"}
         if answer in {"once", "allow", "allow-once"}:
             return {"decision": "allow", "reason": "User allowed this invocation"}

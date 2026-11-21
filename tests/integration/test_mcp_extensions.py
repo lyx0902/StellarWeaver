@@ -30,6 +30,7 @@ def setup(
     grant_start: bool = True,
     confirmed: tuple[str, ...] = ("lookup_symbol", "unsupported"),
     slow_grant: bool = False,
+    grant_calls: bool = True,
 ) -> tuple[Path, Path, PolicyEngine]:
     root = tmp_path / "workspace"
     root.mkdir()
@@ -40,6 +41,19 @@ def setup(
         if grant_start
         else []
     )
+    if grant_calls:
+        grants.extend(
+            {
+                "tool": tool_name("local fixture", name),
+                "server_id": "local fixture",
+                "arguments": {
+                    "symbol": "STELLARWEAVER_PRIVATE_TEST_TOKEN"
+                    if name == "environment_present"
+                    else "add"
+                },
+            }
+            for name in confirmed
+        )
     if slow_grant:
         grants.append(
             {
@@ -136,13 +150,17 @@ async def test_trust_does_not_replace_exact_startup_authorization(
 async def test_read_only_exposes_only_user_confirmed_remote_tools_not_annotations(
     tmp_path: Path,
 ) -> None:
-    root, config, policy = setup(tmp_path, preset="read-only")
+    root, config, policy = setup(tmp_path, preset="read-only", grant_calls=False)
     with SessionStore(root, tmp_path / "state") as store:
         registry = ToolRegistry(root, policy, artifacts_dir=store.artifacts_dir)
         async with ExtensionManager(registry, store, config, trusted=True):
             names = {schema["function"]["name"] for schema in registry.schemas()}
             assert tool_name("local fixture", "lookup_symbol") in names
             assert tool_name("local fixture", "slow_lookup") not in names
+            handoff = await registry.dispatch(
+                ToolCall("scope", tool_name("local fixture", "lookup_symbol"), '{"symbol":"add"}')
+            )
+            assert handoff.status == "blocked"
             denied = await registry.dispatch(
                 ToolCall("denied", tool_name("local fixture", "slow_lookup"), '{"symbol":"add"}')
             )
@@ -260,6 +278,24 @@ async def test_parent_secret_environment_is_not_inherited_by_mcp_server(
             assert result.data["structured_content"] == {"present": False}
 
 
+async def test_explicit_startup_grant_cannot_forward_credential_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SW_FIXTURE_PRIVATE_KEY", "synthetic-only")
+    root, config, policy = setup(tmp_path)
+    data = json.loads(config.read_text())
+    data["servers"][0]["allow_env"] = ["SW_FIXTURE_PRIVATE_KEY"]
+    config.write_text(json.dumps(data))
+    with SessionStore(root, tmp_path / "state") as store:
+        registry = ToolRegistry(root, policy, artifacts_dir=store.artifacts_dir)
+        async with ExtensionManager(registry, store, config, trusted=True) as manager:
+            assert manager.catalog[0]["status"] == "blocked"
+            assert not manager._connections
+        event = next(item for item in store.load_events() if item.type == "mcp.start_authorization")
+        assert event.payload["security"]["reason_codes"] == ["CREDENTIAL_ENVIRONMENT"]
+        assert "synthetic-only" not in json.dumps(event.payload)
+
+
 async def test_cancelled_unconfirmed_mcp_call_is_unknown_and_session_closes(tmp_path: Path) -> None:
     root, config, policy = setup(tmp_path, slow_grant=True)
     data = json.loads(config.read_text())
@@ -361,13 +397,13 @@ async def test_stdio_shutdown_ends_real_process_and_stderr_is_bounded_and_redact
     pid_path = tmp_path / "server.pid"
     monkeypatch.setenv("STELLARWEAVER_FIXTURE_PID_FILE", str(pid_path))
     monkeypatch.setenv("STELLARWEAVER_FIXTURE_STDERR_BYTES", "50000")
-    monkeypatch.setenv("STELLARWEAVER_FIXTURE_LOG_TOKEN", "fake-secret-for-redaction-test")
+    monkeypatch.setenv("STELLARWEAVER_FIXTURE_LOG_MARKER", "fake-secret-for-redaction-test")
     root, config, policy = setup(tmp_path)
     data = json.loads(config.read_text())
     data["servers"][0]["allow_env"] = [
         "STELLARWEAVER_FIXTURE_PID_FILE",
         "STELLARWEAVER_FIXTURE_STDERR_BYTES",
-        "STELLARWEAVER_FIXTURE_LOG_TOKEN",
+        "STELLARWEAVER_FIXTURE_LOG_MARKER",
     ]
     config.write_text(json.dumps(data))
     with SessionStore(root, tmp_path / "state") as store:

@@ -272,9 +272,8 @@ tests/
 
 docs/
   EVAL_PROTOCOL.md        # 新增：指标、方法、污染防治、实验注册
-  SECURITY_THREAT_MODEL.md
-  SECURITY_EVAL.md
-  REPAIR_EVAL.md          # 新增：ACI、定位、测试反馈、编辑、上下文与成本指标
+  SECURITY.md            # 威胁模型与安全评测
+  EVAL.md                # 收录修复过程评测
 ```
 
 > 仅为模块划分建议。先扫描仓库已有 `evals`、`provenance`、`web/experiment` 及测试实现，优先**小范围增量扩展**，不要为了符合树形结构重写当前工作代码。
@@ -700,7 +699,7 @@ Codex 完成一个里程碑后返回：
 - 规范化实验记录、官方评分 JSON、逐题候选补丁、脱敏事件和配置/镜像/模型/评分器指纹；可离线导出 Markdown、JSON/JSONL 和 CSV 摘要。
 - 安全测试同时展示 `attack_triggered`、`attacker_success`、`benign_success`、`unauthorized_effects` 和 `false_positive`，不会将“未执行攻击”误报为成功防御。
 - 报告至少包含三个互不替代的结论：**任务修复能力、执行安全性、运行效率/可用性**；同时提供 Top-k 定位、修复恢复率、多文件 Patch 可靠性、任务证据保留等过程证据。所有提升均附对应对照与限制。
-- 文档 `docs/EVAL_PROTOCOL.md`、`docs/SECURITY_THREAT_MODEL.md`、`docs/SECURITY_EVAL.md`、`docs/REPAIR_EVAL.md`、必要的部署/配置示例及可复现命令。
+- 文档 [EVAL_PROTOCOL.md](EVAL_PROTOCOL.md)、[SECURITY.md](SECURITY.md) 和 [EVAL.md](EVAL.md)，以及必要的部署、配置示例和可复现命令。
 
 ---
 

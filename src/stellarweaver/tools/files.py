@@ -155,6 +155,7 @@ async def prepare_list_files(args: ListFilesArgs, ctx: ToolContext) -> PreparedT
     root = ctx.workspace.resolve(args.path, allow_directory=True)
 
     async def execute() -> dict[str, Any]:
+        ctx.workspace.recheck(args.path, root, allow_directory=True)
         paths: list[str] = []
         truncated = False
         if root.is_file():
@@ -196,7 +197,7 @@ async def prepare_list_files(args: ListFilesArgs, ctx: ToolContext) -> PreparedT
             "data": {"paths": paths, "count": len(paths), "truncated": truncated},
         }
 
-    return PreparedTool({"path": args.path}, execute)
+    return PreparedTool({"path": ctx.workspace.relative(root)}, execute)
 
 
 async def prepare_read_file(args: ReadFileArgs, ctx: ToolContext) -> PreparedTool:
@@ -210,8 +211,8 @@ async def prepare_read_file(args: ReadFileArgs, ctx: ToolContext) -> PreparedToo
         )
 
     async def execute() -> dict[str, Any]:
-        checked = ctx.workspace.resolve(args.path)
-        data = _scan_file(checked, args.start_line, end)
+        ctx.workspace.recheck(args.path, path)
+        data = _scan_file(path, args.start_line, end)
         data["path"] = ctx.workspace.relative(path)
         text = "\n".join(f"{row['line']}: {row['text']}" for row in data["lines"])
         return {"content": text, "data": data}

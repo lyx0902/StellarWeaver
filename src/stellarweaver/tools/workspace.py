@@ -75,12 +75,14 @@ class Workspace:
     def is_protected(relative: str) -> bool:
         parts = Path(relative).parts
         for part in parts:
-            name = part.lower()
+            name = part.rstrip(" .").lower()
             if name in {
                 ".git",
                 ".stellarweaver",
                 ".aws",
                 ".ssh",
+                ".codex",
+                ".agents",
                 "credentials",
                 "credentials.json",
                 "session.db",
@@ -114,12 +116,8 @@ class Workspace:
         self, value: str, *, allow_directory: bool = False, must_exist: bool = True
     ) -> Path:
         supplied = Path(value)
-        if (
-            supplied.is_absolute()
-            or PureWindowsPath(value).is_absolute()
-            or ".." in supplied.parts
-            or ".." in PureWindowsPath(value).parts
-        ):
+        windows = PureWindowsPath(value)
+        if supplied.anchor or windows.anchor or ".." in supplied.parts or ".." in windows.parts:
             raise ToolError(
                 "PATH_OUTSIDE_WORKSPACE",
                 "Use a relative path inside the fixed workspace.",
@@ -131,7 +129,7 @@ class Workspace:
                 "Alternate streams and device paths are not supported.",
                 {"path": value},
             )
-        if PureWindowsPath(value).is_reserved():
+        if windows.is_reserved() or any(part.rstrip(" .") == "" for part in windows.parts):
             raise ToolError(
                 "INVALID_PATH", "Reserved Windows device paths are not supported.", {"path": value}
             )
@@ -156,6 +154,10 @@ class Workspace:
                 "IS_DIRECTORY", "Expected a file, received a directory.", {"path": value}
             )
         return candidate
+
+    def recheck(self, value: str, expected: Path, *, allow_directory: bool = False) -> None:
+        if self.resolve(value, allow_directory=allow_directory) != expected:
+            raise ToolError("PATH_CHANGED", "The resolved target changed during authorization.")
 
     def is_ignored(self, relative: str, *, is_dir: bool = False) -> bool:
         if self.is_protected(relative) or self._is_extra_protected(

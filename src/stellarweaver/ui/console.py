@@ -108,7 +108,13 @@ class TerminalUI:
                 "argv: " + json.dumps(invocation["argv"], ensure_ascii=False), markup=False
             )
             self.console.print(f"cwd: {invocation.get('cwd', '.')}", markup=False)
-            self.console.print("Host commands run with your OS user permissions.", markup=False)
+            if invocation.get("executor") in {None, "host"}:
+                self.console.print("Host commands run with your OS user permissions.", markup=False)
+        if invocation.get("query") is not None:
+            self.console.print(f"Public web query: {invocation['query']}", markup=False)
+        if invocation.get("server_id") is not None and "arguments_json" in invocation:
+            self.console.print(f"MCP server: {invocation['server_id']}", markup=False)
+            self.console.print(f"Arguments: {invocation['arguments_json']}", markup=False)
         if invocation.get("path") is not None:
             self.console.print(f"Path: {invocation['path']}", markup=False)
         preview = invocation.get("preview") or invocation.get("diff")
@@ -120,7 +126,10 @@ class TerminalUI:
             answer = (
                 (
                     await self.prompts.prompt_async(
-                        "[o]nce / [s]ame scope this session / [d]eny: ", handle_sigint=False
+                        "[o]nce / [d]eny: "
+                        if invocation.get("one_shot")
+                        else "[o]nce / [s]ame scope this session / [d]eny: ",
+                        handle_sigint=False,
                     )
                 )
                 .strip()

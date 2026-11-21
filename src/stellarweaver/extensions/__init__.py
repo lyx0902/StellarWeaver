@@ -25,6 +25,7 @@ from stellarweaver.extensions.mcp import (
     tool_name,
 )
 from stellarweaver.extensions.skills import SkillCatalog
+from stellarweaver.policy.risk import assess
 from stellarweaver.session.store import SessionStore
 from stellarweaver.tools.registry import PreparedTool, ToolContext, ToolRegistry
 from stellarweaver.tools.workspace import ToolError, sha256_bytes
@@ -167,6 +168,16 @@ class ExtensionManager:
         return self
 
     async def _start(self, config: ServerConfig) -> None:
+        if getattr(self.registry.execution, "backend", "host") == "docker":
+            self._servers.append({"server_id": config.server_id, "status": "blocked"})
+            await self._emit(
+                "mcp.start_blocked",
+                {
+                    "server_id": config.server_id,
+                    "reason": "The Docker profile does not permit host MCP startup",
+                },
+            )
+            return
         if not self.trusted:
             self._servers.append({"server_id": config.server_id, "status": "untrusted"})
             await self._emit(
@@ -187,9 +198,15 @@ class ExtensionManager:
                 "cwd": self.registry.workspace.relative(cwd),
                 "workspace": str(self.registry.workspace.root),
                 "allow_env": list(config.allow_env),
+                "executor": "host",
             }
-            decision = await self.registry.policy.decide(invocation)
-            await self._emit("mcp.start_authorization", {**invocation, **decision})
+            policy = self.registry.policy
+            binding = policy.binding()
+            decision = await policy.decide(invocation)
+            await self._emit(
+                "mcp.start_authorization",
+                {**invocation, **decision, "security": assess(invocation).metadata()},
+            )
             if decision["decision"] != "allow":
                 self._servers.append({"server_id": config.server_id, "status": "blocked"})
                 return
@@ -198,6 +215,9 @@ class ExtensionManager:
             environment = {
                 name: os.environ[name] for name in config.allow_env if name in os.environ
             }
+            if self.registry.policy is not policy or policy.binding() != binding:
+                raise ToolError("AUTHORIZATION_CHANGED", "MCP startup authorization changed.")
+            self.registry.workspace.recheck(config.cwd, cwd, allow_directory=True)
             connection = MCPConnection(config, cwd, environment)
             await connection.start()
             tools = await connection.list_tools()
@@ -419,8 +439,12 @@ class ExtensionManager:
         raw = bytes(connection.stderr.raw)
         text = raw.decode("utf-8", errors="replace")
         for name, value in connection.environment.items():
-            if value and any(
-                word in name.casefold() for word in ("key", "secret", "token", "password", "auth")
+            if value and (
+                len(value) >= 8
+                or any(
+                    word in name.casefold()
+                    for word in ("key", "secret", "token", "password", "auth")
+                )
             ):
                 text = text.replace(value, "[REDACTED]")
         artifact: JSONDict | None = None

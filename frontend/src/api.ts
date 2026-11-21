@@ -19,6 +19,9 @@ export type Approval = {
   id: string; expires_at: string; tool: string; path?: string; diff?: string
   argv?: string[]; cwd?: string; timeout_seconds?: number
   before_sha256?: string; after_sha256?: string
+  base_commit?: string; patch_sha256?: string; paths?: string[]
+  query?: string
+  security?: { level: string; capabilities: string[]; reason_codes: string[] }
 }
 export type Delivery = {
   run_id: string; verification: string; scope: string
@@ -28,6 +31,7 @@ export type Delivery = {
   review_error?: string
   checks: {
     operation_id: string; state: string; observed: string; exit_code: number | null
+    tool?: string; diagnostic?: { action: string; target: string; framework: string } | null
     argv: string[]; cwd: string; stdout: string; stderr: string
   }[]
 }
@@ -60,6 +64,7 @@ export type RunEvent = {
   seq: number; session_id: string; run_id: string; type: string; schema_version: number
   payload: Partial<Approval> & {
     content?: string; status?: string; tool_name?: string; code?: string
+    staged_patch?: string
     exit_code?: number; status_code?: number
     request_index?: number
     input_tokens?: number; context_window_tokens?: number; input_estimated?: boolean; estimated?: boolean

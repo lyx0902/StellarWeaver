@@ -35,10 +35,13 @@ web = [
 ]
 
 [dependency-groups]
-dev = [
+verification = [
   "pytest>=8,<10",
   "pytest-asyncio>=1,<2",
   "ruff>=0.14,<1",
+]
+dev = [
+  { include-group = "verification" },
   "mypy>=1.18,<2",
   "httpx>=0.28,<1",
   "types-jsonschema>=4.26.0.20261006",

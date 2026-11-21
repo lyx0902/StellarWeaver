@@ -22,6 +22,10 @@ max_output_tokens_total = 30000
 
 [execution]
 backend = "host"
+# Docker is opt-in. Set backend = "docker" and provide a locally cached pinned image ID or digest.
+# image = "sha256:<64 hex digits>"
+# profile = "sandbox-workspace"
+# allow_argv = false
 default_timeout_seconds = 60
 max_timeout_seconds = 300
 max_output_bytes_per_stream = 1048576
@@ -39,3 +43,11 @@ recent_complete_rounds = 6
 max_retries = 2
 base_delay_seconds = 0.5
 max_delay_seconds = 30.0
+
+[harness]
+development_tools = false
+issue_navigation = false
+repair_controller = "off"
+patch_staging = false
+task_evidence = false
+budget_guidance = false

@@ -1,6 +1,7 @@
 """Strict configuration, with API credentials kept outside serializable settings."""
 
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Literal
@@ -50,7 +51,10 @@ class LimitsConfig(StrictConfig):
 
 
 class ExecutionConfig(StrictConfig):
-    backend: Literal["host"] = "host"
+    backend: Literal["host", "docker"] = "host"
+    image: str | None = None
+    profile: Literal["sandbox-workspace", "sandbox-read-only"] = "sandbox-workspace"
+    allow_argv: bool = False
     default_timeout_seconds: int = Field(default=60, ge=1)
     max_timeout_seconds: int = Field(default=300, ge=1)
     max_output_bytes_per_stream: int = Field(default=1048576, ge=1024)
@@ -59,6 +63,11 @@ class ExecutionConfig(StrictConfig):
     def timeout_order(self) -> "ExecutionConfig":
         if self.default_timeout_seconds > self.max_timeout_seconds:
             raise ValueError("default_timeout_seconds must not exceed max_timeout_seconds")
+        if self.backend == "docker" and (
+            self.image is None
+            or not re.fullmatch(r"(?:[a-z0-9._:/-]+@)?sha256:[a-f0-9]{64}", self.image)
+        ):
+            raise ValueError("Docker execution requires a pinned image ID or repository digest")
         return self
 
 
@@ -85,6 +94,15 @@ class RetryConfig(StrictConfig):
     max_delay_seconds: float = Field(default=30.0, gt=0, le=60)
 
 
+class HarnessConfig(StrictConfig):
+    development_tools: bool = False
+    issue_navigation: bool = False
+    repair_controller: Literal["off", "feedback", "enforce"] = "off"
+    patch_staging: bool = False
+    task_evidence: bool = False
+    budget_guidance: bool = False
+
+
 class AppConfig(StrictConfig):
     model: ModelConfig = Field(default_factory=ModelConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
@@ -92,6 +110,7 @@ class AppConfig(StrictConfig):
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    harness: HarnessConfig = Field(default_factory=HarnessConfig)
 
 
 def load_config(workspace: Path, config_path: Path | None = None) -> AppConfig:

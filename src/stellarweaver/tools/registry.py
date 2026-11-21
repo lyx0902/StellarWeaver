@@ -9,7 +9,8 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -18,7 +19,9 @@ from jsonschema.exceptions import ValidationError as SchemaValidationError
 from pydantic import BaseModel, ValidationError
 
 from stellarweaver.domain import JSONDict, Message, ToolCall, ToolResult, ToolStatus
-from stellarweaver.policy import READ_TOOLS, PolicyEngine
+from stellarweaver.policy import DS_SEARCH, READ_TOOLS, PolicyEngine
+from stellarweaver.policy.hooks import Decision, HookEvent, HookManager, Stage
+from stellarweaver.policy.risk import HARD_PATH_ERRORS, POLICY_VERSION, assess, fingerprint
 from stellarweaver.session.locking import SessionBusy, workspace_write_lock
 from stellarweaver.tools.commands import CommandRunner
 from stellarweaver.tools.workspace import ToolError, Workspace
@@ -66,12 +69,16 @@ class ToolRegistry:
         artifacts_dir: Path | None = None,
         command_runner: CommandRunner | None = None,
         builtins: bool = True,
+        hooks: HookManager | None = None,
+        command_boundary: str | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.policy = policy
         self.execution = execution
         self.journal = journal
         self.command_runner = command_runner
+        self.command_boundary = command_boundary
+        self.hooks = hooks or HookManager()
         self.artifacts_dir = artifacts_dir or self.workspace.root / ".stellarweaver" / "artifacts"
         self._tools: dict[str, RegisteredTool] = {}
         self.extension_context: Message | None = None
@@ -163,14 +170,51 @@ class ToolRegistry:
                 await result
 
     async def dispatch(self, call: ToolCall, *, operation_id: str | None = None) -> ToolResult:
-        operation_id = operation_id or uuid.uuid4().hex
+        with ExitStack() as scope:
+            return await self._dispatch(call, operation_id or uuid.uuid4().hex, scope)
+
+    async def _run_hooks(
+        self,
+        manager: HookManager,
+        stage: Stage,
+        invocation: JSONDict,
+        result: JSONDict | None = None,
+    ) -> Decision:
+        if not manager.has_stage(stage):
+            return "continue"
+        tool, operation = invocation["tool"], invocation["operation_id"]
+        decision, records = await manager.run(
+            HookEvent(
+                stage,
+                tool,
+                operation,
+                json.dumps(invocation, sort_keys=True),
+                json.dumps(result) if result is not None else None,
+            )
+        )
+        for receipt in records:
+            await self._record(
+                "security.hook",
+                {"stage": stage, "tool": tool, "operation_id": operation, **asdict(receipt)},
+            )
+        if decision == "deny":
+            code = (
+                "HOOK_FAILED_CLOSED"
+                if records[-1].outcome in {"error", "timeout"}
+                else "HOOK_DENIED"
+            )
+            raise ToolError(code, f"A trusted {stage} hook blocked this operation.")
+        return decision
+
+    async def _dispatch(
+        self, call: ToolCall, operation_id: str, write_scope: ExitStack
+    ) -> ToolResult:
         started = time.monotonic()
         status: ToolStatus = "error"
         payload: JSONDict = {}
         content = ""
         artifacts: tuple[str, ...] = ()
         executing = False
-        write_scope = ExitStack()
         mutating = False
         try:
             tool = self._tools.get(call.name)
@@ -209,24 +253,79 @@ class ToolRegistry:
                 self.command_runner,
             )
             prepared = await tool.prepare(args, context)
+            policy, hooks = self.policy, self.hooks
+            expected_inputs = fingerprint(prepared.invocation)
+            command = self.is_command(call.name)
+            executor = "builtin"
+            if command:
+                executor = "configured" if context.command_runner is not None else "host"
+            elif tool.remote:
+                executor = "stdio-extension"
+            elif call.name == DS_SEARCH:
+                executor = "provider"
             invocation = {
-                **prepared.invocation,
+                **deepcopy(prepared.invocation),
                 "tool": call.name,
                 "workspace": str(self.workspace.root),
                 "call_id": call.call_id,
+                "registered_tool": call.name,
                 "operation_id": operation_id,
                 "arguments_json": call.arguments_json,
                 "remote": tool.remote,
                 "confirmed_read_only": tool.remote and tool.read_only,
+                "executor": executor,
+                "command_boundary": self.command_boundary if command else None,
+                "policy_binding": policy.binding(),
+                "hooks_binding": hooks.binding,
             }
-            if self.before_execute is not None:
-                await self.before_execute(call, invocation)
             if tool.authorization_tool is not None:
                 invocation["authorization_tool"] = tool.authorization_tool
-                decision = await self.policy.decide({**invocation, "tool": tool.authorization_tool})
-            else:
-                decision = await self.policy.decide(invocation)
-            await self._record("tool.authorization", {**invocation, **decision})
+            risk = assess(invocation, read_only=tool.read_only)
+            invocation["security"] = risk.metadata()
+
+            async def permission_hook() -> None:
+                await self._run_hooks(hooks, "PermissionRequest", invocation)
+
+            authorized = {**invocation, "tool": tool.authorization_tool or call.name}
+            approval_callback = policy.approval
+
+            async def revalidate() -> None:
+                if (
+                    self._tools.get(call.name) is not tool
+                    or self.policy is not policy
+                    or self.hooks is not hooks
+                    or self.execution is not context.execution
+                    or self.command_runner is not context.command_runner
+                    or (command and self.command_boundary != invocation["command_boundary"])
+                    or policy.approval is not approval_callback
+                    or policy.binding() != invocation["policy_binding"]
+                    or hooks.binding != invocation["hooks_binding"]
+                    or fingerprint(prepared.invocation) != expected_inputs
+                    or policy.prohibition(authorized) is not None
+                ):
+                    raise ToolError(
+                        "AUTHORIZATION_CHANGED",
+                        "The operation or its authority changed. Request it again.",
+                    )
+                if prepared.recheck is not None:
+                    await prepared.recheck()
+
+            await self._record(
+                "security.assessed",
+                {"tool": call.name, "operation_id": operation_id, **risk.metadata()},
+            )
+            if risk.recommendation == "deny":
+                status = "denied"
+                raise ToolError(
+                    risk.reason_codes[0], "This operation crosses a hard capability boundary."
+                )
+            if self.before_execute is not None:
+                await self.before_execute(call, deepcopy(invocation))
+            force = await self._run_hooks(hooks, "PreToolUse", invocation) == "ask"
+            decision = await policy.decide(
+                authorized, force_approval=force, before_approval=permission_hook
+            )
+            await self._record("tool.authorization", {**deepcopy(invocation), **decision})
             if decision["decision"] != "allow":
                 status = "blocked" if decision["decision"] == "blocked" else "denied"
                 payload = {
@@ -238,10 +337,10 @@ class ToolRegistry:
                 content = decision["reason"]
             else:
                 if self.after_authorize is not None:
-                    await self.after_authorize(call, invocation)
-                if prepared.recheck is not None:
-                    await prepared.recheck()
-                await self._record("tool.started", invocation)
+                    await self.after_authorize(call, deepcopy(invocation))
+                await revalidate()
+                await self._record("tool.started", deepcopy(invocation))
+                await revalidate()
                 executing = True
                 outcome = await prepared.execute()
                 status = cast(ToolStatus, outcome.get("status", "ok"))
@@ -250,11 +349,31 @@ class ToolRegistry:
                 payload = outcome.get("data", {})
                 content = outcome.get("content", json.dumps(payload, ensure_ascii=False))
                 artifacts = tuple(outcome.get("artifact_ids", ()))
+                post = await self._run_hooks(
+                    hooks,
+                    "PostToolUse",
+                    invocation,
+                    {"status": status, "content": content, "data": payload},
+                )
+                if post == "withhold":
+                    payload = {"code": "OUTPUT_WITHHELD"}
+                    content = "A trusted hook withheld this tool output."
+                    artifacts = ()
         except SessionBusy as exc:
             status = "blocked"
             payload = ToolError("WORKSPACE_BUSY", str(exc)).as_data()
             content = f"WORKSPACE_BUSY: {exc}"
         except ToolError as exc:
+            if exc.code in HARD_PATH_ERRORS or exc.code == "AUTHORIZATION_CHANGED":
+                await self._record(
+                    "security.guard_denied",
+                    {
+                        "tool": call.name,
+                        "operation_id": operation_id,
+                        "policy_version": POLICY_VERSION,
+                        "reason_code": exc.code,
+                    },
+                )
             payload = exc.as_data()
             content = f"{exc.code}: {exc.message}"
         except (OSError, UnicodeError) as exc:
@@ -281,20 +400,17 @@ class ToolRegistry:
             artifacts,
             int((time.monotonic() - started) * 1000),
         )
-        try:
-            await self._record(
-                "tool.finished",
-                {
-                    "call_id": call.call_id,
-                    "operation_id": operation_id,
-                    "tool_name": call.name,
-                    "status": status,
-                    "content": content,
-                    "data": payload,
-                    "artifact_ids": list(artifacts),
-                    "duration_ms": result.duration_ms,
-                },
-            )
-        finally:
-            write_scope.close()
+        await self._record(
+            "tool.finished",
+            {
+                "call_id": call.call_id,
+                "operation_id": operation_id,
+                "tool_name": call.name,
+                "status": status,
+                "content": content,
+                "data": payload,
+                "artifact_ids": list(artifacts),
+                "duration_ms": result.duration_ms,
+            },
+        )
         return result

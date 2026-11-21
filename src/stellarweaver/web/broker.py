@@ -19,6 +19,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from stellarweaver.config import ExecutionConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.commands import _wait_cleanup
+from stellarweaver.tools.development import Action, DevelopmentArgs, development_argv
 from stellarweaver.tools.workspace import ToolError, Workspace
 from stellarweaver.web.isolation import _MAX_BYTES, _MAX_FILES, DockerRunner, Isolation
 
@@ -101,12 +102,29 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
     async def verify(
         job_id: UUID,
         request: Request,
-        command: Annotated[int, Query(ge=0)],
         timeout_seconds: Annotated[float, Query(alias="timeout", gt=0, le=300)],
+        command: Annotated[int | None, Query(ge=0)] = None,
+        action: Action | None = None,
+        target: str | None = None,
+        framework: str | None = None,
         authorization: Annotated[str | None, Header()] = None,
     ) -> JSONDict:
         authorize(authorization)
-        if command >= len(isolation.commands):
+        if (
+            command is not None
+            and command < len(isolation.commands)
+            and action is None
+            and target is None
+            and framework is None
+        ):
+            argv = list(isolation.commands[command])
+        elif command is None and action is not None and isolation.development:
+            try:
+                args = DevelopmentArgs.model_validate({"target": target, "framework": framework})
+            except ValueError as exc:
+                raise HTTPException(422, "Invalid development target") from exc
+            argv = development_argv(action, args)
+        else:
             raise HTTPException(422, "Unknown verification command")
         if job_id in active:
             raise HTTPException(409, "Verification already active")
@@ -138,7 +156,7 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
                 task = job.task = asyncio.create_task(
                     runner.run_archive(
                         archive,
-                        list(isolation.commands[command]),
+                        argv,
                         config=ExecutionConfig(max_output_bytes_per_stream=65536),
                         timeout_seconds=timeout_seconds,
                     )

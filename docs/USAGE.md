@@ -45,6 +45,18 @@ uv run stellarweaver resume SESSION_ID --provider deepseek --env-file .env --pro
 
 `read-only` 供源码阅读。`ask` 按策略请求确认。`workspace-edit` 允许受控文件编辑，命令仍走相应授权规则。需要交互批准的操作在无 TTY 时停止。本地 stdio MCP 的发现、调用及关闭流程由[集成测试](../tests/integration/test_mcp_extensions.py)覆盖。配置字段见[示例配置](../stellarweaver.example.toml)，加载与协议边界见[架构](ARCHITECTURE.md#模型上下文与扩展)。
 
+在 Git 工作区可使用 `[execution]` 的 `backend = "docker"` 和固定本地镜像启用断网沙箱。设置 `allow_argv = true` 才会向模型公开沙箱里的通用命令工具，命令仍需授权。`[harness]` 可单独开启开发工具、Python 代码导航和修复反馈。工作台与评测的开关及验证口径见 [M5–M8 验收](HARNESS_ACCEPTANCE.md#m5-m8-沙箱与修复工具)。
+
+需要用工作台验证 StellarWeaver 自身时，可从仓库根目录构建专用镜像。镜像包含锁定的项目依赖、pytest、pytest-asyncio 和 Ruff。执行时从任务快照读取源码，pytest 只显式加载镜像中安装的异步插件，容器保持断网。
+
+```powershell
+docker build --target verification -t stellarweaver-verification:m6-local -f deploy/Dockerfile .
+$env:SW_RUNNER_IMAGE = docker image inspect --format '{{.Id}}' stellarweaver-verification:m6-local
+$env:SW_WEB_DEVELOPMENT_TOOLS = '1'
+```
+
+把 `SW_RUNNER_IMAGE` 的固定 ID 与开发工具开关存入 `.stellarweaver/workbench.compose.env`，按下文更新当前 Compose 项目。其他仓库需要的依赖由其自己的验证镜像提供。
+
 ## Web 工作台
 
 1. 打开 `http://127.0.0.1:8787/`，用账号名和密码注册或登录，用户名显示在侧栏底部。升级已有单人部署时，首个注册账号继承原登记项目的历史。后续账号拥有各自的工作区与会话。
@@ -57,13 +69,13 @@ uv run stellarweaver resume SESSION_ID --provider deepseek --env-file .env --pro
 
 Enter 提交，Shift+Enter 换行。运行中的线程可以编辑追问草稿，当前轮次结束后提交。
 
-使用 DeepSeek Flash 时，模型可在普通对话和项目任务中按需调用 `ds_search`，例如查询 Node.js 官网最新稳定版本及发布日期。来源可从「执行过程」展开。搜索调用只接收公开查询，并纳入任务的模型请求、token 和工具预算。DeepSeek 的服务端搜索免单独费用，模型 token 仍按正常费率计量。 [DeepSeek 搜索计费](https://api-docs.deepseek.com/guides/search/)
+使用支持搜索的 DeepSeek 模型时，普通对话和项目任务均可按需请求 `ds_search`，例如查询 Node.js 官网的最新稳定版本。工作台会显示即将外发的查询原文，批准一次后才发送。CLI 使用终端审批，无 TTY 时需要批准的搜索会被阻止。搜索结果的来源可从「执行过程」展开，搜索调用计入原有模型请求、token 和工具预算。 [DeepSeek 搜索说明](https://api-docs.deepseek.com/guides/search/)
 
 管理员在左侧打开「审计与用量」可查看北京时间今日用量、自己的 UTC 日额度和最近审计。面板打开后每 30 秒重新查询用量和审计，并显示服务端最近读取时间。今日用量在北京时间零点切换，UTC 日额度在北京时间 08:00 重置。
 
 左侧用户名上方的「Skills 库」可搜索、查看和刷新本机技能。正文以只读文档展示，列表同时给出来源和扫描提示。可在本机 Compose 配置中将 `SW_WORKBENCH_AGENT_SKILLS_ROOT`、`SW_WORKBENCH_CODEX_SKILLS_ROOT` 指向希望提供给工作台已登录用户浏览的目录。Agents 根目录下已有的 `skills-codex` 会作为独立来源扫描。路径通过 API 容器只读挂载，每个来源扫描一级子目录中的 `SKILL.md`。
 
-本机初始管理员可在左侧「实验记录」查看已发布的离线运行，包括会话消息、工具参数和结果、事件、候选补丁及独立评分。`SW_WORKBENCH_EXPERIMENT_ROOT` 指向包含 `report.json` 的本机目录，API 只读挂载该目录。批量 SWE-bench Lite 实验的运行和评分入口见[评测指南](EVAL.md#swe-bench-lite-批量评测)。
+本机初始管理员可在左侧「实验记录」切换已发布的批量评测、边界夹具和单题轨迹。可筛选题号和评分状态，逐题查看候选、失败原因、独立评分、耗时和 Token 用量，并按题号对照两份报告、查看不可比原因或下载脱敏 JSON。`SW_WORKBENCH_EXPERIMENT_ROOT` 指向只读挂载目录。根目录 `report.json` 保留旧单题记录，`reports/*.json` 用于发布 M1 批量报告和 M2 夹具报告。 [看板与发布口径](HARNESS_ACCEPTANCE.md#已发布的本地记录)
 
 ## 本机 Compose
 

@@ -41,21 +41,67 @@ def test_experiment_file_is_visible_only_to_initial_local_owner(tmp_path, monkey
     monkeypatch.setattr(web_app.local_accounts, "lookup", lambda *_: "Local Admin")
     monkeypatch.setattr(web_app.local_accounts, "projects", lambda *_: [])
     report = tmp_path / "report.json"
-    report.write_text('{"schema_version":1,"instance_id":"trial"}', encoding="utf-8")
+    report.write_text(
+        '{"schema_version":1,"instance_id":"trial","api_key":"fixture-secret","log":"Authorization: Bearer sensitive-log"}',
+        encoding="utf-8",
+    )
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "boundary.json").write_text(
+        json.dumps(
+            {
+                "manifest": {
+                    "schema_version": 1,
+                    "suite": "local_fixtures",
+                    "instance_ids": ["case-1"],
+                    "fixture_sha256": "a" * 64,
+                    "oracle_source_sha256": "b" * 64,
+                    "model": "FakeModel",
+                },
+                "security": {"planned": 900},
+                "cases": [
+                    {
+                        "instance_id": "case-1",
+                        "kind": "protected",
+                        "passed": True,
+                        "unsafe_effect": False,
+                        "tool_calls": 1,
+                        "model_calls": 2,
+                        "approvals": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (reports / "invalid.json").write_text("invalid", encoding="utf-8")
     app = create_app(
         Mock(), {}, tmp_path, queued=True, isolated=True, local=config, experiment_file=report
     )
     client = TestClient(app, base_url="http://127.0.0.1")
 
     assert client.get("/api/v1/experiment").status_code == 401
+    assert client.get("/api/v1/experiments").status_code == 401
     client.cookies.set(SESSION_COOKIE, "other")
     assert client.get("/api/v1/workspaces").json()["experiment_available"] is False
     assert client.get("/api/v1/experiment").status_code == 404
+    assert client.get("/api/v1/experiments/boundary").status_code == 404
     client.cookies.set(SESSION_COOKIE, "owner")
     assert client.get("/api/v1/workspaces").json()["experiment_available"] is True
     response = client.get("/api/v1/experiment")
     assert response.headers["Cache-Control"] == "no-store"
     assert response.json()["instance_id"] == "trial"
+    assert "fixture-secret" not in response.text and "sensitive-log" not in response.text
+    index = client.get("/api/v1/experiments").json()
+    assert {row["kind"] for row in index["reports"]} == {"legacy", "security"}
+    assert index["unavailable"] == ["invalid"]
+    detail = client.get("/api/v1/experiments/boundary").json()["report"]
+    assert detail["security"] == {
+        "planned": 1,
+        "boundary_checks_passed": 1,
+        "unauthorized_effects": 0,
+    }
+    assert client.get("/api/v1/experiments/compare?left=boundary&right=legacy").status_code == 422
     report.write_text("invalid", encoding="utf-8")
     assert client.get("/api/v1/experiment").status_code == 503
 

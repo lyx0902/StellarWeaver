@@ -229,6 +229,7 @@ async def test_journal_precedes_side_effect_and_result_is_correlated(tmp_path: P
     tools.journal = journal
     result = await tools.dispatch(call("create_file", path="a.txt", content="hello"))
     assert [event for event, _ in records] == [
+        "security.assessed",
         "tool.authorization",
         "tool.started",
         "tool.finished",

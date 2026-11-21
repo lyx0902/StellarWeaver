@@ -441,6 +441,9 @@ async def execute_command(
 async def prepare_run_command(args: RunCommandArgs, context: ToolContext) -> PreparedTool:
     from stellarweaver.tools.registry import PreparedTool
 
+    if getattr(context.execution, "backend", "host") == "docker" and context.command_runner is None:
+        raise ToolError("SANDBOX_UNAVAILABLE", "Docker execution requires the configured sandbox.")
+
     cwd = context.workspace.resolve(args.cwd, allow_directory=True)
     if not cwd.is_dir():
         raise ToolError("NOT_DIRECTORY", "Command cwd must be an existing directory.")
@@ -457,6 +460,7 @@ async def prepare_run_command(args: RunCommandArgs, context: ToolContext) -> Pre
             raise ToolError("PATH_CHANGED", "Command cwd changed after authorization.")
 
     async def execute() -> JSONDict:
+        await recheck()
         runner = context.command_runner or execute_command
         return await runner(
             args.argv,

@@ -30,7 +30,7 @@ from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
 from stellarweaver.runtime.budget import finish_cleanup
 from stellarweaver.runtime.loop import Agent
-from stellarweaver.runtime.service import build_agent
+from stellarweaver.runtime.service import attach_harness, build_agent
 from stellarweaver.session.store import SCHEMA_VERSION, SessionBusy, SessionStore
 from stellarweaver.session.views import render_jsonl, render_markdown
 from stellarweaver.tools.registry import ToolRegistry
@@ -312,11 +312,13 @@ async def execute_chat(
             registry = ToolRegistry(
                 workspace, engine, execution=config.execution, artifacts_dir=store.artifacts_dir
             )
+            attach_harness(registry, config)
             agent = Agent(
                 model,
                 registry,
                 limits=config.limits,
                 context_config=config.context,
+                harness_config=config.harness,
                 store=store,
                 on_event=ui.event,
                 on_delta=ui.delta,
@@ -551,11 +553,13 @@ async def execute_resume(
             registry = ToolRegistry(
                 root, engine, execution=config.execution, artifacts_dir=store.artifacts_dir
             )
+            attach_harness(registry, config)
             agent = Agent(
                 model,
                 registry,
                 limits=config.limits,
                 context_config=config.context,
+                harness_config=config.harness,
                 preflight=lambda: task_extensions(
                     registry, store, ui, extensions, trust_workspace, skill_dirs
                 ),

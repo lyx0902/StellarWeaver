@@ -1502,6 +1502,11 @@ dev = [
     { name = "ruff" },
     { name = "types-jsonschema" },
 ]
+verification = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1532,6 +1537,11 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=1,<2" },
     { name = "ruff", specifier = ">=0.14,<1" },
     { name = "types-jsonschema", specifier = ">=4.26.0.20261006" },
+]
+verification = [
+    { name = "pytest", specifier = ">=8,<10" },
+    { name = "pytest-asyncio", specifier = ">=1,<2" },
+    { name = "ruff", specifier = ">=0.14,<1" },
 ]
 
 [[package]]

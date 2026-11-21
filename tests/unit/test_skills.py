@@ -189,9 +189,15 @@ async def test_remote_large_structured_artifact_has_hard_size_limit(tmp_path: Pa
         async def call(self, name: str, args: object) -> CallToolResult:
             return CallToolResult(content=[], structuredContent={"large": "中文" * 400000})
 
+    async def approve(invocation: dict[str, object]) -> str:
+        assert invocation["server_id"] == "bounded"
+        return "once"
+
     with SessionStore(tmp_path, tmp_path / "state") as store:
         registry = ToolRegistry(
-            tmp_path, PolicyEngine(workspace=tmp_path), artifacts_dir=store.artifacts_dir
+            tmp_path,
+            PolicyEngine(workspace=tmp_path, interactive=True, approval=approve),
+            artifacts_dir=store.artifacts_dir,
         )
         manager = ExtensionManager(registry, store)
         manager._register_remote(
