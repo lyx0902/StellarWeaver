@@ -399,7 +399,7 @@ def test_two_web_tasks_followup_recovery_and_partial_review(
                 if line.startswith("data: ")
                 for event in [json.loads(line[6:])]
             }
-            assert payloads["model.started"]["context_window_tokens"] == 100_000
+            assert payloads["model.started"]["context_window_tokens"] == 200_000
             assert payloads["model.started"]["input_estimated"] is True
             assert payloads["model.completed"]["input_tokens"] > 0
             assert payloads["assistant.completed"]["has_tools"] is False

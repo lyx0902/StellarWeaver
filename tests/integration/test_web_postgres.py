@@ -22,10 +22,13 @@ from sqlalchemy.exc import DBAPIError, OperationalError  # noqa: E402
 from stellarweaver.domain import AssistantReply, Message, ToolCall, ToolResult  # noqa: E402
 from stellarweaver.providers.base import ProviderError  # noqa: E402
 from stellarweaver.providers.fake import FakeModel  # noqa: E402
+from stellarweaver.tools.workspace import sha256_bytes  # noqa: E402
 from stellarweaver.web.app import LOCAL_TENANT, Principal, create_app  # noqa: E402
 from stellarweaver.web.approval import VERIFY_ARGV, DecisionConflict, request_cancel  # noqa: E402
 from stellarweaver.web.db import claim, engine_for, register, scoped, service_lock, submit  # noqa: E402
 from stellarweaver.web.delivery import Delivery  # noqa: E402
+from stellarweaver.web.identity import Member  # noqa: E402
+from stellarweaver.web.isolation import Isolation, saved_worktree  # noqa: E402
 from stellarweaver.web.journal import JobOwnershipLost, PgJournal, pack  # noqa: E402
 from stellarweaver.web.offline import BAD, FIXED, WRONG  # noqa: E402
 from stellarweaver.web.worker import run_worker  # noqa: E402
@@ -172,6 +175,411 @@ def test_static_workbench_and_redacted_model_diagnostics(
                 patch.setattr("stellarweaver.web.db.recent", unavailable)
                 response = client.get("/api/v1/runs", headers=auth(token))
             assert response.status_code == 503 and private not in response.text
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("queued", [False, True], ids=["inline", "worker"])
+def test_workbench_agent_loads_configured_skill_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, queued: bool
+) -> None:
+    dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
+    if not dsn:
+        pytest.skip("Set STELLARWEAVER_TEST_DATABASE_DSN to a migrated test database")
+
+    workspace = (tmp_path / "repo").resolve()
+    skills = tmp_path / "configured-skills"
+    name = "workbench-fixture"
+    body = "WORKBENCH_SKILL_BODY"
+    configured = skills / "workflow" / "SKILL.md"
+    project = workspace / ".stellarweaver" / "skills" / "not-configured" / "SKILL.md"
+    for path, key, contents in (
+        (configured, name, body),
+        (project, "workspace-untrusted", "DO_NOT_AUTO_LOAD"),
+    ):
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            f"---\nname: {key}\ndescription: Guidance for the fixture\n---\n{contents}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("SW_WEB_AGENT_SKILLS_ROOT", str(skills))
+    monkeypatch.delenv("SW_WEB_NESTED_SKILLS_ROOT", raising=False)
+    monkeypatch.delenv("SW_WEB_CODEX_SKILLS_ROOT", raising=False)
+    monkeypatch.delenv("SW_WEB_CONTEXT_WINDOW_TOKENS", raising=False)
+
+    def respond(request):
+        assert any(tool["function"]["name"] == "load_skill" for tool in request.tools)
+        if request.messages[-1].role == "user":
+            context = "\n".join(message.content for message in request.messages)
+            assert name in context and "Guidance for the fixture" in context
+            assert not any(value in context for value in (body, "workspace-untrusted", str(skills)))
+            return AssistantReply(
+                tool_calls=(ToolCall("skill", "load_skill", json.dumps({"name": name})),),
+                stop_reason="tool_calls",
+            )
+        result = json.loads(request.messages[-1].content)
+        assert body in result["content"]
+        assert result["data"]["source_path"] == "workflow/SKILL.md"
+        assert result["data"]["source_kind"] == "Agents"
+        return AssistantReply("Used the configured skill.")
+
+    monkeypatch.setattr(
+        "stellarweaver.web.execution.offline_repository_model", lambda: FakeModel(respond)
+    )
+    engine = engine_for(dsn)
+    principal, token = Principal(uuid4(), (workspace,)), uuid4().hex
+    state = tmp_path / "state"
+    try:
+        with TestClient(
+            create_app(
+                engine,
+                {token: principal},
+                state,
+                queued=queued,
+                skill_roots=[("Agents", skills)],
+            ),
+            base_url="http://127.0.0.1",
+        ) as client:
+            headers = auth(token)
+            assert (
+                client.get("/api/v1/workspaces", headers=headers).json()["context_window_tokens"]
+                == 200_000
+            )
+            catalog = client.get("/api/v1/skills", headers=headers).json()
+            assert [skill["name"] for skill in catalog["skills"]] == [name]
+            response = client.post(
+                "/api/v1/runs",
+                headers=headers,
+                json={
+                    "workspace_id": next(iter(principal.workspace_map())),
+                    "request_id": str(uuid4()),
+                    "mode": "read-only",
+                    "prompt": "Use relevant workflow guidance.",
+                },
+            )
+            assert response.status_code == 202, response.text
+            run_id = response.json()["run_id"]
+            if queued:
+                pending = client.get(f"/api/v1/runs/{run_id}", headers=headers).json()
+                assert pending["context_window_tokens"] == 200_000 and pending["status"] == "active"
+                # The submitted window takes precedence over the worker's current default.
+                monkeypatch.setenv("SW_WEB_CONTEXT_WINDOW_TOKENS", "120000")
+                run_worker(
+                    engine,
+                    str(principal.tenant),
+                    principal.workspace_map(),
+                    state,
+                    provider="fake",
+                    once=True,
+                )
+            terminal = wait_done(client, token, run_id)
+            assert terminal["status"] == "completed", terminal.get("outcome")
+            assert terminal["context_window_tokens"] == 200_000
+            stream = client.get(f"/api/v1/runs/{run_id}/events", headers=headers).text
+            assert '"context_window_tokens": 200000' in stream
+            assert '"skill_name": "workbench-fixture"' in stream
+            assert '"skill_source": "Agents"' in stream
+            assert "Used the configured skill." in stream and body not in stream
+            exported = client.get(f"/api/v1/runs/{run_id}/export", headers=headers).json()
+            assert exported["run"]["context_window_tokens"] == 200_000
+            assert any(
+                item["type"] == "model.started"
+                and item["payload"]["context_window_tokens"] == 200_000
+                for item in exported["events"]
+            )
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+def test_workbench_pins_project_skill_restores_evidence_and_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
+    if not dsn:
+        pytest.skip("Set STELLARWEAVER_TEST_DATABASE_DSN to a migrated test database")
+    workspace = tmp_path / "repo"
+    skill = workspace / ".stellarweaver" / "skills" / "fixture" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text(
+        "---\nname: project-fixture\ndescription: Fixture workflow\n---\nSKILL_BODY_SENTINEL\n",
+        encoding="utf-8",
+    )
+    source = workspace / "note.txt"
+    source.write_text("FILE_BODY_SENTINEL", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(["git", "add", "note.txt"], cwd=workspace, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=workspace,
+        check=True,
+    )
+    model_inputs = []
+
+    def reply(request):
+        model_inputs.append("\n".join(message.content for message in request.messages))
+        if len(model_inputs) == 1:
+            return AssistantReply(
+                tool_calls=(ToolCall("read", "read_file", '{"path":"note.txt"}'),),
+                stop_reason="tool_calls",
+            )
+        return AssistantReply("Done. password=fixture-secret <script>alert(1)</script>")
+
+    monkeypatch.setattr(
+        "stellarweaver.web.execution.offline_repository_model", lambda: FakeModel(reply)
+    )
+    tenant = uuid4()
+    main = Member(id=uuid4(), tenant=tenant, name="owner", role="member", workspace_indexes=[0])
+    other = Member(id=uuid4(), tenant=tenant, name="other", role="member", workspace_indexes=[0])
+    principal = Principal(tenant, (workspace,), member=main)
+    token, other_token = uuid4().hex, uuid4().hex
+    workspace_id = next(iter(principal.workspace_map()))
+    engine = engine_for(dsn)
+    state = tmp_path / "state"
+    isolation = Isolation("unused", (tuple(VERIFY_ARGV),), "parity-fixture")
+    monkeypatch.setattr(Isolation, "reap", lambda *args: None)
+    try:
+        with TestClient(
+            create_app(
+                engine,
+                {token: principal, other_token: Principal(tenant, (workspace,), member=other)},
+                state,
+                queued=True,
+                isolated=True,
+            ),
+            base_url="http://127.0.0.1",
+        ) as client:
+
+            def catalog(key):
+                return client.get(
+                    "/api/v1/skills", params={"workspace_id": workspace_id}, headers=auth(key)
+                ).json()
+
+            def launch(prompt, **options):
+                return client.post(
+                    "/api/v1/runs",
+                    headers=auth(token),
+                    json={
+                        "workspace_id": workspace_id,
+                        "request_id": str(uuid4()),
+                        "prompt": prompt,
+                        **options,
+                    },
+                )
+
+            def execute_one(ids):
+                run_worker(
+                    engine,
+                    str(tenant),
+                    principal.workspace_map(),
+                    state,
+                    provider="fake",
+                    once=True,
+                    isolation=isolation,
+                )
+                assert wait_done(client, token, ids["run_id"])["status"] == "completed"
+
+            assert catalog(token)["skills"] == []
+            trust = f"/api/v1/workspaces/{workspace_id}/skill-trust"
+            assert client.put(trust, headers=auth(token), json={"enabled": True}).json() == {
+                "project_trusted": True,
+            }
+            (entry,) = catalog(token)["skills"]
+            assert entry["source"] == "项目" and catalog(other_token)["skills"] == []
+            refs = [{key: entry[key] for key in ("id", "sha256")}]
+            assert launch("Mismatch", skills=[{**refs[0], "sha256": "0" * 64}]).status_code == 409
+            first = launch("Initial task", skills=refs)
+            assert first.status_code == 202, first.text
+            ids = first.json()
+            execute_one(ids)
+            assert "SKILL_BODY_SENTINEL" in model_inputs[0]
+            route = f"/api/v1/runs/{ids['run_id']}"
+            bundle_response = client.get(route + "/export", headers=auth(token))
+            assert bundle_response.status_code == 200, bundle_response.text
+            bundle = bundle_response.json()
+            assert bundle["operations"][0]["tool_name"] == "read_file"
+            assert bundle["events"][-1]["type"] == "run.completed"
+            assert all(
+                mark not in bundle_response.text
+                for mark in (
+                    "fixture-secret",
+                    "SKILL_BODY_SENTINEL",
+                    "FILE_BODY_SENTINEL",
+                    "reasoning_content",
+                )
+            )
+            page = client.get(route + "/export?format=html", headers=auth(token))
+            assert "&lt;script&gt;" in page.text and "<script>" not in page.text
+            assert client.get(route + "/export", headers=auth(other_token)).status_code == 404
+            next_turn = launch("Follow up", session_id=ids["session_id"])
+            assert next_turn.status_code == 202, next_turn.text
+            execute_one(next_turn.json())
+            assert '"matches_current": true' in model_inputs[-1]
+            assert "SKILL_BODY_SENTINEL" in model_inputs[-1]
+            work = saved_worktree(state, str(tenant), ids["session_id"])
+            (work / "note.txt").write_text("changed outside the run", encoding="utf-8")
+            changed = launch("Check freshness", session_id=ids["session_id"], skills=[])
+            assert changed.status_code == 202, changed.text
+            execute_one(changed.json())
+            assert '"matches_current": false' in model_inputs[-1]
+            assert "SKILL_BODY_SENTINEL" not in model_inputs[-1]
+            assert (
+                client.put(trust, headers=auth(token), json={"enabled": False}).status_code == 200
+            )
+            assert catalog(token)["skills"] == []
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+def test_workbench_undo_restores_and_guards_real_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
+    if not dsn:
+        pytest.skip("Set STELLARWEAVER_TEST_DATABASE_DSN to a migrated test database")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    base = b"before\n"
+    (workspace / "note.txt").write_bytes(base)
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    subprocess.run(["git", "add", "note.txt"], cwd=workspace, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=workspace,
+        check=True,
+    )
+    state = tmp_path / "state"
+    token, principal = uuid4().hex, Principal(uuid4(), (workspace,))
+    isolation = Isolation("unused", (tuple(VERIFY_ARGV),), "parity-fixture")
+    monkeypatch.setattr(Isolation, "reap", lambda *args: None)
+    monkeypatch.setattr(
+        "stellarweaver.web.execution.offline_repair_model",
+        lambda _: FakeModel(
+            [
+                AssistantReply(
+                    tool_calls=(
+                        ToolCall(
+                            "edit",
+                            "edit_file",
+                            json.dumps(
+                                {
+                                    "path": "note.txt",
+                                    "old_text": "before",
+                                    "new_text": "agent",
+                                    "expected_sha256": sha256_bytes(base),
+                                }
+                            ),
+                        ),
+                    ),
+                    stop_reason="tool_calls",
+                ),
+                AssistantReply(
+                    tool_calls=(
+                        ToolCall("create", "create_file", '{"path":"new.txt","content":"created"}'),
+                    ),
+                    stop_reason="tool_calls",
+                ),
+                AssistantReply("wrote two files"),
+            ]
+        ),
+    )
+    engine = engine_for(dsn)
+    try:
+        with TestClient(
+            create_app(
+                engine,
+                {token: principal},
+                state,
+                queued=True,
+                isolated=True,
+                enable_repair=True,
+            ),
+            base_url="http://127.0.0.1",
+        ) as client:
+
+            def execute_one():
+                run_worker(
+                    engine,
+                    str(principal.tenant),
+                    principal.workspace_map(),
+                    state,
+                    provider="fake",
+                    once=True,
+                    enable_repair=True,
+                    isolation=isolation,
+                )
+
+            first = client.post(
+                "/api/v1/runs",
+                headers=auth(token),
+                json={
+                    "workspace_id": next(iter(principal.workspace_map())),
+                    "request_id": str(uuid4()),
+                    "mode": "auto",
+                    "prompt": "Edit and create",
+                },
+            )
+            assert first.status_code == 202, first.text
+            ids = first.json()
+            execute_one()
+            assert wait_done(client, token, ids["run_id"])["status"] == "completed"
+            work = saved_worktree(state, str(principal.tenant), ids["session_id"])
+            assert (work / "note.txt").read_bytes() == b"agent\n" and (work / "new.txt").is_file()
+
+            def undo(previous, path):
+                route = f"/api/v1/runs/{previous}/undo"
+                result = client.get(route, headers=auth(token))
+                assert result.status_code == 200, result.text
+                target = result.json()["target"]
+                assert target["path"] == path
+                payload = {"operation_id": target["operation_id"], "request_id": str(uuid4())}
+                accepted = client.post(route, headers=auth(token), json=payload)
+                assert accepted.status_code == 202, accepted.text
+                assert (
+                    client.post(route, headers=auth(token), json=payload).json() == accepted.json()
+                )
+                execute_one()
+                return wait_done(client, token, accepted.json()["run_id"])
+
+            removed = undo(ids["run_id"], "new.txt")
+            assert removed["status"] == "completed" and not (work / "new.txt").exists()
+            (work / "note.txt").write_bytes(b"user concurrent change\n")
+            blocked = undo(removed["run_id"], "note.txt")
+            assert blocked["outcome"]["error_code"] == "UNDO_CONFLICT"
+            assert (work / "note.txt").read_bytes() == b"user concurrent change\n"
+            (work / "note.txt").write_bytes(b"agent\n")
+            restored = undo(blocked["run_id"], "note.txt")
+            assert restored["status"] == "completed" and (work / "note.txt").read_bytes() == base
+            assert (workspace / "note.txt").read_bytes() == base and not (
+                workspace / "new.txt"
+            ).exists()
+            original_report = client.get(
+                f"/api/v1/runs/{ids['run_id']}/report", headers=auth(token)
+            ).json()
+            assert {entry["path"] for entry in original_report["patches"]} == {
+                "note.txt",
+                "new.txt",
+            }
     finally:
         engine.dispose()
 

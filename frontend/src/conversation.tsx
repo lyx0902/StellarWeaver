@@ -36,6 +36,8 @@ const eventNames: Record<string, string> = {
   'verification.started': '开始验证', 'verification.completed': '验证完成',
   'repair.diagnostic': '修复诊断', 'harness.profile': '运行配置',
   'task.evidence': '任务证据', 'budget.guidance': '预算提示',
+  'skill.selected': '指定技能', 'context.prior_evidence': '复核续接证据',
+  'changes.undo.started': '开始撤销文件修改', 'changes.undo.completed': '已撤销文件修改',
 }
 
 export function eventLabel(event: RunEvent) {
@@ -62,6 +64,15 @@ function Process({ events, settled, onLogs }: {
           {event.type === 'assistant.completed'
             ? <Answer text={event.payload.content ?? ''} />
             : <><strong>{eventLabel(event)}</strong>{event.payload.status && <span>{event.payload.status}</span>}
+              {event.payload.skill_name && <span title={event.payload.skill_source}>{event.payload.skill_name}</span>}
+              {event.type === 'context.prior_evidence' && <span>
+                {event.payload.files ?? 0} 个文件 · {event.payload.checks ?? 0} 项检查 · {event.payload.skills ?? 0} 个技能版本
+              </span>}
+              {event.type === 'context.compacted' && event.payload.after_tokens_estimated != null && <span>
+                {event.payload.strategy === 'adaptive_complete_rounds' && '自适应压缩 · '}
+                {event.payload.before_tokens_estimated?.toLocaleString()} → {event.payload.after_tokens_estimated.toLocaleString()} token（估算）
+              </span>}
+              {event.type.startsWith('changes.undo.') && event.payload.path && <code>{event.payload.path}</code>}
               {event.payload.code && <code>{event.payload.code}</code>}
               {event.payload.staged_patch && <button type="button" onClick={() => {
                 const url = URL.createObjectURL(new Blob([event.payload.staged_patch ?? ''], { type: 'text/x-diff' }))
@@ -118,7 +129,8 @@ export function Turn({ run, events, focused, approval, hasReport, onOpen, onLogs
     if (event.type === 'assistant.completed') return event !== final && Boolean(event.payload.content)
     return ['tool.completed', 'model.started', 'model.failed', 'context.compacted',
       'approval.requested', 'approval.decided', 'approval.expired', 'review.applied',
-      'verification.started', 'verification.completed'].includes(event.type)
+      'verification.started', 'verification.completed', 'skill.selected', 'context.prior_evidence',
+      'changes.undo.started', 'changes.undo.completed'].includes(event.type)
   }) ?? []
   const result = final?.payload.content ?? run.final_text
   let live = ''
@@ -142,8 +154,15 @@ export function Turn({ run, events, focused, approval, hasReport, onOpen, onLogs
       {focused && !result && !live && run.status === 'active' && !approval &&
         <p className="wait-state" role="status">{run.job_state === 'queued' ? '已排队，等待执行' : '正在处理任务…'}</p>}
       {focused && run.outcome?.error_code && <p className="run-warning">
-        {run.outcome.error_code === 'RUNNER_CLEANUP_UNCONFIRMED' ?
-          '执行服务未确认验证结果及清理状态。' : <code>{run.outcome.error_code}</code>}
+        {({
+          RUNNER_CLEANUP_UNCONFIRMED: '执行服务未确认验证结果及清理状态。',
+          WEEKLY_MODEL_QUOTA: '已达到工作台本周模型额度。',
+          CONTEXT_WINDOW_EXCEEDED: '下一次模型请求超出上下文窗口。',
+          UNDO_CONFLICT: '文件内容已变化，撤销未写入文件。',
+          SKILL_VERSION_CHANGED: '所选技能的内容已更新，请重新选择版本。',
+          SKILL_NOT_FOUND: '所选技能不可用，请检查工作区授权或移除该技能。',
+        } as Record<string, string>)[run.outcome.error_code] ?? <code>{run.outcome.error_code}</code>}
+        {run.outcome.budget_reason && <small title={run.outcome.budget_reason}> {run.outcome.budget_reason.split(';')[0]}</small>}
       </p>}
       {focused && run.status === 'interrupted' && <section className="run-warning">
         <strong>运行已中断</strong>
@@ -163,7 +182,7 @@ export function Turn({ run, events, focused, approval, hasReport, onOpen, onLogs
   </article>
 }
 
-export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: number }) {
+export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: number | null }) {
   const [open, setOpen] = useState(false)
   const started = events.filter(event => event.type === 'model.started' && event.payload.purpose !== 'ds_search').at(-1)
   const completed = events.filter(event =>
@@ -174,13 +193,14 @@ export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: num
   const estimated = payload?.input_estimated ?? payload?.estimated ?? true
   const formatted = (n: number) => n.toLocaleString('zh-CN')
   const label = used === undefined ? '等待统计' : (estimated ? '约 ' : '') + formatted(used)
-  const ratio = used === undefined ? 0 : Math.min(100, (used / window) * 100)
+  const ratio = used === undefined || window === null ? 0 : Math.min(100, (used / window) * 100)
+  const display = window === null ? '未记录' : label + ' / ' + formatted(window)
   return <span className="context-meter" data-testid="context-usage"
     onMouseEnter={() => setOpen(true)} onMouseLeave={event => {
       if (!event.currentTarget.contains(document.activeElement)) setOpen(false)
     }}>
     <button type="button" className="context-trigger"
-      aria-label={'上下文用量 ' + label + ' / ' + formatted(window) + ' tokens'}
+      aria-label={'上下文用量 ' + display + (window === null ? '' : ' tokens')}
       onFocus={() => setOpen(true)} onBlur={() => setOpen(false)} onClick={() => setOpen(true)}
       onKeyDown={event => {
         if (event.key === 'Escape' && open) {
@@ -192,7 +212,7 @@ export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: num
         style={{ background: 'conic-gradient(var(--accent) ' + ratio + '%, var(--line) 0)' }} />
     </button>
     {open && <span className="context-tooltip" role="tooltip">
-      <span>上下文</span><span><b>{label}</b> / {formatted(window)}</span>
+      <span>上下文</span><span>{window === null ? '未记录' : <><b>{label}</b> / {formatted(window)}</>}</span>
     </span>}
   </span>
 }

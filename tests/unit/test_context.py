@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -90,6 +90,41 @@ def test_call_ids_can_repeat_in_different_rounds() -> None:
     messages.extend(round_messages(2, output_size=1))
     projection = ContextManager().build(messages, (), 100, 20000, ContextConfig(reserve_tokens=0))
     assert projection.messages == tuple(messages)
+
+
+def test_adaptive_retention_uses_recent_evidence_when_six_rounds_overflow_100k() -> None:
+    messages = [Message("system", "Keep repository policy"), Message("user", "Finish analyzing")]
+    for number in range(6):
+        assistant, result = round_messages(number, output_size=6000)
+        messages.extend([replace(assistant, reasoning_content="r" * 16000), result])
+    original = tuple(messages)
+    config = ContextConfig()
+    with pytest.raises(ContextBudgetExceeded, match="Required context does not fit"):
+        ContextManager().build(messages, (), 8192, 100_000, config)
+    projection = ContextManager(adaptive_round_retention=True).build(
+        messages, (), 8192, 100_000, config
+    )
+    assert projection.estimated_tokens <= projection.input_budget == 89760
+    assert projection.summary["retention"] == "adaptive_complete_rounds"
+    assert 0 < projection.summary["retained_complete_rounds"] < 6
+    assert "operation-0" in "\n".join(item.content for item in projection.messages)
+    assert any(
+        item.role == "tool" and json.loads(item.content)["operation_id"] == "operation-5"
+        for item in projection.messages
+    )
+    for index, item in enumerate(projection.messages):
+        if item.role == "assistant":
+            assert item.reasoning_content == "r" * 16000
+            assert projection.messages[index + 1].tool_call_id == item.tool_calls[0].call_id
+    assert tuple(messages) == original
+
+
+def test_adaptive_retention_does_not_cut_the_current_goal_or_system_instructions() -> None:
+    messages = [Message("system", "policy" * 1300), Message("user", "task" * 800)]
+    with pytest.raises(ContextBudgetExceeded):
+        ContextManager(adaptive_round_retention=True).build(
+            messages, (), 1000, 12000, ContextConfig()
+        )
 
 
 @pytest.mark.parametrize(

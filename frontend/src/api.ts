@@ -14,7 +14,7 @@ export type Thread = {
   run_id: string; session_id: string; workspace_id: string; title: string; status: string
   needs_approval: boolean; is_review: boolean; archived?: boolean
 }
-export type Mode = 'read-only' | 'repair'
+export type Mode = 'read-only' | 'repair' | 'auto'
 export type Approval = {
   id: string; expires_at: string; tool: string; path?: string; diff?: string
   argv?: string[]; cwd?: string; timeout_seconds?: number
@@ -42,8 +42,11 @@ export type PatchPreflight = {
   verified_selection: boolean; handoff_ready: boolean
 }
 export type ReviewFeedback = { path: string; hunk?: string; text: string }
+export type SkillSelection = { id: string; name: string; source: string; sha256: string }
+export type UndoTarget = { operation_id: string; path: string; tool_name: string }
 export type Run = {
   run_id: string; session_id: string; status: string; prompt: string; provider?: string
+  context_window_tokens?: number | null
   mode?: Mode; cancel_requested?: boolean; pending_approval?: Approval | null; through_seq?: number
   job_state?: 'queued' | 'running' | 'done' | null
   has_report?: boolean
@@ -51,12 +54,15 @@ export type Run = {
   workspace_id?: string
   isolated?: boolean
   is_review?: boolean
+  is_undo?: boolean
+  skills?: SkillSelection[]
   final_text?: string | null
   created_at?: string
   requires_acknowledgement?: boolean
   unconfirmed_operations?: { operation_id: string; tool_name: string; path?: string; argv?: string[] }[]
   outcome?: {
     run_status?: string; verification_status?: string; error_code?: string
+    budget_reason?: string
     failure_phase?: string; unfinished_tools?: number; recorded_results?: number
   } | null
 }
@@ -65,6 +71,9 @@ export type RunEvent = {
   payload: Partial<Approval> & {
     content?: string; status?: string; tool_name?: string; code?: string
     staged_patch?: string
+    skill_name?: string; skill_source?: string
+    files?: number; checks?: number; skills?: number
+    strategy?: string; before_tokens_estimated?: number; after_tokens_estimated?: number; input_budget?: number
     exit_code?: number; status_code?: number
     request_index?: number
     input_tokens?: number; context_window_tokens?: number; input_estimated?: boolean; estimated?: boolean
@@ -72,6 +81,22 @@ export type RunEvent = {
     purpose?: string
     sources?: { url: string; title?: string }[]
   }
+}
+
+export async function downloadRun(token: string, id: string, format: 'json' | 'html') {
+  const headers = new Headers()
+  if (token) headers.set('Authorization', 'Bearer ' + token)
+  const response = await fetch('/api/v1/runs/' + id + '/export?format=' + format, { headers })
+  if (!response.ok) {
+    const data = await response.json()
+    throw new Error(typeof data.detail === 'string' ? data.detail : '导出失败：' + response.status)
+  }
+  const url = URL.createObjectURL(await response.blob())
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'stellarweaver-' + id + '.' + format
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 export async function api<T>(token: string, resource: string, options?: RequestInit): Promise<T> {

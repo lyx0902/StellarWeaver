@@ -147,16 +147,17 @@ test('installed skill browsing and 30-second usage and audit refresh', async ({ 
     const previous = ++reads === 1
     return route.fulfill({ json: {
       read_at: previous ? '2026-11-18T15:59:45Z' : '2026-11-18T16:00:15Z',
-      day: previous ? '2026-11-18' : '2026-11-19', quota_day: '2026-11-18',
-      quota_resets_at: '2026-11-19T00:00:00Z',
+      day: previous ? '2026-11-18' : '2026-11-19', quota_week_start: '2026-11-16',
+      quota_resets_at: '2026-11-23T00:00:00Z',
       today: { tokens: previous ? 58 : 0, requests: previous ? 1 : 0, estimated_requests: 0, unsettled_requests: 0 },
-      quota: { limit_tokens: 500000, used_tokens: 58 }, history: [],
+      quota: { limit_tokens: 10000000, used_tokens: 58 }, history: [],
     } })
   })
   await page.clock.install({ time: new Date('2026-11-18T15:59:45Z') })
   await page.getByRole('button', { name: '审计与用量' }).click()
   const panel = page.getByRole('dialog', { name: '审计与用量' })
   const today = panel.getByRole('region', { name: '今日模型用量' })
+  await expect(panel.getByRole('region', { name: '我的周额度' })).toContainText('10,000,000')
   await expect(today).toContainText('2026-11-18')
   await expect(panel.getByTestId('usage-read-at')).toContainText('23:59:45')
   await panel.getByRole('button', { name: '刷新', exact: true }).waitFor()

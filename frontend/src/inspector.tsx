@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Delivery, PatchPreflight, ReviewFeedback, RunEvent } from './api'
+import type { Delivery, PatchPreflight, ReviewFeedback, RunEvent, UndoTarget } from './api'
 import { eventLabel } from './conversation'
 
 export type InspectorTab = 'changes' | 'checks' | 'logs'
@@ -74,24 +74,40 @@ function PreflightResult({ result, targetLabel, onDownload }: {
 }
 
 export function Inspector({ active, onSelect, onClose, delivery, events, canApply, canFeedback, isReview,
-  targetLabel, onReview, onFeedback, onPreflight }: {
+  targetLabel, onReview, onFeedback, onPreflight, exportRun, undoTarget, onUndo }: {
   active: InspectorTab; onSelect: (tab: InspectorTab) => void; onClose: () => void
   delivery: Delivery | null; events: RunEvent[]; canApply: boolean; canFeedback: boolean
   isReview: boolean; targetLabel?: string
   onReview: (hunks: string[]) => Promise<void>
   onFeedback: (feedback: ReviewFeedback) => Promise<void>
   onPreflight: (hunks: string[]) => Promise<PatchPreflight>
+  exportRun?: (format: 'json' | 'html') => Promise<void>
+  undoTarget: UndoTarget | null; onUndo: (target: UndoTarget) => Promise<void>
 }) {
   const [selection, setSelection] = useState<string[] | null>(null)
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState<ReviewFeedback | null>(null)
   const [reviewError, setReviewError] = useState('')
+  const [confirmUndo, setConfirmUndo] = useState<string | null>(null)
+  const [actionError, setActionError] = useState('')
   const [preview, setPreview] = useState<{ key: string; result: PatchPreflight } | null>(null)
   const files = delivery?.review?.files ?? []
   const all = files.flatMap(file => file.hunks.map(hunk => hunk.id))
   const reviewed = isReview && delivery?.verification === 'passed'
   const selected = selection ?? (reviewed ? all : [])
   const selectionKey = JSON.stringify(selected)
+
+  async function act(action: () => Promise<void>) {
+    setBusy(true)
+    setActionError('')
+    try {
+      await action()
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   function selectHunks(ids: string[]) {
     setSelection(ids)
@@ -154,8 +170,23 @@ export function Inspector({ active, onSelect, onClose, delivery, events, canAppl
       <button type="button" className="icon-btn" aria-label="关闭运行详情" onClick={onClose}>×</button>
     </div>
     <div className="inspector-body">
+      {actionError && <p className="notice" role="alert">{actionError}</p>}
+      {active === 'changes' && undoTarget && <section className="undo-file" aria-label="撤销文件修改">
+        {confirmUndo === undoTarget.operation_id ? <>
+          <p>撤销隔离工作区中对 <code>{undoTarget.path}</code> 的最近一次修改？</p>
+          <div className="actions">
+            <button type="button" disabled={busy} onClick={() => void act(() => onUndo(undoTarget))}>确认撤销</button>
+            <button type="button" disabled={busy} onClick={() => setConfirmUndo(null)}>取消</button>
+          </div>
+        </> : <button type="button" disabled={busy}
+          onClick={() => setConfirmUndo(undoTarget.operation_id)}>撤销最近一次文件修改</button>}
+      </section>}
       {active === 'logs' ? <>
         <h2>运行日志</h2>
+        {exportRun && <div className="actions">
+          <button type="button" disabled={busy} onClick={() => void act(() => exportRun('html'))}>下载离线回放</button>
+          <button type="button" disabled={busy} onClick={() => void act(() => exportRun('json'))}>导出运行 JSON</button>
+        </div>}
         {!events.length && <p className="muted">等待运行事件。</p>}
         <ol className="event-list" aria-label="运行事件">
           {events.filter(event => event.type !== 'assistant.delta').map(event =>

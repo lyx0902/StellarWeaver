@@ -1,6 +1,6 @@
 # 统一评测协议
 
-本页定义 M1 的 SWE-bench Lite 结果契约。原有数据准备、Agent 执行、SQLite Journal 和独立官方评分入口继续使用。标准化报告从既有制品读取，无需重新请求模型或启动评分容器。
+本页定义 M1 的 SWE-bench Lite 结果契约。原有数据准备、Agent 执行、SQLite Journal 和独立官方评分入口继续使用。标准化报告从既有制品读取，无需重新请求模型或启动评分容器。独立 SWE-bench Lite 批量与试跑配置固定为 100,000 token 窗口，交互式 CLI 与 Web 默认采用 200,000 token。窗口变化的评测对照需在实验设置中单独登记。 [固定对照设置](EVAL_PLAN.md#对照设计)
 
 ## 离线命令
 
@@ -32,6 +32,7 @@ uv run --locked --offline python -m stellarweaver.evals.swebench_contract compar
 - 计划分母等于 manifest 中注册的独立题目数。每道题只计入一次，旧尝试和重评分仍留在明细。
 - `by_run_status`、`by_candidate_status`、`by_evaluation_status` 分别计数。未开始、未产补丁、空补丁、预算用尽、环境失败和未评分保留自己的状态。`resolved_rate` 用当前可关联官方评分的通过数除以计划题数。`graded` 只计官方已判定的通过和未通过题。
 - `usage_source` 区分服务端返回、估算、不完整与不可用。缺失的缓存 token 保留为空。当前格式保留 `security_assessment=not_evaluated`，为独立安全评测留出字段。
+- 批量入口将无人值守策略及其版本写入 `run-settings.json`。策略拦截和环境准备失败分别记录在运行归因中，评分失败仍属于独立评分状态。对照组应采用同一硬边界与冻结策略。 [策略分流](SECURITY.md#运行模式与分流)
 - `compare` 按题号配对，先核对数据、split、基线、冻结输入、预算和策略等控制条件，再核对模型身份、隔离环境和评分器。只有双方同时有可关联且可比较的官方判定才进入四格配对计数；未配对题号和排除原因另列。
 - `--vary` 仅用于显式注册源码版本、配置哈希、提示哈希或工具 schema 哈希的变化。`source_sha256` 覆盖源码文件哈希与 Harness 提交。策略哈希、可见测试环境、模型身份和官方评分绑定仍须满足比较条件。缺少可信模型修订的历史 DeepSeek 实验可独立报告。
 

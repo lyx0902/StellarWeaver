@@ -6,6 +6,7 @@ from typing import Any, Literal
 JSONDict = dict[str, Any]
 ToolStatus = Literal["ok", "error", "denied", "cancelled", "blocked", "unknown"]
 RunStatus = Literal["completed", "blocked", "cancelled", "budget_exceeded", "failed"]
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 
 
 @dataclass(frozen=True)
@@ -70,7 +71,7 @@ class ModelCapabilities:
     tool_calling: bool = True
     streaming: bool = False
     parallel_tool_calls: bool = False
-    context_window_tokens: int | None = 100_000
+    context_window_tokens: int | None = DEFAULT_CONTEXT_WINDOW_TOKENS
     requires_reasoning_history: bool = False
     request_settings: JSONDict = field(default_factory=dict)
     web_search: bool = False

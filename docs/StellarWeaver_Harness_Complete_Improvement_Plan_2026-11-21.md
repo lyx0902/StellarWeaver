@@ -1,5 +1,7 @@
 # StellarWeaver 完整 Harness 改进与可复现实验实施总方案
 
+当前实现与最近一次验收见[实施进度核对](HARNESS_ACCEPTANCE.md#当前实现进度核对)。
+
 
 ## 理想完成态 Harness 架构图（**目标架构**，不是当前已经实现的功能清单）
 

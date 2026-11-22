@@ -33,6 +33,7 @@ def attach_harness(registry: ToolRegistry, config: AppConfig) -> None:
         )
         registry.command_runner = DockerRunner(registry.workspace.root, isolation)
         registry.command_boundary = fingerprint(config.execution.model_dump())
+        registry.sandbox_commands = None if isolation.allow_argv else isolation.commands
         if not isolation.allow_argv:
             registry.unregister("run_command")
     if config.harness.development_tools:
@@ -64,6 +65,9 @@ def build_agent(
     hooks: HookManager | None = None,
     command_boundary: str | None = None,
     allow_sandbox_development: bool = False,
+    sandbox_commands: tuple[tuple[str, ...], ...] | None = None,
+    enforce_run_budget: bool = True,
+    adaptive_round_retention: bool = False,
 ) -> Agent:
     engine = PolicyEngine(
         config.policy.preset,
@@ -82,6 +86,7 @@ def build_agent(
         builtins=not chat_only,
         hooks=hooks,
         command_boundary=command_boundary,
+        sandbox_commands=sandbox_commands,
     )
     if not chat_only:
         attach_harness(registry, config)
@@ -108,4 +113,6 @@ def build_agent(
         project_context=not chat_only,
         completion_check=completion_check,
         enable_web_search=enable_web_search,
+        enforce_run_budget=enforce_run_budget,
+        adaptive_round_retention=adaptive_round_retention,
     )

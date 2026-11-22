@@ -13,7 +13,7 @@ from sqlalchemy.engine import Connection, Engine
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.workspace import Workspace
 from stellarweaver.web import db
-from stellarweaver.web.identity import Access
+from stellarweaver.web.identity import DEFAULT_WEEKLY_TOKENS, Access
 
 ENROLLMENT_LOCK = 1645207843
 
@@ -127,13 +127,20 @@ def enroll(engine: Engine, config: LocalConfig, username: str, password: str) ->
         ).scalar_one()
         tenant = str(config.legacy_tenant if first else uuid4())
         member = str(config.legacy_member if first else uuid4())
-        params = {"tenant": tenant, "member": member, "name": name, "key": key, "hash": stored}
+        params = {
+            "tenant": tenant,
+            "member": member,
+            "name": name,
+            "key": key,
+            "hash": stored,
+            "limit": DEFAULT_WEEKLY_TOKENS,
+        }
         conn.execute(text("SELECT set_config('sw.tenant_id', :tenant, true)"), params)
         conn.execute(text("INSERT INTO sw.tenants VALUES (:tenant) ON CONFLICT DO NOTHING"), params)
         conn.execute(
             text("""
-            INSERT INTO sw.memberships(tenant_id,id,name,role,active_limit,daily_tokens)
-            VALUES(:tenant,:member,:name,'admin',3,500000)
+            INSERT INTO sw.memberships(tenant_id,id,name,role,active_limit,weekly_tokens)
+            VALUES(:tenant,:member,:name,'admin',3,:limit)
             ON CONFLICT (tenant_id,id) DO UPDATE SET name=excluded.name
         """),
             params,

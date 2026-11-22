@@ -31,7 +31,7 @@ test('isolated repair, patch export and validation, and same-thread follow-up', 
   await expect(page.getByRole('region', { name: '执行过程' })).toContainText('edit_file')
   await processToggle.click()
   await page.getByTestId('context-usage').getByRole('button').hover()
-  await expect(page.getByRole('tooltip')).toHaveText(/上下文\s*约 [\d,]+ \/ 100,000/)
+  await expect(page.getByRole('tooltip')).toHaveText(/上下文\s*约 [\d,]+ \/ 200,000/)
   await page.getByRole('button', { name: '查看改动', exact: true }).click()
   await expect(page.getByTestId('verification')).toHaveText('passed')
   const review = page.getByRole('region', { name: '补丁审阅' })

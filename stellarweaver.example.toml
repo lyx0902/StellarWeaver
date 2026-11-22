@@ -7,7 +7,7 @@ thinking = "enabled"
 reasoning_effort = "high"
 api_key_env = "STELLARWEAVER_API_KEY"
 # Explicit conservative working limit; this is not a claim about the model's maximum window.
-context_window_tokens = 100000
+context_window_tokens = 200000
 max_output_tokens = 8192
 request_timeout_seconds = 90
 supports_streaming = true

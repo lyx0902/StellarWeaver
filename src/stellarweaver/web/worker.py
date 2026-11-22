@@ -123,7 +123,14 @@ def _execute_claimed(
                     root = local.folder(project["relative_path"])
             except (OSError, ValueError):
                 setup_error = "WORKSPACE_UNAVAILABLE"
-    repair = job["mode"] == "repair"
+    repair = job["mode"] in db.REPAIR_MODES
+    skill_project = (
+        root
+        if not chat
+        and root is not None
+        and db.project_skill_trust(engine, tenant, job["member_id"], job["workspace_id"])
+        else None
+    )
     configured = (
         root is not None
         and root.is_dir()
@@ -191,6 +198,11 @@ def _execute_claimed(
             runner,
             job["continuation"],
             job["review"],
+            auto=job["mode"] == "auto",
+            selected_skills=job["skills"],
+            skill_project=skill_project,
+            undo=job["undo"],
+            context_window_tokens=job["context_window_tokens"],
         )
 
 

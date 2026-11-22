@@ -7,10 +7,11 @@ from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from stellarweaver.config import PolicyPreset
 from stellarweaver.policy.risk import DS_SEARCH as DS_SEARCH
 from stellarweaver.policy.risk import POLICY_VERSION, assess, fingerprint
 
@@ -29,6 +30,7 @@ READ_TOOLS = frozenset(
     }
 )
 EDIT_TOOLS = frozenset({"create_file", "edit_file"})
+BENCHMARK_TOOLS = (READ_TOOLS - {DS_SEARCH}) | EDIT_TOOLS
 
 
 class Grant(BaseModel):
@@ -64,7 +66,7 @@ ApprovalCheck = Callable[[], Awaitable[None]]
 class PolicyEngine:
     def __init__(
         self,
-        preset: Literal["ask", "read-only", "workspace-edit"] = "ask",
+        preset: PolicyPreset = "ask",
         *,
         workspace: Path | None = None,
         interactive: bool = False,
@@ -72,7 +74,7 @@ class PolicyEngine:
         policy_file: Path | None = None,
         allow_sandbox_development: bool = False,
     ) -> None:
-        if preset not in {"ask", "read-only", "workspace-edit"}:
+        if preset not in {"ask", "read-only", "workspace-edit", "auto", "benchmark"}:
             raise ValueError("Unknown policy preset")
         self.preset = preset
         self.workspace = workspace.resolve() if workspace else None
@@ -186,12 +188,37 @@ class PolicyEngine:
             }
         )
 
+    @staticmethod
+    def _sandbox_development(invocation: dict[str, Any]) -> bool:
+        return (
+            invocation["tool"] == "run_command"
+            and invocation.get("executor") in {"configured", "sandbox"}
+            and invocation.get("development_action") is not None
+            and invocation.get("development_action") == invocation.get("registered_tool")
+        )
+
     def prohibition(self, invocation: dict[str, Any]) -> str | None:
         tool = invocation["tool"]
         if self.workspace is not None and Path(invocation["workspace"]) != self.workspace:
             return "Workspace does not match frozen policy"
         if assess(invocation).recommendation == "deny":
             return "Operation is prohibited by the capability boundary"
+        if self.preset == "benchmark":
+            permitted = not invocation.get("remote") and (
+                tool in BENCHMARK_TOOLS
+                or (
+                    tool == "run_command"
+                    and invocation.get("executor") == "sandbox"
+                    and invocation.get("registered_tool") != "run_command"
+                    and (
+                        (invocation.get("sandbox_command_configured") and self._matches(invocation))
+                        or (
+                            self.allow_sandbox_development and self._sandbox_development(invocation)
+                        )
+                    )
+                )
+            )
+            return None if permitted else "Operation is outside the frozen benchmark policy"
         if self.preset != "read-only" or tool in READ_TOOLS:
             return None
         if tool == "mcp_start" and self._matches(invocation):
@@ -211,20 +238,41 @@ class PolicyEngine:
         blocked = self.prohibition(invocation)
         if blocked:
             return {"decision": "deny", "reason": blocked}
-        # Model-authored queries cross a separate boundary even in read-only mode.
-        if tool == DS_SEARCH:
-            return await self._ask(invocation, one_shot=True, check=before_approval)
+        if self.preset == "benchmark" and force_approval:
+            return {
+                "decision": "blocked",
+                "reason": "Benchmark cannot request interactive approval",
+            }
         if tool in READ_TOOLS and not force_approval:
-            return {"decision": "allow", "reason": "Built-in workspace read"}
+            return {
+                "decision": "allow",
+                "reason": "Public web search" if tool == DS_SEARCH else "Built-in workspace read",
+            }
+        if self.preset == "benchmark":
+            return {"decision": "allow", "reason": "Frozen benchmark policy"}
         if (
             not force_approval
             and self.allow_sandbox_development
-            and tool == "run_command"
-            and invocation.get("executor") == "configured"
-            and invocation.get("development_action") == invocation.get("registered_tool")
-            and invocation.get("development_action") is not None
+            and self._sandbox_development(invocation)
         ):
-            return {"decision": "allow", "reason": "Frozen benchmark development scope"}
+            return {"decision": "allow", "reason": "Configured benchmark development scope"}
+        if self.preset == "auto":
+            if not force_approval and (
+                tool in EDIT_TOOLS
+                or (
+                    tool == "run_command"
+                    and invocation.get("executor") == "sandbox"
+                    and (
+                        invocation.get("sandbox_command_configured")
+                        or self._sandbox_development(invocation)
+                    )
+                )
+            ):
+                return {
+                    "decision": "allow",
+                    "reason": "Auto allows scoped editing and sandbox checks",
+                }
+            return await self._ask(invocation, one_shot=True, check=before_approval)
         scope = self._scope(invocation)
         one_shot = force_approval or assess(invocation).level == "L2"
         if not force_approval and (

@@ -118,12 +118,6 @@ async def test_ds_search_tool_round_trip(tmp_path: Path, case: str) -> None:
     ) as client:
         provider = OpenAICompatibleChatProvider(model_config, "fixture", client=client)
         with SessionStore(root, tmp_path / "state") as store:
-
-            async def approve(invocation: JSONDict) -> str:
-                assert invocation["query"] == "Latest Node.js official release"
-                assert invocation["one_shot"]
-                return "once"
-
             agent = build_agent(
                 config,
                 provider,
@@ -131,8 +125,6 @@ async def test_ds_search_tool_round_trip(tmp_path: Path, case: str) -> None:
                 chat_only=True,
                 enable_web_search=True,
                 stream=False,
-                interactive=True,
-                approval=approve,
             )
             outcome = await agent.run("Search the web. Keep this outside search scope.")
             assert outcome.model_calls == (1 if case == "budget" else 3)
@@ -142,6 +134,9 @@ async def test_ds_search_tool_round_trip(tmp_path: Path, case: str) -> None:
                 assert result.data["sources"] == [{"url": SOURCE, "title": "Node.js release"}]
                 assert (outcome.input_tokens, outcome.output_tokens) == (60, 30)
                 events = store.load_events()
+                (assessment,) = [event for event in events if event.type == "security.assessed"]
+                assert assessment.payload["level"] == "L0"
+                assert assessment.payload["recommendation"] == "allow"
                 (lookup,) = [
                     event
                     for event in events

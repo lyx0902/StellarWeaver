@@ -170,7 +170,7 @@ async def test_one_shot_search_approval_is_bound_to_run_tenant_and_intent(
         "operation_id": operation,
         "query": query,
         "policy_binding": "fixture-policy",
-        "security": {"level": "L2", "capabilities": ["network:public-search-query"]},
+        "security": {"level": "L0", "capabilities": ["network:public-search-query"]},
     }
     gate = ApprovalGate(journal, Event(), 20.0)
     async with asyncio.TaskGroup() as group:
@@ -183,7 +183,7 @@ async def test_one_shot_search_approval_is_bound_to_run_tenant_and_intent(
                     break
                 await asyncio.sleep(0.02)
         assert preview["query"] == query
-        assert preview["security"]["level"] == "L2"
+        assert preview["security"]["level"] == "L0"
         for unrelated in (other_run, other_tenant):
             with pytest.raises(DecisionConflict):
                 decide(unrelated, operation, "approve")
@@ -255,6 +255,7 @@ def test_usage_days_and_read_only_skill_library(engine, tmp_path: Path) -> None:
         assert empty.status_code == 200, empty.text
         assert empty.json()["today"]["tokens"] == 0
         assert empty.json()["read_at"] and empty.json()["quota_resets_at"]
+        assert empty.json()["quota"]["limit_tokens"] == 10_000_000
         ids, _ = db.submit(
             engine,
             str(tenant),
@@ -271,7 +272,9 @@ def test_usage_days_and_read_only_skill_library(engine, tmp_path: Path) -> None:
                                            started_at,tokens,settled,estimated) VALUES
                 (:tenant,:run,1,:member,'2026-11-18','2026-11-18 15:59:00+00',17,true,false),
                 (:tenant,:run,2,:member,'2026-11-18','2026-11-18 16:00:00+00',23,false,true),
-                (:tenant,:run,3,:member,'2026-11-18',NULL,5,true,false)
+                (:tenant,:run,3,:member,'2026-11-18',NULL,5,true,false),
+                (:tenant,:run,4,:member,'2026-11-16',NULL,7,true,false),
+                (:tenant,:run,5,:member,'2026-11-15',NULL,100,true,false)
                 """),
                 {"tenant": str(tenant), "run": ids["run_id"], "member": admin.member_id},
             )
@@ -283,9 +286,12 @@ def test_usage_days_and_read_only_skill_library(engine, tmp_path: Path) -> None:
         assert current["today"] == dict(
             tokens=23, requests=1, estimated_requests=1, unsettled_requests=1
         )
-        assert current["history"][0]["tokens"] == 45 and current["quota"]["used_tokens"] == 45
-        reset = db.usage_today(engine, str(tenant), admin.access, at="2026-11-19T00:00:00Z")
-        assert reset["today"]["tokens"] == 23 and reset["quota"]["used_tokens"] == 0
+        assert current["history"][0]["tokens"] == 45 and current["quota"]["used_tokens"] == 52
+        assert current["quota_week_start"].isoformat() == "2026-11-16"
+        midnight = db.usage_today(engine, str(tenant), admin.access, at="2026-11-19T00:00:00Z")
+        assert midnight["today"]["tokens"] == 23 and midnight["quota"]["used_tokens"] == 52
+        reset = db.usage_today(engine, str(tenant), admin.access, at="2026-11-23T00:00:00Z")
+        assert reset["quota"]["used_tokens"] == 0
 
         route = "/api/v1/skills"
         assert client.get(route).status_code == 401
@@ -309,7 +315,7 @@ def test_team_access_quotas_audit_and_report_exports(engine, tmp_path: Path):
     other.mkdir()
     tenant = uuid4()
     accounts = {
-        "owner": account(tenant, repo, "member", "Owner", active_limit=1, daily_tokens=65),
+        "owner": account(tenant, repo, "member", "Owner", active_limit=1, weekly_tokens=65),
         "teammate": account(tenant, repo, "member", "Teammate"),
         "outsider": account(uuid4(), repo, "member", "Outsider"),
         "other_project": account(tenant, other, "admin", "Other project"),
@@ -356,7 +362,7 @@ def test_team_access_quotas_audit_and_report_exports(engine, tmp_path: Path):
         for actor in ("outsider", "teammate", "other_project"):
             assert get(actor, "threads").json() == []
             assert get(actor, "runs?session_id=" + ids["session_id"]).json() == []
-            for suffix in ("", "/events", "/report", "/patch"):
+            for suffix in ("", "/events", "/report", "/patch", "/export", "/undo"):
                 assert get(actor, route + suffix).status_code == 404
             assert post(actor, route + "/cancel", {}).status_code == 404
             assert (
@@ -407,7 +413,7 @@ def test_team_access_quotas_audit_and_report_exports(engine, tmp_path: Path):
                 "estimated": False,
             },
         )
-        with pytest.raises(BudgetExceeded, match="DAILY_MODEL_QUOTA"):
+        with pytest.raises(BudgetExceeded, match="WEEKLY_MODEL_QUOTA"):
             journal.append_event(
                 "model.started",
                 {

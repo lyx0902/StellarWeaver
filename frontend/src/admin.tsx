@@ -4,7 +4,7 @@ import { api } from './api'
 type Audit = { id: number; name: string; run_id: string; action: string; created_at: string }
 type Usage = { member_id: string; name: string; usage_day: string; tokens: number; requests: number; estimated_requests: number }
 type Overview = {
-  read_at: string; day: string; quota_day: string; quota_resets_at: string
+  read_at: string; day: string; quota_week_start: string; quota_resets_at: string
   today: { tokens: number; requests: number; estimated_requests: number; unsettled_requests: number }
   quota: { limit_tokens: number; used_tokens: number }
   history: Usage[]
@@ -73,8 +73,8 @@ export function AdminPanel({ token, onClose }: { token: string; onClose: () => v
           {usage.today.estimated_requests > 0 && <small className="muted">估算 {usage.today.estimated_requests} 次
             {usage.today.unsettled_requests > 0 && ` · 未结算 ${usage.today.unsettled_requests} 次`}</small>}</>}
       </section>
-      <section aria-label="我的日额度"><h3>我的日额度（UTC）</h3>
-        {usage && <><p className="muted">额度日期 {usage.quota_day}</p>
+      <section aria-label="我的周额度"><h3>我的周额度（UTC）</h3>
+        {usage && <><p className="muted">本周起始日 {usage.quota_week_start}</p>
           <p><strong>{count(usage.quota.used_tokens)}</strong> / {count(usage.quota.limit_tokens)} tokens</p>
           <small className="muted">下次重置 {displayTime(usage.quota_resets_at)}（北京时间）</small></>}
       </section>

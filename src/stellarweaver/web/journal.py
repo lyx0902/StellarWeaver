@@ -147,10 +147,24 @@ class PgJournal:
                     }
                 ):
                     model_usage(conn, self.tenant, self.member_id, self.run_id, kind, payload)
+                window = payload.get("context_window_tokens")
+                if (
+                    kind == "model.started"
+                    and payload.get("purpose") != "ds_search"
+                    and type(window) is int
+                    and window >= 2048
+                ):
+                    conn.execute(
+                        text("""
+                        UPDATE sw.runs SET context_window_tokens=:window
+                        WHERE id=:run AND context_window_tokens IS NULL
+                        """),
+                        {**self._keys, "window": window},
+                    )
                 event = self.add_event_in_transaction(conn, kind, payload)
         except QuotaReached as exc:
             self.model_quota_exhausted = True
-            raise BudgetExceeded("DAILY_MODEL_QUOTA") from exc
+            raise BudgetExceeded("WEEKLY_MODEL_QUOTA") from exc
         if kind in {"model.started", "model.failed", "model.completed"}:
             self.model_request_failed = kind == "model.failed"
         return event
@@ -184,7 +198,7 @@ class PgJournal:
                        AND m.body->'tool_calls'='[]'::jsonb
                      ORDER BY m.position DESC LIMIT 1) AS answer
                 FROM sw.runs r WHERE r.session_id=:session AND r.id<>:run
-                    AND r.status='completed' AND r.review IS NULL
+                    AND r.status='completed' AND r.review IS NULL AND r.undo IS NULL
                 ORDER BY r.created_at DESC,r.id DESC LIMIT 8
                 """),
                     self._keys,
@@ -198,6 +212,13 @@ class PgJournal:
             if row["answer"]
             for message in (Message("user", row["prompt"]), Message("assistant", row["answer"]))
         )
+
+    def selected_skills(self) -> list[JSONDict]:
+        with scoped(self.engine, self.tenant) as conn:
+            selected: list[JSONDict] = conn.execute(
+                text("SELECT skills FROM sw.runs WHERE id=:run"), self._keys
+            ).scalar_one()
+            return selected
 
     def latest_interruption(self) -> JSONDict | None:
         with scoped(self.engine, self.tenant) as conn:
@@ -372,7 +393,7 @@ class PgJournal:
 
     def finish_run(self, outcome: JSONDict, event_type: str) -> AgentEvent:
         if self.model_quota_exhausted:
-            outcome = {**outcome, "error_code": "DAILY_MODEL_QUOTA", "failure_phase": "model"}
+            outcome = {**outcome, "error_code": "WEEKLY_MODEL_QUOTA", "failure_phase": "model"}
         if self.connection_interrupted:
             with self.execution_scope() as conn:
                 return self.interrupt(conn, "WORKER_CONNECTION_LOST")
@@ -410,18 +431,15 @@ class PgJournal:
         """),
             self._keys,
         ).scalar_one()
+        unfinished = max(counts.unfinished, len(unconfirmed_operations(conn, self.run_id)))
         return self.finish_in_transaction(
             conn,
             {
                 "run_status": "interrupted",
-                "verification_status": "unknown" if counts.unfinished else "not_run",
+                "verification_status": "unknown" if unfinished else "not_run",
                 "error_code": reason,
-                "failure_phase": "tool"
-                if counts.unfinished
-                else "approval"
-                if waiting
-                else "worker",
-                "unfinished_tools": counts.unfinished,
+                "failure_phase": "tool" if unfinished else "approval" if waiting else "worker",
+                "unfinished_tools": unfinished,
                 "recorded_results": counts.recorded,
             },
             "run.interrupted",

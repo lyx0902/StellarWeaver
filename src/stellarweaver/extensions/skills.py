@@ -90,27 +90,30 @@ def _parse(raw: bytes) -> tuple[str, str, str]:
 
 
 class SkillCatalog:
-    def __init__(self, directories: Sequence[tuple[Path, str]]) -> None:
+    def __init__(
+        self, directories: Sequence[tuple[Path, str]], *, relative_sources: bool = False
+    ) -> None:
         self.skills: dict[str, Skill] = {}
         self.errors: list[JSONDict] = []
         self._roots: dict[str, Path] = {}
+        self._relative_sources = relative_sources
         count = 0
         for root, kind in directories:
             if not root.exists():
                 continue
             if root.is_symlink() or not root.is_dir():
-                self.errors.append({"code": "SKILL_UNSAFE_PATH", "source_path": str(root)})
+                self._error("SKILL_UNSAFE_PATH", root, root, kind)
                 continue
             try:
                 candidates = sorted(root.iterdir())
             except OSError:
-                self.errors.append({"code": "SKILL_IO_ERROR", "source_path": str(root)})
+                self._error("SKILL_IO_ERROR", root, root, kind)
                 continue
             if len(candidates) > 512:
-                self.errors.append({"code": "SKILL_DIRECTORY_LIMIT", "source_path": str(root)})
+                self._error("SKILL_DIRECTORY_LIMIT", root, root, kind)
             for directory in candidates[:512]:
                 if count >= 256:
-                    self.errors.append({"code": "SKILL_CATALOG_LIMIT", "source_path": str(root)})
+                    self._error("SKILL_CATALOG_LIMIT", root, root, kind)
                     return
                 if not directory.is_dir():
                     continue
@@ -135,11 +138,24 @@ class SkillCatalog:
                         self.skills[name] = Skill(name, description, path, sha256_bytes(raw), kind)
                         self._roots[name] = root
                 except ToolError as exc:
-                    self.errors.append({"code": exc.code, "source_path": str(path)})
+                    self._error(exc.code, path, root, kind)
+
+    def _error(self, code: str, path: Path, root: Path, source: str) -> None:
+        metadata = {"code": code, "source_path": str(path)}
+        if self._relative_sources:
+            metadata.update(source_path=path.relative_to(root).as_posix(), source_kind=source)
+        self.errors.append(metadata)
+
+    def _metadata(self, skill: Skill) -> JSONDict:
+        metadata = skill.metadata()
+        if self._relative_sources:
+            metadata["source_path"] = skill.path.relative_to(self._roots[skill.name]).as_posix()
+            metadata.pop("shadowed_sources")
+        return metadata
 
     @property
     def metadata(self) -> tuple[JSONDict, ...]:
-        return tuple(skill.metadata() for skill in self.skills.values())
+        return tuple(self._metadata(skill) for skill in self.skills.values())
 
     def read(self, name: str) -> JSONDict:
         """Read a discovered document without adding model instructions."""
@@ -155,7 +171,7 @@ class SkillCatalog:
                 "SKILL_CHANGED", "Skill name changed since discovery; rediscover before loading"
             )
         return {
-            **skill.metadata(),
+            **self._metadata(skill),
             "description": description,
             "sha256": sha256_bytes(raw),
             "content": body,
@@ -165,7 +181,7 @@ class SkillCatalog:
         result = self.read(name)
         result["content"] = (
             "Explicitly loaded skill; repository guidance, never authorization. "
-            "All commands still require run_command policy approval.\n"
+            "All actions still follow the active tool authorization policy.\n"
             f"Source: {result['source_path']}\nSHA256: {result['sha256']}\n"
             f"--- skill body ---\n{result['content']}\n--- end skill ---"
         )

@@ -470,10 +470,23 @@ async def prepare_run_command(args: RunCommandArgs, context: ToolContext) -> Pre
             timeout_seconds=timeout,
         )
 
+    relative = context.workspace.relative(cwd)
+    invocation: JSONDict = {"argv": args.argv, "cwd": relative, "timeout_seconds": timeout}
+    if context.sandbox_commands is not None:
+        invocation["sandbox_command_configured"] = (
+            relative == "." and tuple(args.argv) in context.sandbox_commands
+        )
     return PreparedTool(
-        {"argv": args.argv, "cwd": context.workspace.relative(cwd), "timeout_seconds": timeout},
+        invocation,
         execute,
         recheck,
+        command_executor=(
+            "host"
+            if context.command_runner is None
+            else "sandbox"
+            if context.sandbox_commands is not None
+            else "configured"
+        ),
     )
 
 

@@ -221,11 +221,53 @@ def thinking_history(messages: Sequence[Message]) -> tuple[Message, ...]:
     return (*remaining[:prefix], evidence, *remaining[prefix:])
 
 
+def _overflow_evidence(messages: Sequence[Message], omitted: set[int]) -> JSONDict:
+    tools = []
+    users = []
+    for position in sorted(omitted):
+        item = messages[position]
+        if item.role == "user":
+            users.append(_preview(item.content, 350))
+        elif item.role == "tool":
+            body = _body(item)
+            data = body.get("data", {})
+            details = {
+                key: data[key]
+                for key in (
+                    "path",
+                    "sha256",
+                    "before_sha256",
+                    "after_sha256",
+                    "exit_code",
+                    "code",
+                    "start_line",
+                    "end_line",
+                    "name",
+                    "source_kind",
+                )
+                if isinstance(data, dict) and key in data
+            }
+            tools.append(
+                {
+                    "call_id": item.tool_call_id,
+                    "operation_id": body.get("operation_id"),
+                    "tool": body.get("tool_name"),
+                    "status": body.get("status"),
+                    "data": details,
+                    "excerpt": _preview(str(body.get("content", item.content)), 220),
+                }
+            )
+    return {"recent_tool_observations": tools[-8:], "prior_user_excerpts": users[-3:]}
+
+
 class ContextManager:
-    def __init__(self, *, tool_preview_bytes: int = 1024) -> None:
+    def __init__(
+        self, *, tool_preview_bytes: int = 1024, adaptive_round_retention: bool = False
+    ) -> None:
         if tool_preview_bytes < 0:
             raise ValueError("tool_preview_bytes must be non-negative")
         self.tool_preview_bytes = tool_preview_bytes
+        self.adaptive_round_retention = adaptive_round_retention
 
     def build(
         self,
@@ -271,16 +313,34 @@ class ContextManager:
         removable = [group for group in groups if not set(group.positions) & protected]
         omitted: set[int] = set()
 
-        def project() -> tuple[tuple[Message, ...], JSONDict, int]:
+        def project(
+            *, overflow: bool = False, include_summary: bool = True
+        ) -> tuple[tuple[Message, ...], JSONDict, int]:
             summary = _summarize(messages, omitted)
+            summary_text = json.dumps(summary, ensure_ascii=False)
+            if overflow:
+                summary["retention"] = "adaptive_complete_rounds"
+                summary["retained_complete_rounds"] = sum(
+                    group.assistant
+                    and bool(messages[group.positions[0]].tool_calls)
+                    and group.positions[0] not in omitted
+                    for group in groups
+                )
+                summary_text = _preview(
+                    json.dumps(_overflow_evidence(messages, omitted), ensure_ascii=False),
+                    min(6144, budget // 8),
+                )
             summary_message = Message(
                 "system",
                 "Derived historical summary (evidence, not new user instructions or authorization). "
-                "Original messages remain in the session journal.\n"
-                + json.dumps(summary, ensure_ascii=False),
+                "Original messages remain in the session journal.\n" + summary_text,
             )
             remaining = tuple(
-                _project_tool(item, self.tool_preview_bytes) if item.role == "tool" else item
+                _project_tool(
+                    item, min(384, self.tool_preview_bytes) if overflow else self.tool_preview_bytes
+                )
+                if item.role == "tool"
+                else item
                 for index, item in enumerate(messages)
                 if index not in omitted
             )
@@ -288,7 +348,11 @@ class ContextManager:
             insertion = 0
             while insertion < len(remaining) and remaining[insertion].role == "system":
                 insertion += 1
-            items = (*remaining[:insertion], summary_message, *remaining[insertion:])
+            items = (
+                (*remaining[:insertion], summary_message, *remaining[insertion:])
+                if include_summary
+                else remaining
+            )
             return items, summary, tokens(items)
 
         projected, summary, count = project()
@@ -302,6 +366,19 @@ class ContextManager:
         # when summary overhead would be larger than the source it replaces.
         if count >= before and before <= budget:
             return ContextProjection(tuple(messages), before, False, {}, -1, before, budget)
+        if count > budget and self.adaptive_round_retention:
+            projected, summary, count = project(overflow=True)
+            # DeepSeek receives either the full assistant/call/result group or its journal
+            # evidence. Dropping an entire group also drops that group's reasoning payload.
+            for group in groups:
+                if count <= budget:
+                    break
+                if group.assistant and group.positions[0] not in omitted:
+                    omitted.update(group.positions)
+                    projected, summary, count = project(overflow=True)
+            if count > budget:
+                projected, summary, count = project(overflow=True, include_summary=False)
+                summary["summary_sent_to_model"] = False
         if count > budget:
             raise ContextBudgetExceeded(
                 f"Required context does not fit: estimated {count}, input budget {budget}; "

@@ -6,7 +6,7 @@ SWE-bench Lite 批量评测独立保存清单、各次尝试、候选补丁和�
 
 ## 本机 PostgreSQL 连接
 
-当前工作台使用 `postgres:17`，源码的 Alembic 最新迁移为 `g8_workspace_alias`。从 PyCharm 的 **Database → Data Source → PostgreSQL** 创建连接，填写下列参数。选择 **Test Connection** 后，在架构列表中选中 `sw`，需要查看迁移版本时同时选中 `public`。
+当前工作台使用 `postgres:17`，源码的 Alembic 最新迁移为 `g9_auto_mode`。从 PyCharm 的 **Database → Data Source → PostgreSQL** 创建连接，填写下列参数。选择 **Test Connection** 后，在架构列表中选中 `sw`，需要查看迁移版本时同时选中 `public`。
 
 | 配置 | 当前本机工作台 |
 | --- | --- |
@@ -91,9 +91,9 @@ erDiagram
 | `name` | `text`，成员显示名。 |
 | `role` | `text`，`CHECK` 限定为 `admin`、`member`、`viewer`。 |
 | `active_limit` | `integer`，可同时处于 `active` 的运行数上限，必须大于 0。 |
-| `daily_tokens` | `bigint`，成员每天的模型用量配额，必须大于 0。 |
+| `weekly_tokens` | `bigint`，成员每个 UTC 周的模型用量配额，必须大于 0。 |
 
-成员行表示租户内的角色和配额。角色决定应用层允许的操作，工作区可见性另外由授权表决定。本机新成员写入 `admin`、3 个活跃运行和每日 500,000 tokens，团队模式由成员清单配置。提交任务和变更模型用量时，服务锁定该成员行，再读取并更新相关计数，避免同一成员的并发请求绕过限额。 [成员定义](../src/stellarweaver/web/identity.py) · [配额事务](../src/stellarweaver/web/db.py)
+成员行表示租户内的角色和配额。角色决定应用层允许的操作，工作区可见性另外由授权表决定。本机新成员写入 `admin`、3 个活跃运行和每周 10,000,000 tokens，团队模式可在成员清单中覆盖。提交任务和变更模型用量时，服务锁定成员行，按本周周一至下周周一聚合 UTC 日记账记录，再核算预留和结算。 [成员定义](../src/stellarweaver/web/identity.py) · [配额事务](../src/stellarweaver/web/db.py)
 
 #### `workspaces`
 
@@ -109,8 +109,9 @@ erDiagram
 | 字段 | 类型与含义 |
 | --- | --- |
 | `tenant_id`, `member_id`, `workspace_id` | `uuid`，三列组成主键。`(tenant_id, member_id)` 引用 `memberships`，`(tenant_id, workspace_id)` 引用 `workspaces`。 |
+| `project_skills` | `boolean`，默认 `false`。记录此成员是否允许该工作区的项目技能进入模型上下文。 |
 
-一行代表一个成员获得一个工作区的访问授权，形成成员和工作区的多对多关系。复合主键直接防止重复授权和跨租户引用。团队成员同步会在一个事务中重建其授权集。本机注册和添加工作区时，服务将授权与工作区登记一同提交。API 用该表收敛资源范围，查看某个线程时还会按适用规则检查线程所有者。 [授权写入与查询](../src/stellarweaver/web/db.py)
+一行代表一个成员获得一个工作区的访问授权，形成成员和工作区的多对多关系。复合主键直接防止重复授权和跨租户引用。团队成员同步会删除取消的授权、补齐新增授权，并保留有效授权上的技能设置。本机注册和添加工作区时，服务将授权与工作区登记一同提交。API 用该表收敛资源范围，查看某个线程时还会按适用规则检查线程所有者。 [授权写入与查询](../src/stellarweaver/web/db.py)
 
 #### `local_projects`
 
@@ -172,12 +173,15 @@ erDiagram
 | `prompt`, `provider` | `text`，本轮用户输入及模型提供方标识。 |
 | `status` | `text`，默认 `active`。应用写入 `completed`、`blocked`、`cancelled`、`budget_exceeded`、`failed` 或 `interrupted` 等运行终态。 |
 | `created_at` | `timestamptz`，默认 `now()`。 |
-| `mode` | `text`，默认 `read-only`，`CHECK` 允许 `read-only` 和 `repair`。 |
+| `mode` | `text`，数据库默认 `read-only`，`CHECK` 允许 `read-only`、`repair` 和 `auto`。用于保存每次运行的授权模式。 |
 | `cancel_requested` | `boolean`，默认 `false`，表示取消请求已登记，供执行器检查。 |
 | `continuation` | `text`，可为 `NULL`，保存 `history`、`fresh` 等由入口校验和选定的续接方式。 |
 | `outcome` | `jsonb`，可为 `NULL`，保存终态、验证状态、错误代码和恢复所需计数等结果。 |
 | `report` | `jsonb`，可为 `NULL`，保存修复报告、变更路径、验证记录及可用的候选补丁。 |
 | `review` | `jsonb`，可为 `NULL`。复验请求写入来源运行及线程标识、Git 基线和选中的补丁文本。 |
+| `skills` | `jsonb`，默认空数组。保存用户选择的技能 ID、名称、来源和 SHA-256，供后续运行继续选择同一版本。 |
+| `context_window_tokens` | `integer`，可为 `NULL`。模型运行提交时保存窗口并传给 worker。历史运行从首条有有效窗口的主模型请求回填，缺少记录或纯验证运行保留空值。 |
+| `undo` | `jsonb`，可为 `NULL`。撤销运行保存目标工具操作 ID，由 worker 核对线程内最近可撤销的编辑。 |
 
 `request_key` 让客户端重试返回已存在的运行，相同键对应的主要输入不一致时由事务拒绝。`UNIQUE (tenant_id, id, session_id)` 为事件的三列外键提供约束目标，确保运行和事件的线程一致。`runs_recent (tenant_id, created_at DESC)` 面向最近运行，`runs_by_thread (tenant_id, session_id, created_at DESC)` 面向线程历史，`member_runs (tenant_id, member_id, status)` 支持按成员和状态筛选。`outcome` 负责描述执行结果，`report` 保存文件和验证证据，`review` 则是复验运行的输入。`status` 和 `continuation` 的合法转移由应用控制。 [提交和去重](../src/stellarweaver/web/db.py) · [运行收尾](../src/stellarweaver/web/journal.py) · [交付报告](../src/stellarweaver/web/delivery.py)
 
@@ -216,6 +220,8 @@ erDiagram
 | `event` | `jsonb`，完整事件对象，包含线程、运行、游标、事件类型、时间和负载。 |
 
 运行进度、审批请求、工具执行及终态都可以形成事件。分配 `seq` 时，Journal 在同一事务中更新 `sessions.next_seq` 并插入事件，保证游标与已提交的记录一致。`events_run_cursor (tenant_id, run_id, seq)` 适配 API 按运行查询 `seq > after` 并升序分页。游标在线程范围继续递增，单个运行的首个游标取决于该线程此前的事件。 [事件持久化](../src/stellarweaver/web/journal.py) · [事件分页](../src/stellarweaver/web/db.py)
+
+`model.started` 保存该请求的窗口及输入估算，`model.completed` 保存返回后的用量。`context.compacted` 保存压缩策略、输入预算及压缩前后的估算。G11 用已有主模型请求回填 `runs.context_window_tokens`，原事件和终态保留供核对。运行导出包含该轮窗口和可导出的事件字段。 [窗口迁移](../src/stellarweaver/web/migrations/versions/g11_context_window.py) · [运行导出](../src/stellarweaver/web/run_export.py)
 
 #### `operations`
 
@@ -278,22 +284,23 @@ erDiagram
 | `tokens` | `bigint`，`CHECK` 要求大于等于 0。先记预留量，结算后为实际或估算用量。 |
 | `settled`, `estimated` | `boolean`，默认分别为 `false` 和 `true`，标记是否结算及数据是否来自估算。 |
 
-当前仅对有关联成员的 DeepSeek 请求记账。发起请求时预留输入估算量加输出上限，返回后用输入和输出用量结算。失败时有可信用量也可结算，缺少用量的失败请求保留原预留。两类写入都锁定成员行，并与对应模型事件一同提交。`usage_by_day (tenant_id, member_id, usage_day)` 支持按 UTC 日期检查额度和汇总。`usage_by_started_at (tenant_id, started_at)` 支持按北京时间当天的时间区间统计可见项目，结算仍归属请求开始日期。迁移从 `model.started` 事件回填开始时间，缺失该事件的旧数据仍计入 UTC 历史和额度。 [预留、结算和聚合](../src/stellarweaver/web/db.py) · [事件计量入口](../src/stellarweaver/web/journal.py) · [历史回填](../src/stellarweaver/web/migrations/versions/g7_model_usage_time.py)
+有关联成员的 DeepSeek 请求会记账。发起时预留输入估算量加输出上限，返回后按输入和输出用量结算。失败时若收到可信用量也可结算，缺少用量的失败请求保留原预留。两类写入都锁定成员行，并与对应模型事件一同提交。`usage_by_day (tenant_id, member_id, usage_day)` 支持按 UTC 日汇总，并按周一至下周一的日期范围核算周额度。`usage_by_started_at (tenant_id, started_at)` 用于北京时间当天的可见项目统计。两组统计均按请求发起时间归属。旧数据如果缺少开始时间，仍按 `usage_day` 计入 UTC 历史和额度。 [预留、结算和聚合](../src/stellarweaver/web/db.py) · [事件计量入口](../src/stellarweaver/web/journal.py) · [历史回填](../src/stellarweaver/web/migrations/versions/g7_model_usage_time.py)
 
 ### 典型事务中的表协作
 
 | 场景 | 写入与读取顺序 |
 | --- | --- |
 | 注册、登录和选择项目 | 注册时登记 `tenants`、`memberships`、`local_accounts`，并创建普通对话的 `workspaces`、`local_projects` 和 `workspace_grants`。登录使用账号索引定位身份，再签发 `browser_sessions` 记录。项目列表联合读取工作区、路径映射和授权。 |
-| 新建线程、追问与流式订阅 | 新线程先写 `sessions`，追问复用该行。队列模式将 `runs` 和 `run_jobs` 一起提交。运行期间更新 `sessions.next_seq` 并写入 `events`，SSE 按游标补读。 |
+| 新建线程、追问与流式订阅 | 新线程先写 `sessions`，追问复用该行。队列模式将包含窗口及技能版本的 `runs` 和 `run_jobs` 一起提交。运行期间更新 `sessions.next_seq` 并写入 `events`，SSE 按游标补读。 |
 | 修改、验证和补丁交付 | 助手 `messages` 和计划中的 `operations` 一同入库。需要授权时写 `approvals`。工具完成时提交结果及事件，运行收尾写 `runs.outcome` 和可用的 `runs.report`，并关闭尚未结束的审批及队列状态。补丁复验自身是新运行，其输入保存在 `runs.review`。 |
+| 撤销与导出 | 撤销的操作 ID 写入同线程的新 `runs.undo`，worker 分别记录撤销意图和结果。导出按运行查询 `messages`、`events`、`operations` 和报告字段，再生成脱敏文件。 |
 | 重启后检查中断 | Worker 检查 `runs` 和 `run_jobs`。已领取且需要恢复的运行记录为中断，通过 `operations` 中的意图和结果识别待核对副作用。项目基线、隔离 worktree 和工作区文件仍由状态卷保存。 |
 
 ## 迁移、备份与恢复
 
 ### `public.alembic_version`
 
-`version_num` 为 `varchar(32)` 主键，由 Alembic 随迁移更新。当前源码的迁移历史为单线，最新版本是 `g8_workspace_alias`。版本表位于 `public`，与 `sw` 的业务事务及租户隔离独立。排查表或字段缺失时，可先查询该版本，再查看对应迁移增加了哪些结构。 [迁移环境](../src/stellarweaver/web/migrations/env.py)
+`version_num` 为 `varchar(32)` 主键，由 Alembic 随迁移更新。当前源码的迁移历史为单线，最新版本是 `g9_auto_mode`。版本表位于 `public`，与 `sw` 的业务事务及租户隔离独立。排查表或字段缺失时，可先查询该版本，再查看对应迁移增加了哪些结构。 [迁移环境](../src/stellarweaver/web/migrations/env.py)
 
 | Revision | 内容 |
 | --- | --- |
@@ -305,6 +312,9 @@ erDiagram
 | `g6_local_accounts` | 本机账号、可选项目目录与线程归档。 |
 | `g7_model_usage_time` | 请求开始时间、历史回填和本地日期聚合索引。 |
 | `g8_workspace_alias` | 本机项目别名列、约束和列级更新授权。 |
+| `g9_auto_mode` | 扩充运行模式约束，接纳 `auto`。既有会话的模式值沿用原记录。 |
+| `g10_workbench_parity` | 增加工作区技能信任、运行级技能选择和撤销请求。将旧默认日额度迁移为每周 10,000,000 tokens，保留明细和已配置的非默认数值。 |
+| `g11_context_window` | 保存运行提交时的模型窗口，从已有主模型请求回填历史窗口。 |
 
 通过 Compose 启动时，`migrate` 服务先用管理员权限升级，再启动日常服务。开发环境可以用 `STELLARWEAVER_MIGRATION_DSN` 指定管理员 DSN 后运行 `uv run --locked --extra web python -m stellarweaver.web migrate`，并通过 `STELLARWEAVER_DATABASE_DSN` 为 API 或 worker 提供应用账号 DSN。数据库镜像初始化脚本在首次创建空数据卷时建立数据库角色。运行中的密码轮换需同步更新数据库角色与 Compose 配置。
 

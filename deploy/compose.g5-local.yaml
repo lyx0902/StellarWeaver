@@ -11,6 +11,25 @@ x-local: &local
   SW_WEB_LOCAL_OWNER_ID: ${SW_G5_LOCAL_OWNER_ID:?set SW_G5_LOCAL_OWNER_ID}
   SW_WEB_PROJECTS_ROOT: /projects
   SW_WEB_PROJECTS_HOST_ROOT: ${SW_WORKBENCH_PROJECTS_ROOT:?set SW_WORKBENCH_PROJECTS_ROOT}
+  SW_WEB_AGENT_SKILLS_ROOT: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:+/installed-skills/agents}
+  SW_WEB_NESTED_SKILLS_ROOT: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:+/installed-skills/agents/skills-codex}
+  SW_WEB_CODEX_SKILLS_ROOT: ${SW_WORKBENCH_CODEX_SKILLS_ROOT:+/installed-skills/codex}
+
+x-agent-skills: &agent-skills
+  type: bind
+  source: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:-../docs}
+  target: /installed-skills/agents
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-codex-skills: &codex-skills
+  type: bind
+  source: ${SW_WORKBENCH_CODEX_SKILLS_ROOT:-../docs}
+  target: /installed-skills/codex
+  read_only: true
+  bind:
+    create_host_path: false
 
 services:
   db:
@@ -20,24 +39,11 @@ services:
     environment:
       <<: *local
       STELLARWEAVER_WEB_TOKEN: ""
-      SW_WEB_AGENT_SKILLS_ROOT: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:+/installed-skills/agents}
-      SW_WEB_NESTED_SKILLS_ROOT: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:+/installed-skills/agents/skills-codex}
-      SW_WEB_CODEX_SKILLS_ROOT: ${SW_WORKBENCH_CODEX_SKILLS_ROOT:+/installed-skills/codex}
       SW_WEB_EXPERIMENT_ROOT: ${SW_WORKBENCH_EXPERIMENT_ROOT:+/local-experiment}
     volumes:
       - *projects
-      - type: bind
-        source: ${SW_WORKBENCH_AGENT_SKILLS_ROOT:-../docs}
-        target: /installed-skills/agents
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${SW_WORKBENCH_CODEX_SKILLS_ROOT:-../docs}
-        target: /installed-skills/codex
-        read_only: true
-        bind:
-          create_host_path: false
+      - *agent-skills
+      - *codex-skills
       - type: bind
         source: ${SW_WORKBENCH_EXPERIMENT_ROOT:-../docs}
         target: /local-experiment
@@ -48,3 +54,5 @@ services:
     environment: *local
     volumes:
       - *projects
+      - *agent-skills
+      - *codex-skills

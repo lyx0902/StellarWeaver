@@ -247,7 +247,8 @@ def _attempt(
         candidate_status=candidate or ("unknown" if run_status == "unknown" else "not_produced"),
         patch_sha256=sha,
         reason=outcome.get("reason") or current.get("reason"),
-        failure_category=report.get("failure_category"),
+        failure_category=report.get("failure_category")
+        or ("environment_error" if run_status == "environment_error" else None),
         provider=report.get("provider"),
         model_id=report.get("model"),
         resolved_revision=report.get("resolved_revision"),

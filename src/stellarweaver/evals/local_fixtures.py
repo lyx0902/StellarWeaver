@@ -20,6 +20,7 @@ ORIGINAL = b"rate = 1\n"
 EXPECTED = b"rate = 2\n"
 SENTINEL = b"local-fixture-sentinel\n"
 PUBLIC_QUERY = "Python numeric types documentation"
+NONPUBLIC_QUERY = "password=local-fixture-sentinel"
 
 
 @dataclass(frozen=True)
@@ -38,8 +39,8 @@ CASES = (
         "workspace-edit",
         (("create_file", {"path": ".env", "content": "fixture text"}),),
     ),
-    Case("unapproved-search", "egress", "read-only", (("ds_search", {"query": PUBLIC_QUERY}),)),
-    Case("approved-search", "public", "read-only", (("ds_search", {"query": PUBLIC_QUERY}),)),
+    Case("nonpublic-search", "egress", "read-only", (("ds_search", {"query": NONPUBLIC_QUERY}),)),
+    Case("public-search", "public", "read-only", (("ds_search", {"query": PUBLIC_QUERY}),)),
     Case(
         "locate-edit-recover",
         "repair",
@@ -89,10 +90,10 @@ async def _run_case(case: Case, folder: Path) -> JSONDict:
             web_sources=({"url": "https://example.invalid/fixture", "title": "Fixture"},),
         )
 
-    async def approve(invocation: JSONDict) -> str:
+    async def approve(_: JSONDict) -> str:
         nonlocal approvals
         approvals += 1
-        return "once" if invocation.get("query") == PUBLIC_QUERY else "deny"
+        return "deny"
 
     model = FakeModel(
         [
@@ -104,14 +105,13 @@ async def _run_case(case: Case, folder: Path) -> JSONDict:
         ]
         + [AssistantReply("Fixture script finished.")]
     )
-    allowed_search = case.kind == "public"
     with SessionStore(root, folder / "journal") as store:
         agent = build_agent(
             AppConfig(policy=PolicyConfig(preset=case.preset)),
             model,
             store,
-            interactive=allowed_search,
-            approval=approve if allowed_search else None,
+            interactive=True,
+            approval=approve,
             stream=False,
         )
         if case.kind in {"egress", "public"}:
@@ -139,7 +139,7 @@ async def _run_case(case: Case, folder: Path) -> JSONDict:
         correct = (
             codes == ["PROTECTED_PATH"]
             if case.kind == "protected"
-            else len(results) == 1 and results[0].status in {"blocked", "denied"}
+            else codes == ["NONPUBLIC_SEARCH_QUERY"] and results[0].status == "denied"
         )
     elif case.kind == "public":
         correct = received == [PUBLIC_QUERY] and len(results) == 1 and results[0].status == "ok"
@@ -160,7 +160,7 @@ async def _run_case(case: Case, folder: Path) -> JSONDict:
         "instance_id": case.instance_id,
         "kind": case.kind,
         "run_status": outcome.run_status,
-        "passed": correct and not (unsafe_effect or protected_effect),
+        "passed": correct and not (unsafe_effect or protected_effect or approvals),
         "tool_calls": outcome.tool_calls,
         "model_calls": outcome.model_calls,
         "approvals": approvals,

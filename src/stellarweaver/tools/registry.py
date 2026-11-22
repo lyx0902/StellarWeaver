@@ -19,7 +19,7 @@ from jsonschema.exceptions import ValidationError as SchemaValidationError
 from pydantic import BaseModel, ValidationError
 
 from stellarweaver.domain import JSONDict, Message, ToolCall, ToolResult, ToolStatus
-from stellarweaver.policy import DS_SEARCH, READ_TOOLS, PolicyEngine
+from stellarweaver.policy import BENCHMARK_TOOLS, DS_SEARCH, READ_TOOLS, PolicyEngine
 from stellarweaver.policy.hooks import Decision, HookEvent, HookManager, Stage
 from stellarweaver.policy.risk import HARD_PATH_ERRORS, POLICY_VERSION, assess, fingerprint
 from stellarweaver.session.locking import SessionBusy, workspace_write_lock
@@ -34,6 +34,7 @@ class ToolContext:
     execution: Any = None
     operation_id: str = ""
     command_runner: CommandRunner | None = None
+    sandbox_commands: tuple[tuple[str, ...], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class PreparedTool:
     invocation: JSONDict
     execute: Callable[[], Awaitable[JSONDict]]
     recheck: Callable[[], Awaitable[None]] | None = None
+    command_executor: Literal["host", "configured", "sandbox"] | None = None
 
 
 Prepare = Callable[[Any, ToolContext], Awaitable[PreparedTool]]
@@ -71,6 +73,7 @@ class ToolRegistry:
         builtins: bool = True,
         hooks: HookManager | None = None,
         command_boundary: str | None = None,
+        sandbox_commands: tuple[tuple[str, ...], ...] | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.policy = policy
@@ -78,6 +81,7 @@ class ToolRegistry:
         self.journal = journal
         self.command_runner = command_runner
         self.command_boundary = command_boundary
+        self.sandbox_commands = sandbox_commands
         self.hooks = hooks or HookManager()
         self.artifacts_dir = artifacts_dir or self.workspace.root / ".stellarweaver" / "artifacts"
         self._tools: dict[str, RegisteredTool] = {}
@@ -161,6 +165,13 @@ class ToolRegistry:
             }
             for tool in self._tools.values()
             if not (self.policy.preset == "read-only" and not tool.read_only)
+            and (
+                self.policy.preset != "benchmark"
+                or (
+                    not tool.remote
+                    and (tool.name in BENCHMARK_TOOLS or tool.authorization_tool == "run_command")
+                )
+            )
         ]
 
     async def _record(self, event: str, data: JSONDict) -> None:
@@ -251,6 +262,7 @@ class ToolRegistry:
                 self.execution,
                 operation_id,
                 self.command_runner,
+                self.sandbox_commands,
             )
             prepared = await tool.prepare(args, context)
             policy, hooks = self.policy, self.hooks
@@ -258,7 +270,7 @@ class ToolRegistry:
             command = self.is_command(call.name)
             executor = "builtin"
             if command:
-                executor = "configured" if context.command_runner is not None else "host"
+                executor = prepared.command_executor or "host"
             elif tool.remote:
                 executor = "stdio-extension"
             elif call.name == DS_SEARCH:
@@ -296,6 +308,7 @@ class ToolRegistry:
                     or self.hooks is not hooks
                     or self.execution is not context.execution
                     or self.command_runner is not context.command_runner
+                    or self.sandbox_commands != context.sandbox_commands
                     or (command and self.command_boundary != invocation["command_boundary"])
                     or policy.approval is not approval_callback
                     or policy.binding() != invocation["policy_binding"]

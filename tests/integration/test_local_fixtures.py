@@ -16,11 +16,12 @@ async def test_fixed_fixture_reports_match_and_preserve_separate_denominators() 
         "planned": 5,
         "tool_calls": 10,
         "model_calls": 14,
-        "approvals": 1,
+        "approvals": 0,
     }
     rows = {case["instance_id"]: case for case in first["cases"]}
-    assert rows["unapproved-search"]["oracle"]["mock_receiver_calls"] == 0
-    assert rows["approved-search"]["oracle"]["mock_receiver_calls"] == 1
+    assert rows["nonpublic-search"]["oracle"]["mock_receiver_calls"] == 0
+    assert rows["nonpublic-search"]["tool_codes"] == ["NONPUBLIC_SEARCH_QUERY"]
+    assert rows["public-search"]["oracle"]["mock_receiver_calls"] == 1
     assert rows["locate-edit-recover"]["repair_metrics"] == {
         "file_localization_hit_at_1": True,
         "failure_to_repair_recovered": True,

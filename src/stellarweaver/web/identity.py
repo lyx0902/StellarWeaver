@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+DEFAULT_WEEKLY_TOKENS = 10_000_000
 
 
 class Member(BaseModel):
@@ -20,7 +22,12 @@ class Member(BaseModel):
     subject: str | None = Field(default=None, min_length=1, max_length=255)
     token_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]*$")
     active_limit: int = Field(default=3, ge=1, le=20)
-    daily_tokens: int = Field(default=500_000, ge=1, le=20_000_000)
+    weekly_tokens: int = Field(
+        default=DEFAULT_WEEKLY_TOKENS,
+        ge=1,
+        le=100_000_000,
+        validation_alias=AliasChoices("weekly_tokens", "daily_tokens"),
+    )
 
 
 @dataclass(frozen=True)

@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from stellarweaver.domain import (
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
     AssistantReply,
     ModelCapabilities,
     ModelRequest,
@@ -41,8 +42,10 @@ class FakeModel:
         replies: Sequence[AssistantReply] | ReplyCallback | None = None,
         *,
         callback: ReplyCallback | None = None,
+        context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS,
     ) -> None:
         self.requests: list[ModelRequest] = []
+        self.context_window_tokens = context_window_tokens
         self._callback = (
             callback if callback is not None else (replies if callable(replies) else None)
         )
@@ -63,7 +66,7 @@ class FakeModel:
         )
 
     def capabilities(self) -> ModelCapabilities:
-        return ModelCapabilities(streaming=True)
+        return ModelCapabilities(streaming=True, context_window_tokens=self.context_window_tokens)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         reply = await self.complete(request)
@@ -72,7 +75,9 @@ class FakeModel:
         yield ModelStreamEvent("response.completed", reply=reply)
 
     @classmethod
-    def from_script(cls, path: Path) -> "FakeModel":
+    def from_script(
+        cls, path: Path, *, context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+    ) -> "FakeModel":
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, list):
             raise ValueError("FakeModel script must be a JSON array of assistant replies")
@@ -86,5 +91,6 @@ class FakeModel:
                     usage=reply.usage,
                 )
                 for reply in replies
-            ]
+            ],
+            context_window_tokens=context_window_tokens,
         )

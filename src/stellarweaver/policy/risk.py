@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 DS_SEARCH = "ds_search"
-POLICY_VERSION = "capabilities/1"
+POLICY_VERSION = "capabilities/3"
 HARD_PATH_ERRORS = frozenset({"PATH_OUTSIDE_WORKSPACE", "PROTECTED_PATH", "INVALID_PATH"})
 _CREDENTIAL_NAME = re.compile(
     r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|SIGNING_?KEY|SECRET|TOKEN|PASSWORD|"
@@ -57,7 +57,7 @@ def assess(invocation: dict[str, Any], *, read_only: bool = False) -> Risk:
         capabilities = ("network:public-search-query",)
         if not isinstance(query, str) or not query or _NONPUBLIC_QUERY.search(query):
             return Risk("L3", ("NONPUBLIC_SEARCH_QUERY",), capabilities, "deny", executor)
-        return Risk("L2", ("PUBLIC_QUERY_EGRESS",), capabilities, "ask", executor)
+        return Risk("L0", ("PUBLIC_QUERY_EGRESS",), capabilities, "allow", executor)
     if tool == "mcp_start":
         capabilities = ("process:start", "extension:stdio")
         if any(

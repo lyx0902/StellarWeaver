@@ -99,7 +99,33 @@ async def test_original_file_recheck_still_follows_after_hook(tmp_path: Path) ->
     assert target.read_bytes() == b"observable external change"
 
 
-async def test_hard_egress_denial_precedes_hooks_and_never_reaches_receiver(tmp_path: Path) -> None:
+@pytest.mark.parametrize("preset", ["read-only", "ask", "workspace-edit", "auto"])
+async def test_public_search_is_allowed_without_approval(tmp_path: Path, preset) -> None:
+    async def approve(_: JSONDict) -> str:
+        pytest.fail("Public search must not request default approval")
+
+    async def lookup(query: str) -> AssistantReply:
+        assert query == "Python docs"
+        return AssistantReply("Public result", web_sources=({"url": "https://docs.python.org/3/"},))
+
+    records: list[tuple[str, JSONDict]] = []
+    registry = ToolRegistry(
+        tmp_path,
+        PolicyEngine(preset, workspace=tmp_path, interactive=True, approval=approve),
+        journal=lambda event, payload: records.append((event, payload)),
+    )
+    register_search(registry, lookup)
+    result = await registry.dispatch(ToolCall("search", "ds_search", '{"query":"Python docs"}'))
+    assert result.status == "ok"
+    assert records[0][1]["level"] == "L0"
+    assert records[1][0] == "tool.authorization"
+    assert records[1][1]["decision"] == "allow"
+
+
+@pytest.mark.parametrize("query", ["password=synthetic-marker", r"Z:\synthetic-marker\notes.txt"])
+async def test_hard_egress_denial_precedes_hooks_and_never_reaches_receiver(
+    tmp_path: Path, query: str
+) -> None:
     def unexpected(*_args: object) -> None:
         pytest.fail("Hard guard must precede this callback")
 
@@ -111,9 +137,7 @@ async def test_hard_egress_denial_precedes_hooks_and_never_reaches_receiver(tmp_
         journal=lambda event, payload: records.append((event, payload)),
     )
     register_search(registry, unexpected)
-    result = await registry.dispatch(
-        ToolCall("search", "ds_search", '{"query":"password=synthetic-marker"}')
-    )
+    result = await registry.dispatch(ToolCall("search", "ds_search", json.dumps({"query": query})))
     assert result.status == "denied" and result.data["code"] == "NONPUBLIC_SEARCH_QUERY"
     assert records[0][0] == "security.assessed"
     assert records[0][1]["level"] == "L3"
@@ -228,6 +252,9 @@ async def test_authorization_is_rechecked_after_durable_intent(tmp_path: Path) -
 async def test_replacing_policy_during_search_approval_blocks_dispatch(tmp_path: Path) -> None:
     calls: list[str] = []
 
+    async def require_approval(_: HookEvent) -> Decision:
+        return "ask"
+
     async def approve(_invocation: JSONDict) -> str:
         registry.policy = PolicyEngine("read-only", workspace=tmp_path)
         return "once"
@@ -237,7 +264,9 @@ async def test_replacing_policy_during_search_approval_blocks_dispatch(tmp_path:
         return AssistantReply("No sources")
 
     registry = ToolRegistry(
-        tmp_path, PolicyEngine("read-only", workspace=tmp_path, interactive=True, approval=approve)
+        tmp_path,
+        PolicyEngine("read-only", workspace=tmp_path, interactive=True, approval=approve),
+        hooks=HookManager([TrustedHook("ask", "fixture", "1", "PreToolUse", require_approval)]),
     )
     register_search(registry, lookup)
     result = await registry.dispatch(ToolCall("search", "ds_search", '{"query":"Python docs"}'))

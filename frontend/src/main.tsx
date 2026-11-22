@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent, type PointerEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, receive, type Approval, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type Thread, type Workspace, type Workspaces } from './api'
+import { api, downloadRun, receive, type Approval, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type SkillSelection, type Thread, type UndoTarget, type Workspace, type Workspaces } from './api'
 import { AdminPanel } from './admin'
 import { ApprovalCard, ContextMeter, Turn, runLabel } from './conversation'
 import { Inspector, type InspectorTab } from './inspector'
 import { ProjectAliasDialog, ProjectPicker, WorkspaceGroup } from './projects'
-import { SkillsPanel } from './skills'
+import { ComposerSkills, SkillsPanel } from './skills'
 import { ExperimentPanel } from './experiment'
 import './style.css'
 
@@ -31,7 +31,9 @@ function App() {
   const [threads, setThreads] = useState<Thread[]>([])
   const [turns, setTurns] = useState<Run[]>([])
   const [draft, setDraft] = useState('')
-  const [mode, setMode] = useState<Mode>('read-only')
+  const [skillDraft, setSkillDraft] = useState<{ key: string; items: SkillSelection[] } | null>(null)
+  const [undoTarget, setUndoTarget] = useState<UndoTarget | null>(null)
+  const [selectedMode, setMode] = useState<Mode | null>(null)
   const [runId, setRunId] = useState(readRunId)
   const [snapshot, setSnapshot] = useState<Run | null>(null)
   const [events, setEvents] = useState<RunEvent[]>([])
@@ -70,6 +72,7 @@ function App() {
   const currentProject = listing?.workspaces.find(item => item.id === selectedWorkspace)
   const chatWorkspace = listing?.workspaces.find(item => item.kind === 'chat')
   const chatting = currentProject?.kind === 'chat'
+  const mode = listing?.repair_enabled && !chatting ? selectedMode ?? run?.mode ?? 'auto' : 'read-only'
   const sameMode = Boolean(run?.isolated) === Boolean(!chatting && listing?.isolated)
   const canContinue = Boolean(threadWorkspace && sameMode && !run?.is_review && run?.can_continue !== false)
   const recovery = Boolean(run && latestIsKnown &&
@@ -82,6 +85,23 @@ function App() {
   const canSend = writable && loaded && Boolean(selectedWorkspace) && (!runId || (canContinue && historyTurns.length > 0))
     && !activeThread?.archived && !needLatest && !active && (!recovery || acknowledged) && !submitting
   const currentReport = delivery?.run_id === runId ? delivery : null
+  const skillKey = run?.session_id ?? selectedWorkspace ?? ''
+  const pickedSkills = skillDraft?.key === skillKey
+    ? skillDraft.items : newest?.skills ?? run?.skills ?? []
+  const canPickSkills = writable && loaded && Boolean(selectedWorkspace) && !activeThread?.archived
+    && (!runId || canContinue) && !active
+  const canAskUndo = Boolean(runId && canContinue && latestIsKnown && run?.isolated && !active
+    && !activeThread?.archived && !recovery && listing?.repair_enabled && panel === 'changes')
+
+  useEffect(() => {
+    setUndoTarget(null)
+    if (!canAskUndo) return
+    const abort = new AbortController()
+    void api<{ target: UndoTarget | null }>(token, 'runs/' + runId + '/undo', { signal: abort.signal })
+      .then(result => { if (!abort.signal.aborted) setUndoTarget(result.target) })
+      .catch(err => { if (!abort.signal.aborted) setError(String(err)) })
+    return () => abort.abort()
+  }, [canAskUndo, runId, token])
 
   useEffect(() => {
     const abort = new AbortController()
@@ -229,6 +249,7 @@ function App() {
       setPanel(null)
       setAcknowledged(false)
       setContinuation('history')
+      setMode(null)
       setStopping(false)
       setReconnecting(false)
       nearBottom.current = true
@@ -255,6 +276,7 @@ function App() {
     setError('')
     setAcknowledged(false)
     setContinuation('history')
+    setMode(null)
     setStopping(false)
     setReconnecting(false)
     nearBottom.current = true
@@ -264,7 +286,8 @@ function App() {
     if (workspaceId) setWorkspace(workspaceId)
     else if (threadWorkspace) setWorkspace(threadWorkspace)
     setDraft('')
-    setMode('read-only')
+    setSkillDraft(null)
+    setMode(null)
     openRun('')
     composer.current?.focus()
   }
@@ -314,7 +337,8 @@ function App() {
     setThreads([])
     setTurns([])
     setDraft('')
-    setMode('read-only')
+    setSkillDraft(null)
+    setMode(null)
     setShowAdmin(false)
     setShowSkills(false)
     setShowExperiment(false)
@@ -328,6 +352,9 @@ function App() {
     if (!canSend || !draft.trim()) return
     const payload = {
       workspace_id: selectedWorkspace, prompt: draft.trim(), mode: chatting ? 'read-only' : mode,
+      ...(pickedSkills.length || skillDraft?.key === skillKey ? {
+        skills: pickedSkills.map(({ id, sha256 }) => ({ id, sha256 })),
+      } : {}),
       ...(run ? { session_id: run.session_id, continuation, acknowledge_interrupted: acknowledged } : {}),
     }
     const input = JSON.stringify(payload)
@@ -339,6 +366,7 @@ function App() {
         method: 'POST', body: JSON.stringify({ ...payload, request_id: request.current.id }),
       })
       request.current = null
+      setSkillDraft(null)
       setDraft('')
       openRun(created.run_id)
     } catch (err) {
@@ -346,6 +374,27 @@ function App() {
     } finally {
       setSubmitting(false)
     }
+  }
+
+  function chooseSkill(skill: SkillSelection) {
+    const previous = pickedSkills.find(item => item.id === skill.id)
+    const remaining = pickedSkills.filter(item => item.id !== skill.id)
+    setSkillDraft({
+      key: skillKey,
+      items: previous?.sha256 === skill.sha256
+        ? remaining : [...remaining, { id: skill.id, sha256: skill.sha256, name: skill.name, source: skill.source }],
+    })
+  }
+
+  async function undoChange(target: UndoTarget) {
+    const input = JSON.stringify([runId, target.operation_id])
+    if (reviewRequest.current?.input !== input) reviewRequest.current = { input, id: crypto.randomUUID() }
+    const created = await api<Run>(token, 'runs/' + runId + '/undo', {
+      method: 'POST',
+      body: JSON.stringify({ operation_id: target.operation_id, request_id: reviewRequest.current.id }),
+    })
+    reviewRequest.current = null
+    openRun(created.run_id, 'changes')
   }
 
   async function createProject(directory: { path: string; display_path: string }) {
@@ -544,7 +593,7 @@ function App() {
             <label className="inline-label"><input type="checkbox" checked={acknowledged}
               onChange={event => setAcknowledged(event.target.checked)} />我已检查中断记录，确认继续</label>
             <label>继续方式<select value={continuation} onChange={event => setContinuation(event.target.value as 'history' | 'fresh')}>
-              <option value="history">带上已完成的对话</option>
+              <option value="history">带上已完成的对话和证据</option>
               <option value="fresh">用新提示检查工作区</option>
             </select></label>
           </div>}
@@ -579,14 +628,17 @@ function App() {
               {writable && run?.status === 'active' && <button type="button" disabled={stopping} onClick={() => void cancel()}>
                 {stopping ? '正在取消…' : '取消运行'}</button>}
               <div className="composer-submit">
-                <ContextMeter events={visibleEvents} limit={listing.context_window_tokens} />
+                <ContextMeter events={visibleEvents} limit={run && run.status !== 'active'
+                  ? run.context_window_tokens ?? null : run?.context_window_tokens ?? listing.context_window_tokens} />
+                {canPickSkills && <ComposerSkills key={skillKey} token={token} workspace={selectedWorkspace}
+                  picks={pickedSkills} onPick={chooseSkill} onLibrary={() => setShowSkills(true)} />}
                 {listing.repair_enabled && !chatting && <label className="inline-label composer-mode">
                   <span className="sr-only">运行模式</span>
                   <select value={mode} onChange={event => setMode(event.target.value as Mode)}>
-                    <option value="read-only">只读</option><option value="repair">修复 · 逐项审批</option>
+                    <option value="auto">auto</option><option value="read-only">只读</option><option value="repair">修改</option>
                   </select></label>}
                 <button className="primary send-button" disabled={!canSend || !draft.trim()}>
-                  {submitting ? '提交中…' : runId ? '发送追问' : chatting ? '发送' : mode === 'repair' ? '运行修复任务' : '运行只读任务'}
+                  {submitting ? '提交中…' : runId ? '发送追问' : chatting ? '发送' : mode === 'read-only' ? '运行只读任务' : mode === 'repair' ? '运行修复任务' : '运行任务'}
                 </button>
               </div>
             </div>
@@ -613,11 +665,16 @@ function App() {
         delivery={currentReport} events={visibleEvents}
         canApply={run?.status === 'completed' && Boolean(listing.isolated && listing.repair_enabled)}
         canFeedback={Boolean(canContinue && !activeThread?.archived && latestIsKnown && !active)}
+        exportRun={run && run.status !== 'active' ? format => downloadRun(token, runId, format) : undefined}
+        undoTarget={canAskUndo ? undoTarget : null} onUndo={undoChange}
         isReview={Boolean(run?.is_review)} targetLabel={currentProject?.path ?? currentProject?.label}
         onReview={submitReview} onFeedback={submitFeedback} onPreflight={preflightReview} />
     </>}
     {showAdmin && <AdminPanel token={token} onClose={() => setShowAdmin(false)} />}
-    {showSkills && <SkillsPanel token={token} onClose={() => setShowSkills(false)} />}
+    {showSkills && <SkillsPanel token={token} workspace={loaded ? selectedWorkspace : undefined} picks={pickedSkills}
+      onPick={canPickSkills ? chooseSkill : undefined} onTrustChange={enabled => {
+        if (!enabled) setSkillDraft({ key: skillKey, items: pickedSkills.filter(skill => skill.source !== '项目') })
+      }} onClose={() => setShowSkills(false)} />}
     {showExperiment && listing.experiment_available &&
       <ExperimentPanel token={token} onClose={() => setShowExperiment(false)} />}
     {showPicker && <ProjectPicker onClose={() => setShowPicker(false)} onCreate={createProject} />}

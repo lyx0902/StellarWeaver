@@ -3,7 +3,9 @@
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4, uuid5
 
 from alembic import command
@@ -17,6 +19,8 @@ from stellarweaver.web.identity import Access, Member
 
 SERVER_LOCK = 1645207841
 WORKER_LOCK = 1645207842
+RunMode = Literal["read-only", "repair", "auto"]
+REPAIR_MODES = frozenset({"repair", "auto"})
 _ACCESS = """
     (CAST(:workspace_ids AS uuid[]) IS NULL OR s.workspace_id=ANY(CAST(:workspace_ids AS uuid[])))
     AND (CAST(:owner AS uuid) IS NULL OR s.member_id=CAST(:owner AS uuid))
@@ -135,23 +139,28 @@ def register_member(engine: Engine, member: Member, workspace_ids: list[str]) ->
             "name": member.name,
             "role": member.role,
             "active": member.active_limit,
-            "limit": member.daily_tokens,
+            "limit": member.weekly_tokens,
         }
         conn.execute(
             text("""
-            INSERT INTO sw.memberships(tenant_id,id,name,role,active_limit,daily_tokens)
+            INSERT INTO sw.memberships(tenant_id,id,name,role,active_limit,weekly_tokens)
             VALUES(:tenant,:id,:name,:role,:active,:limit)
             ON CONFLICT (tenant_id,id) DO UPDATE SET name=excluded.name,role=excluded.role,
-              active_limit=excluded.active_limit,daily_tokens=excluded.daily_tokens
+              active_limit=excluded.active_limit,weekly_tokens=excluded.weekly_tokens
         """),
             params,
         )
-        conn.execute(text("DELETE FROM sw.workspace_grants WHERE member_id=:id"), params)
+        conn.execute(
+            text("""DELETE FROM sw.workspace_grants WHERE member_id=:id
+                    AND NOT (workspace_id=ANY(CAST(:workspaces AS uuid[])))"""),
+            {**params, "workspaces": workspace_ids},
+        )
         for workspace in workspace_ids:
             conn.execute(
                 text("""
                 INSERT INTO sw.workspace_grants(tenant_id,member_id,workspace_id)
                 VALUES(:tenant,:id,:workspace)
+                ON CONFLICT DO NOTHING
             """),
                 {**params, "workspace": workspace},
             )
@@ -222,21 +231,44 @@ class QuotaReached(Exception):
     """Configured queue or token allowance exhausted."""
 
 
-def _usage_limit(conn: Connection, member: str) -> tuple[int, int, int]:
+def project_skill_trust(
+    engine: Engine, tenant: str, member: str | None, workspace: str, enabled: bool | None = None
+) -> bool | None:
+    if member is None:
+        return None
+    with scoped(engine, tenant) as conn:
+        params = {"member": member, "workspace": workspace, "enabled": enabled}
+        if enabled is None:
+            query = """SELECT project_skills FROM sw.workspace_grants
+                       WHERE member_id=:member AND workspace_id=:workspace"""
+        else:
+            query = """UPDATE sw.workspace_grants SET project_skills=:enabled
+                       WHERE member_id=:member AND workspace_id=:workspace RETURNING project_skills"""
+        value: bool | None = conn.execute(text(query), params).scalar_one_or_none()
+        return value
+
+
+def _usage_limit(conn: Connection, member: str) -> tuple[int, int, int, datetime]:
     limit = conn.execute(
         text("""
-        SELECT active_limit,daily_tokens FROM sw.memberships WHERE id=:member FOR UPDATE
+        SELECT active_limit,weekly_tokens FROM sw.memberships WHERE id=:member FOR UPDATE
     """),
         {"member": member},
     ).one()
-    used = conn.execute(
+    measured = conn.execute(
         text("""
-        SELECT COALESCE(sum(tokens),0) FROM sw.model_usage WHERE member_id=:member
-          AND usage_day=((now() AT TIME ZONE 'UTC')::date)
+        WITH bounds AS (
+            SELECT statement_timestamp() AS at,
+                   date_trunc('week',statement_timestamp() AT TIME ZONE 'UTC')::date AS start
+        )
+        SELECT bounds.at, (
+            SELECT COALESCE(sum(tokens),0) FROM sw.model_usage WHERE member_id=:member
+              AND usage_day>=bounds.start AND usage_day<(bounds.start+7)
+        ) AS used FROM bounds
     """),
         {"member": member},
-    ).scalar_one()
-    return limit.active_limit, limit.daily_tokens, int(used)
+    ).one()
+    return limit.active_limit, limit.weekly_tokens, int(measured.used), measured.at
 
 
 def model_usage(
@@ -244,16 +276,17 @@ def model_usage(
 ) -> None:
     params = {"tenant": tenant, "member": member, "run": run, "index": payload["request_index"]}
     if kind == "model.started":
-        _, limit, used = _usage_limit(conn, member)
+        _, limit, used, started_at = _usage_limit(conn, member)
         reserve = payload["input_tokens"] + payload["max_output_tokens"]
         if used + reserve > limit:
             raise QuotaReached()
         conn.execute(
             text("""
-            INSERT INTO sw.model_usage(tenant_id,run_id,request_index,member_id,tokens)
-            VALUES(:tenant,:run,:index,:member,:tokens)
+            INSERT INTO sw.model_usage(tenant_id,run_id,request_index,member_id,tokens,usage_day,started_at)
+            VALUES(:tenant,:run,:index,:member,:tokens,
+                   (CAST(:at AS timestamptz) AT TIME ZONE 'UTC')::date, :at)
         """),
-            {**params, "tokens": reserve},
+            {**params, "tokens": reserve, "at": started_at},
         )
     elif kind == "model.completed" or (kind == "model.failed" and not payload["estimated"]):
         # Serialize refunds with reservations for the same member.
@@ -279,14 +312,14 @@ def usage_rows(engine: Engine, tenant: str, access: Access) -> list[JSONDict]:
 def _usage_rows(conn: Connection, access: Access) -> list[JSONDict]:
     rows = conn.execute(
         text(f"""
-            SELECT u.member_id::text,m.name,u.usage_day,m.daily_tokens,
+            SELECT u.member_id::text,m.name,u.usage_day,m.weekly_tokens,
                 sum(u.tokens)::bigint AS tokens,count(*) AS requests,
                 count(*) FILTER (WHERE u.estimated) AS estimated_requests
             FROM sw.model_usage u JOIN sw.memberships m ON (m.tenant_id,m.id)=(u.tenant_id,u.member_id)
             JOIN sw.runs r ON (r.tenant_id,r.id)=(u.tenant_id,u.run_id)
             JOIN sw.sessions s ON (s.tenant_id,s.id)=(r.tenant_id,r.session_id)
             WHERE {_ACCESS}
-            GROUP BY u.member_id,m.name,u.usage_day,m.daily_tokens
+            GROUP BY u.member_id,m.name,u.usage_day,m.weekly_tokens
             ORDER BY u.usage_day DESC,u.member_id LIMIT 100
         """),
         _visible(access),
@@ -303,8 +336,8 @@ def usage_today(engine: Engine, tenant: str, access: Access, *, at: str | None =
                 SELECT COALESCE(CAST(:at AS timestamptz),clock_timestamp()) AS read_at
             )
             SELECT read_at,(read_at AT TIME ZONE 'Asia/Shanghai')::date AS day,
-                   (read_at AT TIME ZONE 'UTC')::date AS quota_day,
-                   (((read_at AT TIME ZONE 'UTC')::date+1)::timestamp AT TIME ZONE 'UTC')
+                   date_trunc('week',read_at AT TIME ZONE 'UTC')::date AS quota_week_start,
+                   ((date_trunc('week',read_at AT TIME ZONE 'UTC')+interval '7 days') AT TIME ZONE 'UTC')
                        AS quota_resets_at
             FROM clock
             """),
@@ -334,12 +367,13 @@ def usage_today(engine: Engine, tenant: str, access: Access, *, at: str | None =
         quota = (
             conn.execute(
                 text("""
-            SELECT m.daily_tokens AS limit_tokens,coalesce(sum(u.tokens),0)::bigint AS used_tokens
+            SELECT m.weekly_tokens AS limit_tokens,coalesce(sum(u.tokens),0)::bigint AS used_tokens
             FROM sw.memberships m LEFT JOIN sw.model_usage u
-              ON (u.tenant_id,u.member_id)=(m.tenant_id,m.id) AND u.usage_day=:quota_day
-            WHERE m.id=:member GROUP BY m.daily_tokens
+              ON (u.tenant_id,u.member_id)=(m.tenant_id,m.id)
+              AND u.usage_day>=:week_start AND u.usage_day<(CAST(:week_start AS date)+7)
+            WHERE m.id=:member GROUP BY m.weekly_tokens
             """),
-                {"member": access.actor, "quota_day": clock["quota_day"]},
+                {"member": access.actor, "week_start": clock["quota_week_start"]},
             )
             .mappings()
             .one()
@@ -390,6 +424,9 @@ def submit(
     isolated: bool = False,
     review: JSONDict | None = None,
     member: str | None = None,
+    skills: list[JSONDict] | None = None,
+    undo: JSONDict | None = None,
+    context_window_tokens: int | None = None,
 ) -> tuple[JSONDict, bool]:
     if member is not None:
         key = str(uuid5(UUID(member), key))
@@ -405,6 +442,9 @@ def submit(
         "continuation": continuation,
         "isolated": isolated,
         "review": json.dumps(review) if review is not None else None,
+        "skills": json.dumps(skills or []),
+        "undo": json.dumps(undo) if undo is not None else None,
+        "context_window_tokens": context_window_tokens,
         "member": member,
     }
     with scoped(engine, tenant) as conn:
@@ -420,7 +460,7 @@ def submit(
         existing = (
             conn.execute(
                 text("""
-            SELECT r.id,r.session_id,r.prompt,r.provider,r.mode,r.continuation,r.review,
+            SELECT r.id,r.session_id,r.prompt,r.provider,r.mode,r.continuation,r.review,r.skills,r.undo,
                 s.workspace_id,s.isolated,r.member_id::text AS member_id
             FROM sw.runs r JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
             WHERE r.request_key=:key
@@ -440,6 +480,8 @@ def submit(
                     existing["mode"],
                     existing["continuation"],
                     existing["review"],
+                    existing["skills"] if skills is not None else [],
+                    existing["undo"],
                     existing["isolated"],
                 )
                 != (
@@ -449,6 +491,8 @@ def submit(
                     mode,
                     continuation,
                     review,
+                    skills or [],
+                    undo,
                     isolated,
                 )
                 or (session_id is not None and str(existing["session_id"]) != session_id)
@@ -465,7 +509,7 @@ def submit(
             if queued_count >= 50:
                 raise RunUnavailable()
         if member is not None:
-            active_limit, daily_tokens, used = _usage_limit(conn, member)
+            active_limit, weekly_tokens, used, _ = _usage_limit(conn, member)
             counts = (
                 conn.execute(
                     text("""
@@ -479,7 +523,16 @@ def submit(
                 .mappings()
                 .one()
             )
-            if used >= daily_tokens or counts["active"] >= active_limit or counts["recent"] >= 20:
+            if (
+                (
+                    provider == "deepseek"
+                    and undo is None
+                    and review is None
+                    and used >= weekly_tokens
+                )
+                or counts["active"] >= active_limit
+                or counts["recent"] >= 20
+            ):
                 raise QuotaReached()
             if (
                 conn.execute(
@@ -520,7 +573,7 @@ def submit(
                 raise ThreadUnavailable()
             previous = (
                 conn.execute(
-                    text("""SELECT id,status,outcome,review IS NOT NULL AS is_review
+                    text("""SELECT id,status,outcome,skills,review IS NOT NULL AS is_review
                      FROM sw.runs WHERE session_id=:session ORDER BY created_at DESC,id DESC LIMIT 1"""),
                     params,
                 )
@@ -541,10 +594,15 @@ def submit(
                 or (previous["outcome"] or {}).get("unfinished_tools")
             ) and not acknowledge_interrupted:
                 raise InterruptedConfirmationRequired()
+            if skills is None:
+                params["skills"] = json.dumps(previous["skills"])
         conn.execute(
             text("""
-            INSERT INTO sw.runs(tenant_id,id,session_id,request_key,prompt,provider,mode,continuation,review,member_id)
-            VALUES (:tenant,:id,:session,:key,:prompt,:provider,:mode,:continuation,CAST(:review AS jsonb),:member)
+            INSERT INTO sw.runs(tenant_id,id,session_id,request_key,prompt,provider,mode,continuation,
+                                review,member_id,skills,undo,context_window_tokens)
+            VALUES (:tenant,:id,:session,:key,:prompt,:provider,:mode,:continuation,
+                    CAST(:review AS jsonb),:member,CAST(:skills AS jsonb),CAST(:undo AS jsonb),
+                    :context_window_tokens)
         """),
             params,
         )
@@ -552,7 +610,8 @@ def submit(
             conn.execute(
                 text("INSERT INTO sw.run_jobs(tenant_id,run_id) VALUES (:tenant,:id)"), params
             )
-        audit(conn, tenant, member, str(params["id"]), "review.submit" if review else "run.submit")
+        action = "undo.submit" if undo else "review.submit" if review else "run.submit"
+        audit(conn, tenant, member, str(params["id"]), action)
         return {"run_id": params["id"], "session_id": params["session"]}, True
 
 
@@ -565,8 +624,10 @@ def snapshot(
                 text(f"""
             SELECT r.id AS run_id,r.session_id,r.status,r.prompt,r.provider,r.mode,r.created_at,
                 r.cancel_requested,r.outcome,r.report IS NOT NULL AS has_report,
+                r.outcome->>'final_text' AS final_text,r.context_window_tokens,
                 s.workspace_id,s.isolated,s.next_seq AS through_seq,j.state AS job_state,
-                r.continuation,r.review IS NOT NULL AS is_review,s.member_id::text AS member_id
+                r.continuation,r.review IS NOT NULL AS is_review,r.skills,(r.undo IS NOT NULL) AS is_undo,
+                s.member_id::text AS member_id
             FROM sw.runs r JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
             LEFT JOIN sw.run_jobs j ON (r.tenant_id,r.id)=(j.tenant_id,j.run_id)
             WHERE r.id=:id AND {_ACCESS}
@@ -593,7 +654,14 @@ def unconfirmed_operations(conn: Connection, run_id: str) -> list[JSONDict]:
                     intent->'argv' AS argv
                 FROM sw.operations WHERE run_id=:id
                   AND (state='started' OR (state='unknown' AND intent IS NOT NULL))
-                ORDER BY id LIMIT 100
+                UNION ALL
+                SELECT event->'payload'->>'target_operation_id','undo',
+                    event->'payload'->>'path',NULL::jsonb FROM sw.events
+                WHERE run_id=:id AND event->>'type'='changes.undo.started'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sw.events e WHERE e.run_id=:id AND e.event->>'type'='changes.undo.completed'
+                  )
+                ORDER BY operation_id LIMIT 100
             """),
             {"id": run_id},
         ).mappings()
@@ -613,7 +681,8 @@ def claim(
             conn.execute(
                 text("""
             SELECT r.id AS run_id,r.session_id,r.prompt,r.provider,r.mode,
-                r.continuation,r.review,s.workspace_id,s.isolated,r.member_id::text AS member_id
+                r.continuation,r.review,r.skills,r.undo,r.context_window_tokens,
+                s.workspace_id,s.isolated,r.member_id::text AS member_id
             FROM sw.run_jobs j JOIN sw.runs r ON (j.tenant_id,j.run_id)=(r.tenant_id,r.id)
             JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
             WHERE j.state='queued' AND r.status='active' AND NOT r.cancel_requested
@@ -667,7 +736,7 @@ def recent(
             turns = conn.execute(
                 text(f"""
                     SELECT r.id AS run_id,r.session_id,r.status,r.prompt,r.created_at,r.mode,
-                        report IS NOT NULL AS has_report,review IS NOT NULL AS is_review,
+                        report IS NOT NULL AS has_report,review IS NOT NULL AS is_review,r.skills,
                         outcome->>'final_text' AS final_text,
                         status='interrupted' OR COALESCE((outcome->>'unfinished_tools')::integer,0)>0
                             AS requires_acknowledgement

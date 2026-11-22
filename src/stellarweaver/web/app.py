@@ -30,7 +30,6 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from stellarweaver.config import ModelConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.policy import DS_SEARCH
 from stellarweaver.tools.workspace import ToolError
@@ -41,7 +40,7 @@ from stellarweaver.web.approval import (
     pending,
     request_cancel,
 )
-from stellarweaver.web.execution import execute
+from stellarweaver.web.execution import execute, web_model_config
 from stellarweaver.web.experiment_records import (
     ExperimentTooLarge,
     PublishedExperiments,
@@ -63,7 +62,11 @@ from stellarweaver.web.oidc import (
     session_member,
 )
 from stellarweaver.web.review import feedback_prompt, preflight_patch, selected_patch
-from stellarweaver.web.skills import SkillLibrary
+from stellarweaver.web.run_export import ExportLimitExceeded
+from stellarweaver.web.run_export import build as build_export
+from stellarweaver.web.run_export import render as render_export
+from stellarweaver.web.skills import SkillLibrary, project_skill_root
+from stellarweaver.web.undo import latest_edit
 from stellarweaver.web.worker import recover_interrupted
 
 LOCAL_TENANT = UUID("408f4403-a999-48de-94dc-cc049f8a95fd")
@@ -123,15 +126,33 @@ class ArchiveThread(BaseModel):
     archived: bool
 
 
+class SkillRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+
+
+class SkillTrust(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    enabled: bool
+
+
+class UndoRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: UUID
+    operation_id: UUID
+
+
 class Submit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     workspace_id: UUID
     request_id: UUID
     prompt: Annotated[str, Field(min_length=1, max_length=8000)]
-    mode: Literal["read-only", "repair"] = "read-only"
+    mode: db.RunMode = "read-only"
     session_id: UUID | None = None
     continuation: Literal["history", "fresh"] = "history"
     acknowledge_interrupted: bool = False
+    skills: Annotated[list[SkillRef], Field(max_length=3)] | None = None
 
 
 HunkId = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
@@ -186,13 +207,40 @@ def public_event(event: JSONDict) -> JSONDict:
         visible = {
             k: payload[k] for k in ("operation_id", "tool_name", "status", "reason") if k in payload
         }
+    elif kind == "skill.selected":
+        visible = {
+            "skill_name": payload["name"],
+            "skill_source": payload["source_kind"],
+            "sha256": payload["sha256"],
+        }
+    elif kind == "context.prior_evidence":
+        visible = {key: len(payload[key]) for key in ("files", "checks", "skills")}
+    elif kind == "context.compacted":
+        visible = {
+            key: payload[key]
+            for key in (
+                "strategy",
+                "before_tokens_estimated",
+                "after_tokens_estimated",
+                "input_budget",
+            )
+            if key in payload
+        }
+    elif kind in {"changes.undo.started", "changes.undo.completed"}:
+        visible = {k: payload[k] for k in ("path", "target_operation_id", "status") if k in payload}
     elif kind == "tool.completed":
         visible = {k: payload[k] for k in ("tool_name", "status", "operation_id") if k in payload}
         if payload.get("status") == "ok":
-            visible["content"] = str(payload.get("content", ""))[:12000]
-            if payload.get("tool_name") == DS_SEARCH:
+            tool_name = payload.get("tool_name")
+            if tool_name == "load_skill":
+                data = payload.get("data", {})
+                visible["skill_name"] = data.get("name")
+                visible["skill_source"] = data.get("source_kind")
+            else:
+                visible["content"] = str(payload.get("content", ""))[:12000]
+            if tool_name == DS_SEARCH:
                 visible["sources"] = payload.get("data", {}).get("sources", [])
-            if payload.get("tool_name") == "stage_patch":
+            if tool_name == "stage_patch":
                 visible["staged_patch"] = payload.get("data", {}).get("patch")
                 visible["patch_sha256"] = payload.get("data", {}).get("patch_sha256")
         else:
@@ -272,6 +320,17 @@ def public_event(event: JSONDict) -> JSONDict:
             )
             if k in payload
         }
+        reason = str(payload.get("reason", ""))
+        if payload.get("run_status") == "budget_exceeded" and reason.startswith(
+            (
+                "Required context does not fit:",
+                "Server context length exceeded;",
+                "Output reserve and safety margin",
+                "context_window_tokens",
+            )
+        ):
+            visible["error_code"] = "CONTEXT_WINDOW_EXCEEDED"
+            visible["budget_reason"] = reason[:300]
     else:
         visible = {}
     return {**event, "payload": visible}
@@ -320,6 +379,7 @@ def create_app(
         raise ValueError("Choose FakeModel or configure the DeepSeek key")
     if any(part.is_relative_to(state_dir) for p in identities for part in p.workspaces):
         raise ValueError("Web state directory cannot contain a registered workspace")
+    context_window = web_model_config(provider).context_window_tokens
     tasks: set[asyncio.Task[None]] = set()
     controls: dict[tuple[str, str], Event] = {}
     repair_roots: set[Path] = set()
@@ -593,7 +653,7 @@ def create_app(
             ]
         return {
             "provider": provider,
-            "context_window_tokens": ModelConfig().context_window_tokens,
+            "context_window_tokens": context_window,
             "repair_enabled": enable_repair and p.can_write,
             "can_submit": p.can_write,
             "account": {"name": p.member.name, "role": p.member.role} if p.member else None,
@@ -691,8 +751,19 @@ def create_app(
     async def start(body: Submit, p: Principal = require_principal) -> JSONDict:
         return await submit_run(body, p)
 
+    def workspace_skill_library(p: Principal, workspace_id: str, root: Path | None) -> SkillLibrary:
+        if root is not None and db.project_skill_trust(
+            engine, str(p.tenant), p.member_id, workspace_id
+        ):
+            return SkillLibrary((*skills.roots, ("项目", project_skill_root(root))))
+        return skills
+
     async def submit_run(
-        body: Submit, p: Principal, *, expected_previous_run: str | None = None
+        body: Submit,
+        p: Principal,
+        *,
+        expected_previous_run: str | None = None,
+        undo: JSONDict | None = None,
     ) -> JSONDict:
         require_write(p)
         workspace_id = str(body.workspace_id)
@@ -704,9 +775,28 @@ def create_app(
         if not prompt:
             raise HTTPException(422, "Prompt is required")
         tenant = str(p.tenant)
-        repair = body.mode == "repair"
+        repair = body.mode in db.REPAIR_MODES
         if repair and not enable_repair:
             raise HTTPException(403, "Local repair is disabled")
+        selected = None
+        library = skills
+        if not queued or body.skills:
+            try:
+                library = await asyncio.to_thread(workspace_skill_library, p, workspace_id, root)
+            except ToolError as exc:
+                raise HTTPException(409, str(exc)) from exc
+        if body.skills is not None:
+            refs = [item.model_dump() for item in body.skills]
+            if len({item["id"] for item in refs}) != len(refs):
+                raise HTTPException(422, "同一个技能只能选择一次。")
+            try:
+                loaded = await asyncio.to_thread(library.pinned, refs)
+            except ToolError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            selected = [
+                {**ref, "name": skill["name"], "source": skill["source"]}
+                for ref, skill in zip(refs, loaded, strict=True)
+            ]
         async with submission_lock:
             busy = repair and root in repair_roots
             try:
@@ -727,6 +817,9 @@ def create_app(
                     acknowledge_interrupted=body.acknowledge_interrupted,
                     isolated=isolated and not chat,
                     member=p.member_id,
+                    skills=selected,
+                    undo=undo,
+                    context_window_tokens=context_window if undo is None else None,
                 )
             except db.RequestConflict as exc:
                 raise HTTPException(409, "Request ID already used with different input") from exc
@@ -781,6 +874,10 @@ def create_app(
                         approval_ttl,
                         None,
                         body.continuation if body.session_id else None,
+                        auto=body.mode == "auto",
+                        skill_roots=library.roots,
+                        selected_skills=selected,
+                        context_window_tokens=context_window,
                     )
                 )
                 tasks.add(task)
@@ -811,7 +908,7 @@ def create_app(
     async def inspect(run_id: UUID, p: Principal = require_principal) -> JSONDict:
         tenant = str(p.tenant)
         row = await lookup(p, run_id)
-        if row["status"] == "active" and row["mode"] == "repair" and p.can_write:
+        if row["status"] == "active" and row["mode"] in db.REPAIR_MODES and p.can_write:
 
             def read_approval() -> JSONDict | None:
                 with db.scoped(engine, tenant) as conn:
@@ -871,6 +968,99 @@ def create_app(
         await lookup(p, run_id)
         return await get_report(tenant, run_id, actor=p.member_id)
 
+    @app.get("/api/v1/runs/{run_id}/export")
+    async def export(
+        run_id: UUID, format: Literal["json", "html"] = "json", p: Principal = require_principal
+    ) -> Response:
+        row = await lookup(p, run_id)
+        if row["status"] == "active":
+            raise HTTPException(409, "请在本轮运行结束后导出。")
+
+        def read_export() -> str:
+            with db.scoped(engine, str(p.tenant)) as conn:
+                output = render_export(build_export(conn, row), format)
+                db.audit(conn, str(p.tenant), p.member_id, str(run_id), "run.export")
+                return output
+
+        try:
+            output = await asyncio.to_thread(read_export)
+        except ExportLimitExceeded as exc:
+            raise HTTPException(413, "本轮记录超过导出大小上限。") from exc
+        return Response(
+            output,
+            media_type="application/json" if format == "json" else "text/html",
+            headers={
+                "Content-Disposition": f'attachment; filename="stellarweaver-{run_id}.{format}"'
+            },
+        )
+
+    def can_undo(row: JSONDict) -> bool:
+        return bool(
+            queued
+            and enable_repair
+            and row["isolated"]
+            and row["can_continue"]
+            and not row["is_review"]
+            and row["status"] != "active"
+            and row["status"] != "interrupted"
+            and not (row.get("outcome") or {}).get("unfinished_tools")
+        )
+
+    @app.get("/api/v1/runs/{run_id}/undo")
+    async def undo_preview(run_id: UUID, p: Principal = require_principal) -> JSONDict:
+        row = await lookup(p, run_id)
+        if not can_undo(row):
+            return {"target": None}
+
+        def find_target() -> JSONDict:
+            with db.scoped(engine, str(p.tenant)) as conn:
+                latest = conn.execute(
+                    text("""
+                    SELECT r.id::text, s.archived_at FROM sw.runs r JOIN sw.sessions s
+                      ON (s.tenant_id,s.id)=(r.tenant_id,r.session_id)
+                    WHERE s.id=:session ORDER BY r.created_at DESC,r.id DESC LIMIT 1
+                    """),
+                    {"session": row["session_id"]},
+                ).one_or_none()
+                edit = (
+                    latest_edit(conn, row["session_id"])
+                    if latest and latest[0] == str(run_id) and latest[1] is None
+                    else None
+                )
+                return {
+                    "target": {
+                        "operation_id": edit["operation_id"],
+                        "tool_name": edit["tool_name"],
+                        "path": edit["data"]["path"],
+                    }
+                    if edit
+                    else None
+                }
+
+        return await asyncio.to_thread(find_target)
+
+    @app.post("/api/v1/runs/{run_id}/undo", status_code=202)
+    async def undo_file(
+        run_id: UUID, body: UndoRequest, p: Principal = require_principal
+    ) -> JSONDict:
+        require_write(p)
+        row = await lookup(p, run_id)
+        if not can_undo(row):
+            raise HTTPException(409, "请从当前项目线程发起撤销。")
+        return await submit_run(
+            Submit(
+                workspace_id=UUID(row["workspace_id"]),
+                request_id=body.request_id,
+                session_id=UUID(row["session_id"]),
+                prompt="撤销最近一次文件修改",
+                mode="repair",
+                continuation="history",
+            ),
+            p,
+            expected_previous_run=str(run_id),
+            undo={"operation_id": str(body.operation_id)},
+        )
+
     async def get_report(tenant: str, run_id: UUID, *, actor: str | None = None) -> JSONDict:
         def read_report() -> JSONDict | None:
             with db.scoped(engine, tenant) as conn:
@@ -906,7 +1096,11 @@ def create_app(
         if not isolated or not enable_repair:
             raise HTTPException(403, "Isolated review is disabled")
         row = await lookup(p, run_id)
-        if not row["isolated"] or row["status"] != "completed" or row["mode"] != "repair":
+        if (
+            not row["isolated"]
+            or row["status"] != "completed"
+            or row["mode"] not in db.REPAIR_MODES
+        ):
             raise HTTPException(409, "Completed isolated repair required")
         root = resolve_workspace(p, row["workspace_id"])
         if root is None:
@@ -935,7 +1129,7 @@ def create_app(
                 request_id=body.request_id,
                 session_id=UUID(row["session_id"]),
                 prompt=prompt,
-                mode="repair",
+                mode=row["mode"],
             ),
             p,
             expected_previous_run=str(run_id),
@@ -1143,13 +1337,56 @@ def create_app(
             raise HTTPException(503, "实验记录格式不正确。") from exc
 
     @app.get("/api/v1/skills")
-    def list_skills(p: Principal = require_principal, refresh: bool = False) -> JSONDict:
-        return skills.list(refresh=refresh)
+    def list_skills(
+        p: Principal = require_principal, refresh: bool = False, workspace_id: UUID | None = None
+    ) -> JSONDict:
+        if workspace_id is None:
+            return skills.list(refresh=refresh)
+        key = str(workspace_id)
+        root = resolve_workspace(p, key)
+        trusted = db.project_skill_trust(engine, str(p.tenant), p.member_id, key) if root else None
+        try:
+            library = (
+                SkillLibrary((*skills.roots, ("项目", project_skill_root(root))))
+                if trusted and root is not None
+                else skills
+            )
+        except ToolError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {
+            **library.list(refresh=refresh),
+            "project_trusted": trusted,
+            "can_manage_project": trusted is not None and p.can_write,
+        }
+
+    @app.put("/api/v1/workspaces/{workspace_id}/skill-trust")
+    def set_skill_trust(
+        workspace_id: UUID, body: SkillTrust, p: Principal = require_principal
+    ) -> JSONDict:
+        require_write(p)
+        key = str(workspace_id)
+        root = resolve_workspace(p, key)
+        if root is None or p.member_id is None:
+            raise HTTPException(404, "找不到项目工作区。")
+        try:
+            if body.enabled:
+                project_skill_root(root)
+        except ToolError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        enabled = db.project_skill_trust(engine, str(p.tenant), p.member_id, key, body.enabled)
+        if enabled is None:
+            raise HTTPException(404, "找不到项目工作区。")
+        return {"project_trusted": enabled}
 
     @app.get("/api/v1/skills/{skill_id}")
-    def read_skill(skill_id: str, p: Principal = require_principal) -> JSONDict:
+    def read_skill(
+        skill_id: str, p: Principal = require_principal, workspace_id: UUID | None = None
+    ) -> JSONDict:
         try:
-            return skills.detail(skill_id)
+            if workspace_id is None:
+                return skills.detail(skill_id)
+            key = str(workspace_id)
+            return workspace_skill_library(p, key, resolve_workspace(p, key)).detail(skill_id)
         except ToolError as exc:
             raise HTTPException(404 if exc.code == "SKILL_NOT_FOUND" else 409, exc.message) from exc
 

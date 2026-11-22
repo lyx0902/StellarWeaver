@@ -9,6 +9,8 @@ from typing import Literal
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from stellarweaver.domain import DEFAULT_CONTEXT_WINDOW_TOKENS
+
 
 class StrictConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
@@ -27,7 +29,7 @@ class ModelConfig(StrictConfig):
     api_key_env: str = "STELLARWEAVER_API_KEY"
     thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort: Literal["low", "high", "max"] = "high"
-    context_window_tokens: int = Field(default=100_000, ge=2048)
+    context_window_tokens: int = Field(default=DEFAULT_CONTEXT_WINDOW_TOKENS, ge=2048)
     max_output_tokens: int = Field(default_factory=_default_output_tokens, ge=1)
     request_timeout_seconds: int = Field(default=90, ge=1, le=600)
     supports_streaming: bool = False
@@ -71,8 +73,11 @@ class ExecutionConfig(StrictConfig):
         return self
 
 
+PolicyPreset = Literal["ask", "read-only", "workspace-edit", "auto", "benchmark"]
+
+
 class PolicyConfig(StrictConfig):
-    preset: Literal["ask", "read-only", "workspace-edit"] = "ask"
+    preset: PolicyPreset = "ask"
 
 
 class ContextConfig(StrictConfig):

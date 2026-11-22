@@ -99,7 +99,7 @@ flowchart TB
 | `AgentEvent.seq` | 按事件顺序定位会话记录。Web 用它作为 SSE 补读游标。 |
 | `RunOutcome` | 保存运行终态、验证状态、证据、计量和回复。CLI 运行时将 `task_assessment` 保持为 `unknown`，独立评测随后按任务规则判定。 |
 
-`build_agent` 是公共装配点。它用 Journal 的工作区创建 `PolicyEngine` 和 `ToolRegistry`，再把模型、边界配置、审批回调、可选的命令执行器和通知回调交给 `Agent`。CLI 将审批连接到终端，Web 通过 `ApprovalGate` 处理修复和搜索外发。开发工具、导航、补丁暂存、修复反馈、任务证据和预算提示分别受配置控制。普通对话用 `chat_only` 关闭仓库工具与仓库上下文。 [公共装配点](../src/stellarweaver/runtime/service.py) · [Web 配置映射](../src/stellarweaver/web/execution.py)
+`build_agent` 是公共装配点。它用 Journal 的工作区创建 `PolicyEngine` 和 `ToolRegistry`，再把模型、边界配置、审批回调、可选的命令执行器和通知回调交给 `Agent`。CLI 将审批连接到终端，Web 用 `ApprovalGate` 处理策略判定需要审批的操作。开发工具、导航、补丁暂存、修复反馈、任务证据和预算提示分别受配置控制。普通对话用 `chat_only` 关闭仓库工具与仓库上下文。 [公共装配点](../src/stellarweaver/runtime/service.py) · [Web 配置映射](../src/stellarweaver/web/execution.py)
 
 主循环 `_drive` 收集工具 schema，准备模型请求并获取回复。它先核验工具调用 ID，然后由 Journal 把 assistant 消息和计划操作落库。`_tools` 按回复里的顺序调用工具。每个结果接入消息序列后，下一次模型请求才能从这些结果继续。测试退出码非零会作为工具错误交给模型，便于继续修复；连续三次相同的工具失败、权限阻断、预算耗尽或无法确认的执行状态会提前结束。本轮已经声明但尚未执行的调用会补上对应结果，保持消息配对完整。 [领域类型](../src/stellarweaver/domain/__init__.py) · [公共装配点](../src/stellarweaver/runtime/service.py) · [主循环](../src/stellarweaver/runtime/loop.py)
 
@@ -124,11 +124,11 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 - **指令加载。** `InstructionLoader` 按工作区根和已操作路径的祖先目录加载 `AGENTS.md`，记录来源、范围和文件哈希。准备修改时，`_before_execute` 根据目标路径判定模型是否已看到适用指令。用户批准后，`_after_authorize` 再检查一次指令指纹。等待期间指令变动会以 `INSTRUCTIONS_UPDATED` 返回，让下一轮先看到新增要求，再决定操作。
 - **仓库索引。** `RepoMap` 在工作区文件约束下枚举候选路径，以 Python AST 提取函数、类、签名和行号。显式路径、曾访问位置和关键词影响排序。索引按预算截取，提供下一步搜索和读文件的线索。实际文件内容由工具读取，编辑依据最新文件哈希执行。
 - **问题驱动导航。** 启用后，`IssueSignals` 从任务提取路径、符号、异常和测试线索，辅助 Repo Map 排序。`find_symbol`、`find_references` 和 `find_related_tests` 通过 Python AST 查找定义、静态引用和相关测试，返回路径、行号、SHA-256、耗时和覆盖状态。索引按内容哈希复用，文件变更后重新解析。动态绑定和扫描范围之外的关系仍存在不确定性。 [Python 导航](../src/stellarweaver/context/navigation.py)
-- **窗口计算。** DeepSeek Thinking 默认从 100,000 token 窗口中预留 8,192 token 输出和 2,048 token 安全余量，估算输入额度为 89,760 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。计量采用保守的 UTF-8 JSON 字节估算，实际服务端用量进入独立字段。
-- **历史压缩。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。分组保留最新用户任务、系统消息、最近的完整 assistant 回合和最近的完整工具组。过长工具输出以有界摘要进入请求，其中保留路径、哈希、操作 ID、证据位置和关键结果。更早的回合按组移出，生成带来源标记的摘要并记录检查点。原始消息仍在 Journal。必需数据放不进窗口时，运行以预算超限结束。
-- **任务证据。** 可选投影会从已入库的工具结果汇总少量路径、文件哈希、测试状态和暂存补丁引用。每条保留事件序号和操作 ID，准备请求时重新核对文件哈希并排除过期路径。当前证据来自运行期间观察到的结果，跨 Web 运行的恢复继续由 Journal 的历史读取和 worktree 管理负责。 [任务证据](../src/stellarweaver/runtime/task_evidence.py)
+- **窗口计算。** DeepSeek Thinking 默认从 200,000 token 窗口中预留 8,192 token 输出和 2,048 token 安全余量，估算输入额度为 189,760 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。工作台在提交时保存该轮窗口，worker 领取时读取；模型事件还记录每次请求的窗口。计量采用保守的 UTF-8 JSON 字节估算，实际服务端用量进入独立字段。
+- **历史压缩。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。分组保留最新用户任务、系统消息、最近的完整 assistant 回合和最近的完整工具组。过长工具输出以有界摘要进入请求，并保留路径、哈希、操作 ID 和关键结果。工作台在普通压缩后仍超窗时允许再归纳较早的完整回合，保留所有仍传给 DeepSeek 的工具调用与对应结果。过程记录检查点，原始消息保存在 Journal。系统指令、工具 schema 和当前任务本身仍须能放入窗口。
+- **任务证据。** 运行内可选投影从工具结果提取路径、文件哈希、测试状态和暂存补丁引用。每条保留事件序号和操作 ID，准备请求时重新核对文件状态。Web 的跨轮证据由 PostgreSQL Journal 另行投影，按当前 worktree 标注文件及检查是否仍适用。 [运行内证据](../src/stellarweaver/runtime/task_evidence.py) · [跨轮证据](../src/stellarweaver/web/continuation.py)
 
-窗口大小约束一次请求。`LimitsConfig` 还分别约束整次任务的模型调用数、工具调用数、累计输入输出用量和墙钟时长。默认单次任务上限为 30 次模型请求、100 次工具调用和 900 秒，累计输入和输出预算分别为 1,000,000 与 30,000 tokens。一次请求适配窗口后，仍需通过整次运行的剩余额度检查。可选预算提示根据本轮证据推断定位、复现、编辑、验证、审阅或交付阶段，余量不足时提示优先处理相关验证。执行仍受同一组硬上限约束。 [指令加载](../src/stellarweaver/instructions/__init__.py) · [仓库索引](../src/stellarweaver/context/repo_map.py) · [历史投影](../src/stellarweaver/context/manager.py) · [运行预算](../src/stellarweaver/runtime/loop.py)
+窗口约束单次模型请求。CLI 的 `LimitsConfig` 默认约束每次运行的模型调用、工具调用和总时长，分别为 30 次、100 次和 900 秒，累计输入和输出分别为 1,000,000 与 30,000 token。独立评测用冻结的运行配置。启用总预算约束的运行可生成阶段余量提示。Web 用单次模型窗口、操作自身超时和账户 UTC 周额度控制运行，累计调用和用量仍写入 Journal。 [历史投影](../src/stellarweaver/context/manager.py) · [运行预算](../src/stellarweaver/runtime/loop.py) · [Web 装配](../src/stellarweaver/web/execution.py)
 
 ### 工具与权限
 
@@ -148,9 +148,9 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 | `find_symbol`、`find_references`、`find_related_tests` | 按配置启用 Python 静态查询，返回可回读的路径、行号和哈希。 |
 | `run_tests`、`discover_tests`、`check_syntax`、`run_linter` | 将受控的操作、目标和框架交给配置的执行器，返回结构化诊断、退出码和清理状态。 |
 | `stage_patch` | 接受带预期哈希的多文件文本变更。用临时 Git 目录生成和复核 diff，批准后保存待审制品。目标工作区不会由此调用写入。 |
-| `ds_search` | CLI 和 Web 选用支持搜索的 DeepSeek provider 时注册。在用户批准具体公开查询后，由单独的 Chat Completions 请求执行服务端搜索。工具返回来源，并将模型用量纳入原有预算。 |
+| `ds_search` | CLI 和 Web 选用支持搜索的 DeepSeek provider 时注册。公开查询通过风险检查后按 L0 自动放行，由独立的 Chat Completions 请求执行服务端搜索。工具返回来源，模型用量沿当前入口记账。 |
 
-`PolicyEngine` 根据预设、能力和显式授权计算结果。工作台把项目运行映射为 `read-only` 或修复时的 `ask`。CLI 另提供 `workspace-edit`，自动放行普通内置创建和编辑，命令和补丁暂存各有授权规则。授权文件绑定工作区，命令匹配完整 argv 与 cwd，内置修改匹配显式文件路径。仓库指令会影响任务选择和复检，权限由程序策略和用户决定提供。 [注册表](../src/stellarweaver/tools/registry.py) · [策略](../src/stellarweaver/policy/__init__.py) · [文件工具](../src/stellarweaver/tools/files.py) · [工作区](../src/stellarweaver/tools/workspace.py)
+`PolicyEngine` 根据预设、能力和显式授权计算结果。工作台将「只读」「修改」与 `auto` 分别映射为 `read-only`、`ask`、`auto`。命令准备阶段记录实际绑定的执行器。只有固定受限命令和已登记的沙箱开发操作进入 `auto` 的自动验证范围。SWE-bench 使用独立的无人值守预设。CLI 还提供 `workspace-edit`，自动放行普通内置创建和编辑。授权文件绑定工作区，命令匹配完整 argv 与 cwd，内置修改匹配显式路径。仓库指令会影响任务选择和复检，权限由程序策略和用户决定提供。 [分流规则](SECURITY.md#运行模式与分流) · [注册表](../src/stellarweaver/tools/registry.py) · [策略](../src/stellarweaver/policy/__init__.py)
 
 ### CLI 改动管理
 
@@ -164,14 +164,14 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 
 ### 扩展
 
-`ExtensionManager` 由 CLI 在任务或交互会话的生命周期内装配。它将 Skills 和 MCP 接入同一个工具注册表，因此扩展调用也会产生授权、执行和结果事件。
+`ExtensionManager` 将技能和已配置的扩展接入共享工具注册表。CLI 在任务或交互会话内装配，Web 在每次模型运行前装配服务端配置的技能目录。调用仍使用同一套授权、执行和 Journal 事件。
 
 - **Skills。** `SkillCatalog` 从可信工作区和用户显式指定的目录发现技能。模型先看到目录中的元数据，通过 `load_skill` 请求某个技能的正文。目录记录来源和内容身份，加载结果进入模型工具回合。技能正文用于补充任务方法和指令，任何后续访问仍通过原工具授权路径。
-- **Web Skills 库。** API 复用 `SkillCatalog` 浏览 Compose 明确挂载的本机目录。列表按来源和相对路径生成条目标识，详情按标识重新读取正文。目录与正文作为页面数据返回，和 CLI 的 `load_skill` 工具调用各走自己的入口。 [Web 技能目录](../src/stellarweaver/web/skills.py)
+- **Web Skills 库。** API 和 worker 从同一组服务端只读挂载发现技能。授权项目技能时，扫描原项目的 `.stellarweaver/skills`，授权标志存于成员的工作区授权行。API 按来源和相对路径生成条目标识，用户可保存特定版本到会话下一轮，worker 再按哈希核对正文。模型也可从目录按名称调用 `load_skill`。Journal 记录名称、来源和已加载版本的哈希。 [Web 技能目录](../src/stellarweaver/web/skills.py) · [Web Agent 装配](../src/stellarweaver/web/execution.py)
 - **MCP。** 启动本地 stdio server 前，管理器检查工作区信任，并将 `server_id`、argv、cwd 及 `allow_env` 交给策略判断。匹配凭据规则的环境变量会被拒绝。启动后，连接完成协议初始化和 `tools/list`，为远程工具注册本地名称与参数 schema。显式的只读配置决定哪些工具可在只读模式中暴露。实际交接需要匹配服务、工具、参数的授权或交互批准。调用经 `tools/call` 返回统一工具结果，连接在退出时关闭。
 - **动态清单。** 当 server 发出工具列表变化通知时，管理器在下一次请求的上下文组装边界刷新注册表，使发送给模型的 schema 与实际可执行项对应。扩展生命周期中的启动失败、连接中断和结果截断也写入 Journal。
 
-Web 的装配路径目前直接使用内置工具与验证执行器。`extensions/` 由 CLI 入口接入，对 CLI 做实验验证可使用项目随附的离线扩展演示。 [扩展管理](../src/stellarweaver/extensions/__init__.py) · [技能目录](../src/stellarweaver/extensions/skills.py) · [MCP 连接](../src/stellarweaver/extensions/mcp.py)
+Web 的共享技能从服务端配置的只读目录发现，项目技能由成员授权后从源项目读取。工作台提供 Skills 的浏览、会话选用和模型自主加载，本地 stdio MCP 由 CLI 装配。 [扩展管理](../src/stellarweaver/extensions/__init__.py) · [技能目录](../src/stellarweaver/extensions/skills.py) · [MCP 连接](../src/stellarweaver/extensions/mcp.py)
 
 ### 会话持久化
 
@@ -196,9 +196,12 @@ FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改�
 | --- | --- |
 | `auth/config`、`auth/login`、`auth/register` | 决定登录方式，建立账号及会话。 |
 | `workspaces`、`workspaces/folders`、`threads` | 提供工作区、可选择目录和线程列表。`PATCH /workspaces/{workspace_id}` 更新本机项目别名，`PATCH /threads/{session_id}` 更新线程归档状态。 |
-| `POST /runs`、`GET /runs/{run_id}` | 提交任务并取得运行标识，随后读取运行快照与待审批状态。排队部署返回 `202` 时，后台运行仍在处理。 |
+| `POST /runs`、`GET /runs/{run_id}` | 提交任务并取得运行标识，读取运行快照、历史窗口和待审批状态。排队部署返回 `202` 表示请求已受理。 |
 | `GET /runs/{run_id}/events` | 逐段接收可见文本与状态事件。断线可按最后处理的事件 `seq` 补读。 |
 | `report`、`patch`、`review` | 读取交付报告、下载补丁或发起所选改动的复验。复验资格由 API 判断。 |
+| `GET /runs/{run_id}/export` | 下载本轮的脱敏 JSON 或离线回放 HTML。 |
+| `GET /runs/{run_id}/undo`、`POST /runs/{run_id}/undo` | 查看或提交最近一次可撤销的文件操作，提交后在原线程新建一轮。 |
+| `GET /skills`、`GET /skills/{skill_id}`、`PUT /workspaces/{workspace_id}/skill-trust` | 查看已授权技能的清单与正文，或更新当前成员的工作区技能信任。版本选择随运行提交。 |
 | `GET /experiment`、`GET /experiments` | 旧接口读取单题报告。新接口列出只读目录中可加载的实验及不可用项。 |
 | `GET /experiments/{name}`、`GET /experiments/compare` | 按权限查看报告详情、核对两个 SWE-bench 清单的配对条件、统计共同评分样本及排除原因。 |
 
@@ -206,7 +209,7 @@ SSE 在服务端查询已提交的事件页，按 `seq` 递增发送。浏览器
 
 ### Web 调度与交付
 
-**从提交到领取。** `db.submit` 按租户和成员约束请求标识。同一个标识和相同参数重复提交会返回原有运行，不同内容复用标识会返回冲突。原线程续接需要会话与项目匹配，且线程可继续、未归档、没有活动运行。数据库事务把新运行、队列行和审计一起提交。`db.claim` 使用 `FOR UPDATE SKIP LOCKED` 领取待执行项，并更新拥有者、尝试号和领取时间。`run_team_worker` 轮转已知租户，按槽位并行执行，每个成员同一时间只能领取一个运行。额度在提交阶段限制活跃及近期运行，DeepSeek 用量在模型请求阶段预留与结算。
+**从提交到领取。** `db.submit` 按租户和成员约束请求标识。同一请求重试返回原有运行，不同内容复用标识返回冲突。原线程续接会核对项目、归档状态和活动运行。事务提交运行的上下文窗口、技能版本、队列行和审计。`db.claim` 使用 `FOR UPDATE SKIP LOCKED` 领取待执行项，记录拥有者、尝试号和领取时间，worker 使用该运行已保存的窗口。`run_team_worker` 按槽位轮转租户，每个成员同一时间只能领取一个运行。提交层检查活跃和近期运行，DeepSeek 每次请求在 UTC 周额度中预留并结算用量。
 
 `runs.status` 表示用户看到的运行状态，`run_jobs.state` 表示调度状态。新任务可以同时为 `active` 和 `queued`，被领取后调度状态变为 `running`，运行结束时配套队列行变为 `done`。模型预算还有独立的计量点：`PgJournal` 处理模型开始事件时按估算输入与输出上限预留额度，收到用量时按实际或估算结果结算。某次请求中断且没有可靠用量时，账本保留相应预留或估算状态。 [队列与用量事务](../src/stellarweaver/web/db.py) · [PostgreSQL Journal](../src/stellarweaver/web/journal.py)
 
@@ -275,9 +278,11 @@ sequenceDiagram
 
 ## 普通对话与恢复
 
-普通对话在本机账号注册时取得独立工作区标识。该工作区的项目相对路径为空。用户从侧栏顶部创建普通对话，API 据此按 `read-only` 接收入队。worker 为会话准备独立状态目录，执行层以 `chat_only` 选项装配 Agent。该路径沿用可见消息、预算和流式输出，关闭仓库索引、`AGENTS.md`、仓库工具和验证执行器。DeepSeek Flash 可使用 `ds_search`，独立搜索请求只包含本次公开查询，基础会话继续沿用 DeepSeek Thinking 配置。新回复、工具证据和用量按相同的 Web Journal 与 SSE 协议返回。 [本机账号与工作区](../src/stellarweaver/web/local_accounts.py) · [任务准备](../src/stellarweaver/web/worker.py) · [Agent 装配](../src/stellarweaver/runtime/service.py)
+普通对话在本机账号注册时取得独立工作区标识。该工作区的项目相对路径为空。用户从侧栏顶部创建普通对话，API 据此按 `read-only` 接收入队。worker 为会话准备独立状态目录，执行层以 `chat_only` 选项装配 Agent。该路径沿用可见消息、预算和流式输出，关闭仓库索引、`AGENTS.md`、仓库工具和验证执行器。已配置的共享技能可通过 `load_skill` 按需读取。DeepSeek Flash 可使用 `ds_search`，独立搜索请求只包含本次公开查询。新回复、工具证据和用量按相同的 Web Journal 与 SSE 协议返回。 [本机账号与工作区](../src/stellarweaver/web/local_accounts.py) · [任务准备](../src/stellarweaver/web/worker.py) · [Agent 装配](../src/stellarweaver/runtime/service.py)
 
-Web 追问沿用已有 `session_id`，服务端为本轮生成新的 `run_id`。在 `history` 续接方式下，`PgJournal.prior_turns` 从至多 8 次已完成且非复验的历史运行中提取用户任务和最终可见回答，并按时间顺序传给模型。`fresh` 从当前提示开始，项目任务仍复用原 worktree。历史工具意图和执行记录保存在数据库中，续接会使用新的工具调用与审批记录。 [历史读取](../src/stellarweaver/web/journal.py) · [Web 执行](../src/stellarweaver/web/execution.py)
+Web 追问沿用已有 `session_id`，服务端为本轮生成新的 `run_id`。`history` 从最近最多八轮已完成的普通对话抽取可见问答，并将文件观察、验证退出码和技能版本整理为结构化证据。文件和验证结果分别按当前文件哈希和工作树快照标记有效性。`fresh` 从当前提示开始。两种方式均复用项目线程的 worktree，已选技能可跨轮保留，工具请求及授权在本轮重新记录。 [证据续接](../src/stellarweaver/web/continuation.py) · [Web 执行](../src/stellarweaver/web/execution.py)
+
+隔离线程的撤销请求以新运行排队，worker 获取原 worktree 和已确认的创建或编辑操作，通过 CLI 共用的文件恢复逻辑核对字节和权限后执行。撤销前写入意图，完成后记录确认事件并生成新候选。中断后未确认的撤销显示在恢复记录中。日志页的运行导出将可见对话、操作、事件和验证摘要投影成脱敏 JSON 或可离线阅读的 HTML。 [撤销](../src/stellarweaver/web/undo.py) · [导出](../src/stellarweaver/web/run_export.py)
 
 CLI `resume` 打开原 SQLite 会话并协调未闭合操作。Web worker 重启后，恢复逻辑区分仍在排队的任务和已经被领取的任务。已领取的运行尚未落终态时，恢复逻辑记录中断及未确认操作。用户核对当前目录、原运行状态和已完成结果后，可以提交新的续接请求。磁盘 worktree 和数据库历史的对应关系见[数据库文档](DATABASE.md)。
 

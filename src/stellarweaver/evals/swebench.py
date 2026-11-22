@@ -21,11 +21,18 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from stellarweaver.cli import build_provider, effective_config
-from stellarweaver.config import AppConfig, ExecutionConfig, LimitsConfig
+from stellarweaver.config import AppConfig, ExecutionConfig, LimitsConfig, ModelConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.evals.provenance import canonical_json
 from stellarweaver.evals.swebench_official import GRADER_VERSION
-from stellarweaver.evals.swebench_pilot import checkout, digest, git, register_fixed_tools
+from stellarweaver.evals.swebench_pilot import (
+    BENCHMARK_CONTEXT_WINDOW_TOKENS,
+    checkout,
+    digest,
+    git,
+    register_fixed_tools,
+)
+from stellarweaver.policy.risk import HARD_PATH_ERRORS, POLICY_VERSION
 from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
 from stellarweaver.runtime.service import build_agent
@@ -464,7 +471,12 @@ async def solve_task(
     grants = [{"tool": "run_command", "argv": argv, "cwd": "."}]
     save(policy, {"workspace": str(workspace), "grants": grants})
     provider: Literal["deepseek", "fake"] = "deepseek" if args.live else "fake"
-    config = effective_config(AppConfig(), provider, "workspace-edit", True)
+    config = effective_config(
+        AppConfig(model=ModelConfig(context_window_tokens=BENCHMARK_CONTEXT_WINDOW_TOKENS)),
+        provider,
+        "benchmark",
+        True,
+    )
     config = config.model_copy(
         update={
             "limits": limits,
@@ -482,7 +494,10 @@ async def solve_task(
     model = (
         build_provider(config, workspace, "deepseek", None, args.env_file, stream=True)
         if args.live
-        else FakeModel.from_script(args.fake_scripts / f"{task.instance_id}.json")
+        else FakeModel.from_script(
+            args.fake_scripts / f"{task.instance_id}.json",
+            context_window_tokens=config.model.context_window_tokens,
+        )
     )
     prompt = (
         f"Fix {task.instance_id} in {task.repo} at base commit {task.base_commit}. "
@@ -501,6 +516,7 @@ async def solve_task(
                 command_runner=runner if sandbox else None,
                 command_boundary=digest(canonical_json(recipe.model_dump())) if sandbox else None,
                 allow_sandbox_development=development,
+                sandbox_commands=(tuple(argv),) if sandbox else None,
             )
             register_fixed_tools(
                 agent.registry,
@@ -524,6 +540,24 @@ async def solve_task(
                 for event in requests
                 if type(count := event.payload.get("prompt_cache_hit_tokens")) is int
             ]
+            failure_category = None
+            if outcome.run_status in {"blocked", "failed"} and any(
+                tool.status == "denied"
+                or tool.data.get("code") in HARD_PATH_ERRORS
+                or tool.data.get("code")
+                in {
+                    "PERMISSION_DENIED",
+                    "AUTHORIZATION_CHANGED",
+                    "HOOK_DENIED",
+                    "HOOK_FAILED_CLOSED",
+                }
+                for tool in agent.results
+            ):
+                failure_category = "policy_blocked"
+            elif (
+                outcome.run_status == "failed" and requests and requests[-1].type == "model.failed"
+            ):
+                failure_category = "provider_error"
             evidence = {
                 "session_id": store.session_id,
                 "outcome": asdict(outcome),
@@ -531,13 +565,7 @@ async def solve_task(
                 "cached_input_tokens": (
                     sum(cached) if requests and len(cached) == len(requests) else None
                 ),
-                "failure_category": (
-                    "provider_error"
-                    if outcome.run_status == "failed"
-                    and requests
-                    and requests[-1].type == "model.failed"
-                    else None
-                ),
+                "failure_category": failure_category,
             }
     finally:
         if isinstance(model, OpenAICompatibleChatProvider):
@@ -575,7 +603,9 @@ async def solve_task(
             "tools_sha256": tools_sha256,
             "config_sha256": digest(canonical_json(config.model_dump(mode="json"))),
             "policy_sha256": digest(
-                canonical_json({"preset": config.policy.preset, "grants": grants})
+                canonical_json(
+                    {"version": POLICY_VERSION, "preset": config.policy.preset, "grants": grants}
+                )
             ),
             "sandbox_profile": "sandbox-workspace" if sandbox else "swebench-visible-pytest-v1",
             "agent_image": recipe.image,
@@ -641,6 +671,7 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
     settings_path = root / "run-settings.json"
     settings = {
         "provider": "deepseek" if args.live else "fake",
+        "policy": {"preset": "benchmark", "version": POLICY_VERSION},
         "limits": limits.model_dump(),
         "assets": str(args.assets),
         "fixtures": {

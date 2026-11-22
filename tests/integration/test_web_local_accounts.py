@@ -365,8 +365,9 @@ def test_password_accounts_workspace_selection_archives_and_chat(
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("mode", ["repair", "auto"])
 def test_local_account_feedback_reverification_and_ide_handoff(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ):
     dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
     image = os.getenv("STELLARWEAVER_G4_TEST_IMAGE")
@@ -408,6 +409,12 @@ def test_local_account_feedback_reverification_and_ide_handoff(
                 }
                 return AssistantReply(
                     tool_calls=(ToolCall("step-2", "edit_file", json.dumps(args)),)
+                )
+            if revising and last.role == "tool" and last.tool_call_id == "step-2":
+                return AssistantReply(
+                    tool_calls=(
+                        ToolCall("check", "run_command", json.dumps({"argv": _commands[0]})),
+                    )
                 )
             return AssistantReply("Review fixture finished")
 
@@ -484,11 +491,12 @@ def test_local_account_feedback_reverification_and_ide_handoff(
                 assert response.is_success, response.text
                 return response.json()
 
-            first = start(owner, workspace, "Create review note", mode="repair")
+            first = start(owner, workspace, "Create review note", mode=mode)
             assert first.status_code == 202, first.text
             original = first.json()
             original_id = original["run_id"]
-            completed(owner, original_id, approve=True)
+            completed(owner, original_id, approve=mode == "repair")
+            assert owner.get(f"/api/v1/runs/{original_id}").json()["mode"] == mode
             original_hunk = report(original_id)["review"]["files"][0]["hunks"][0]["id"]
             body = {
                 "request_id": str(uuid4()),
@@ -510,13 +518,15 @@ def test_local_account_feedback_reverification_and_ide_handoff(
             assert feedback.status_code == 202, feedback.text
             revised = feedback.json()
             assert revised["session_id"] == original["session_id"]
-            completed(owner, revised["run_id"], approve=True)
+            completed(owner, revised["run_id"], approve=mode == "repair")
+            assert owner.get(f"/api/v1/runs/{revised['run_id']}").json()["mode"] == mode
             assert post(original_id, "/feedback", **body).json() == revised
             assert (
                 post(original_id, "/feedback", **{**body, "request_id": str(uuid4())}).status_code
                 == 409
             )
             revised_patch = report(revised["run_id"])["review"]
+            assert report(revised["run_id"])["verification"] == "passed"
             assert "+revised" in revised_patch["files"][0]["hunks"][0]["diff"]
             selected = [revised_patch["files"][0]["hunks"][0]["id"]]
             before = post(revised["run_id"], "/preflight", hunks=selected)

@@ -9,6 +9,7 @@ test('project alias editing and composer controls at desktop and mobile widths',
   const run = {
     run_id: 'layout-run', session_id: 'layout-session', workspace_id: id,
     status: 'completed', mode: 'read-only', prompt: '布局测试', final_text: '已完成。',
+    context_window_tokens: 100000,
   }
   let alias: string | null = null
   await page.route('**/api/v1/**', route => {
@@ -19,7 +20,7 @@ test('project alias editing and composer controls at desktop and mobile widths',
       case 'workspaces':
         return route.fulfill({ json: {
           provider: 'deepseek', repair_enabled: true, can_submit: true, manage_workspaces: true,
-          context_window_tokens: 100000, workspaces: [
+          context_window_tokens: 200000, workspaces: [
             { id, path, label: alias ?? label, alias, default_label: label, kind: 'project' },
             { id: 'chat', kind: 'chat', label: '普通对话' },
           ],
@@ -30,6 +31,8 @@ test('project alias editing and composer controls at desktop and mobile widths',
         return route.fulfill({ json: { alias, label: alias ?? label } })
       case 'threads':
         return route.fulfill({ json: [] })
+      case 'skills':
+        return route.fulfill({ json: { skills: [], sources: [], errors: [] } })
       case 'runs':
         return route.fulfill({ json: [run] })
       case 'runs/' + run.run_id:
@@ -40,7 +43,8 @@ test('project alias editing and composer controls at desktop and mobile widths',
         }) + '\n\n'
         return route.fulfill({ contentType: 'text/event-stream', body:
           frame(1, 'model.started', { request_index: 1, input_tokens: 1000 }) +
-          frame(2, 'model.completed', { request_index: 1, input_tokens: 1234, input_estimated: false }),
+          frame(2, 'model.completed', { request_index: 1, input_tokens: 1234, input_estimated: false }) +
+          frame(3, 'tool.completed', { tool_name: 'load_skill', status: 'ok', skill_name: 'python-tests', skill_source: 'Agents' }),
         })
       }
       default:
@@ -82,18 +86,40 @@ test('project alias editing and composer controls at desktop and mobile widths',
   await trigger.press('Escape')
   await expect(tooltip).toHaveCount(0)
 
+  const activity = page.getByRole('button', { name: /执行过程.*次工具调用/ })
+  await activity.click()
+  await expect(page.getByText('python-tests', { exact: true })).toHaveAttribute('title', 'Agents')
+  await activity.click()
+
   await page.setViewportSize({ width: 320, height: 720 })
   const mode = page.getByLabel('运行模式')
+  await expect(mode).toHaveValue('read-only')
+  await expect(mode.locator('option')).toHaveText(['auto', '只读', '修改'])
   const send = page.getByRole('button', { name: '发送追问' })
-  const [circle, selector, submit, toolbar, projectPath] = await Promise.all([
-    trigger.boundingBox(), mode.boundingBox(), send.boundingBox(), page.locator('.composer-toolbar').boundingBox(),
+  const skills = page.getByRole('button', { name: '技能', exact: true })
+  const [circle, plus, selector, submit, toolbar, projectPath] = await Promise.all([
+    trigger.boundingBox(), skills.boundingBox(), mode.boundingBox(), send.boundingBox(), page.locator('.composer-toolbar').boundingBox(),
     page.locator('.composer-path').boundingBox(),
   ])
-  expect(circle!.x + circle!.width).toBeLessThan(selector!.x)
+  expect(circle!.x + circle!.width).toBeLessThan(plus!.x)
+  expect(plus!.x + plus!.width).toBeLessThan(selector!.x)
   expect(selector!.x + selector!.width).toBeLessThan(submit!.x)
   expect(Math.abs(selector!.y - submit!.y)).toBeLessThan(5)
   expect(submit!.x + submit!.width).toBeLessThan(320)
   expect(projectPath!.y).toBeGreaterThanOrEqual(toolbar!.y + toolbar!.height)
   await expect(page.locator('.composer-path')).toHaveAttribute('title', path)
   await expect(page.locator('.model-label')).toBeVisible()
+  await skills.click()
+  const menu = page.getByRole('region', { name: '技能', exact: true })
+  await expect(menu).toBeVisible()
+  const popup = (await menu.boundingBox())!
+  expect(popup.x).toBeGreaterThanOrEqual(0)
+  expect(popup.x + popup.width).toBeLessThanOrEqual(320)
+  await skills.press('Escape')
+  await expect(menu).toBeHidden()
+
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await add.click()
+  await expect(mode).toHaveValue('auto')
+  await expect(trigger).toHaveAttribute('aria-label', /等待统计 \/ 200,000/)
 })

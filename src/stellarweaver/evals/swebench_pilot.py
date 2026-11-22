@@ -18,7 +18,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict
 
 from stellarweaver.cli import build_provider, effective_config
-from stellarweaver.config import AppConfig
+from stellarweaver.config import AppConfig, ModelConfig
 from stellarweaver.domain import AgentEvent, JSONDict
 from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
@@ -39,6 +39,7 @@ INSTANCE = "marshmallow-code__marshmallow-1359"
 REPO = "marshmallow-code/marshmallow"
 BASE = "b40a0f4e33823e6d0f341f7e8684e359a99060d1"
 IMAGE = "python:3.12-slim-bookworm"
+BENCHMARK_CONTEXT_WINDOW_TOKENS = 100_000
 TESTS = ("pytest", "-q", "tests/test_fields.py", "tests/test_schema.py")
 REPRO = ("python", "/repro/reproduce.py")
 PILOT_COMMANDS = {
@@ -70,12 +71,14 @@ def write_json(path: Path, body: JSONDict) -> None:
 def git(root: Path, *argv: str) -> bytes:
     return subprocess.check_output(
         ["git", "-C", str(root), "-c", f"core.hooksPath={os.devnull}", *argv],
-        env=controlled_environment({
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_LFS_SKIP_SMUDGE": "1",
-        }),
+        env=controlled_environment(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_LFS_SKIP_SMUDGE": "1",
+            }
+        ),
         timeout=30,
     )
 
@@ -290,7 +293,7 @@ def register_fixed_tools(
         async def prepare_fixed(_: NoArguments, context: ToolContext) -> PreparedTool:
             return await prepare_run_command(
                 RunCommandArgs(argv=list(argv)),
-                replace(context, command_runner=runner),
+                replace(context, command_runner=runner, sandbox_commands=(argv,)),
             )
 
         return prepare_fixed
@@ -367,7 +370,12 @@ async def run_pilot(
         },
     )
     provider: Literal["fake", "deepseek"] = "fake" if fake_script is not None else "deepseek"
-    config = effective_config(AppConfig(), provider, "workspace-edit", True)
+    config = effective_config(
+        AppConfig(model=ModelConfig(context_window_tokens=BENCHMARK_CONTEXT_WINDOW_TOKENS)),
+        provider,
+        "benchmark",
+        True,
+    )
     config = config.model_copy(
         update={
             "limits": config.limits.model_copy(
@@ -382,7 +390,7 @@ async def run_pilot(
         }
     )
     model = (
-        FakeModel.from_script(fake_script)
+        FakeModel.from_script(fake_script, context_window_tokens=config.model.context_window_tokens)
         if fake_script is not None
         else build_provider(config, workspace, "deepseek", None, env_file, stream=True)
     )

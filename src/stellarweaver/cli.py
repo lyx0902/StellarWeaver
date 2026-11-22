@@ -20,7 +20,14 @@ from rich.console import Console
 
 from stellarweaver import __version__
 from stellarweaver.changes import ChangeObservationUnknown, ChangesManager
-from stellarweaver.config import AppConfig, ModelConfig, env_file_path, get_api_key, load_config
+from stellarweaver.config import (
+    AppConfig,
+    ModelConfig,
+    PolicyPreset,
+    env_file_path,
+    get_api_key,
+    load_config,
+)
 from stellarweaver.context import ContextBudgetExceeded, ContextManager
 from stellarweaver.domain import Message, ModelRequest, RunOutcome
 from stellarweaver.extensions import ExtensionManager
@@ -79,7 +86,12 @@ def build_provider(
 ) -> ModelProvider:
     selected = provider or config.model.provider
     if selected == "fake":
-        return FakeModel.from_script(script) if script is not None else FakeModel()
+        window = config.model.context_window_tokens
+        return (
+            FakeModel.from_script(script, context_window_tokens=window)
+            if script is not None
+            else FakeModel(context_window_tokens=window)
+        )
     if script is not None:
         raise ValueError("--script requires --provider fake")
     overrides: dict[str, object] = {"provider": selected}
@@ -98,7 +110,7 @@ def build_provider(
 def effective_config(
     config: AppConfig,
     provider: ProviderName | None,
-    policy: PolicyName | None,
+    policy: PolicyPreset | None,
     stream: bool | None,
 ) -> AppConfig:
     """Include explicit CLI overrides in the reproducible credential-free snapshot."""

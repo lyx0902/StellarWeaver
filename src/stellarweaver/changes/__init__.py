@@ -40,6 +40,94 @@ class ChangeObservationUnknown(RuntimeError):
         super().__init__(f"Git observation {stage} stopped: {self.code} ({self.status})")
 
 
+class UndoFile:
+    """Validate and restore one built-in file operation from its recorded hashes."""
+
+    def __init__(self, workspace: Workspace, artifacts_dir: Path) -> None:
+        self.workspace = workspace
+        self.artifacts_dir = artifacts_dir
+
+    @staticmethod
+    def bounded_bytes(path: Path) -> bytes:
+        with path.open("rb") as stream:
+            content = stream.read(MAX_EDIT_BYTES + 1)
+        if len(content) > MAX_EDIT_BYTES:
+            raise ToolError(
+                "UNDO_CONFLICT", "File grew beyond the edit limit; contents are preserved."
+            )
+        return content
+
+    def checked_target(self, metadata: JSONDict) -> tuple[Path, bytes | None, int]:
+        relative = metadata.get("path")
+        after = metadata.get("after_sha256")
+        mode = metadata.get("mode")
+        if not isinstance(relative, str) or not isinstance(after, str) or not isinstance(mode, int):
+            raise ToolError(
+                "UNDO_METADATA_MISSING", "Undo requires recorded path, hashes, and permissions."
+            )
+        path = self.workspace.resolve(relative)
+        raw = self.workspace.root / relative
+        if raw.is_symlink() or any(
+            parent.is_symlink()
+            for parent in raw.parents
+            if parent != self.workspace.root and parent.is_relative_to(self.workspace.root)
+        ):
+            raise ToolError("UNDO_PATH_CHANGED", "Undo refuses symlink targets.")
+        if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != mode:
+            raise ToolError(
+                "UNDO_MODE_CHANGED", "File type or permissions changed after the agent edit."
+            )
+        if path.stat().st_size > MAX_EDIT_BYTES or sha256_bytes(self.bounded_bytes(path)) != after:
+            raise ToolError(
+                "UNDO_CONFLICT",
+                "Current contents differ from the agent after hash; user changes are preserved.",
+            )
+        before = metadata.get("before_sha256")
+        if before is None:
+            return path, None, mode
+        identifier = metadata.get("before_artifact_id")
+        if not isinstance(identifier, str):
+            raise ToolError("UNDO_BACKUP_MISSING", "No before snapshot was recorded for this edit.")
+        backup = Path(identifier)
+        if not backup.is_absolute():
+            backup = self.artifacts_dir / backup
+        if backup.is_symlink() or not backup.resolve(strict=True).is_relative_to(
+            self.artifacts_dir.resolve()
+        ):
+            raise ToolError(
+                "UNDO_BACKUP_INVALID", "Before snapshot leaves the session artifact directory."
+            )
+        if backup.stat().st_size > MAX_EDIT_BYTES:
+            raise ToolError("UNDO_BACKUP_INVALID", "Before snapshot exceeds the edit size limit.")
+        previous = self.bounded_bytes(backup)
+        if sha256_bytes(previous) != before:
+            raise ToolError(
+                "UNDO_BACKUP_CHANGED", "Before snapshot hash does not match the original journal."
+            )
+        return path, previous, mode
+
+    def restore(self, path: Path, content: bytes | None, mode: int) -> None:
+        if content is None:
+            path.unlink()
+            fsync_directory(path.parent)
+            return
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent, prefix=".stellarweaver-undo-", delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+            fsync_directory(path.parent)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
 class ChangesManager:
     def __init__(
         self,
@@ -54,6 +142,7 @@ class ChangesManager:
             raise ValueError("Change manager workspace must match the session workspace")
         self.workspace.protect(store.directory)
         self.store = store
+        self.undo_file = UndoFile(self.workspace, store.artifacts_dir)
         self.policy = policy
         self.on_event = on_event
 
@@ -324,86 +413,6 @@ class ChangesManager:
         )
         return "\n".join(lines)
 
-    @staticmethod
-    def _bounded_bytes(path: Path) -> bytes:
-        with path.open("rb") as stream:
-            content = stream.read(MAX_EDIT_BYTES + 1)
-        if len(content) > MAX_EDIT_BYTES:
-            raise ToolError(
-                "UNDO_CONFLICT", "File grew beyond the edit limit; contents are preserved."
-            )
-        return content
-
-    def _checked_target(self, metadata: JSONDict) -> tuple[Path, bytes | None, int]:
-        relative = metadata.get("path")
-        after = metadata.get("after_sha256")
-        mode = metadata.get("mode")
-        if not isinstance(relative, str) or not isinstance(after, str) or not isinstance(mode, int):
-            raise ToolError(
-                "UNDO_METADATA_MISSING", "Undo requires recorded path, hashes, and permissions."
-            )
-        path = self.workspace.resolve(relative)
-        raw = self.workspace.root / relative
-        if raw.is_symlink() or any(
-            parent.is_symlink()
-            for parent in raw.parents
-            if parent != self.workspace.root and parent.is_relative_to(self.workspace.root)
-        ):
-            raise ToolError("UNDO_PATH_CHANGED", "Undo refuses symlink targets.")
-        if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != mode:
-            raise ToolError(
-                "UNDO_MODE_CHANGED", "File type or permissions changed after the agent edit."
-            )
-        if path.stat().st_size > MAX_EDIT_BYTES or sha256_bytes(self._bounded_bytes(path)) != after:
-            raise ToolError(
-                "UNDO_CONFLICT",
-                "Current contents differ from the agent after hash; user changes are preserved.",
-            )
-        before = metadata.get("before_sha256")
-        if before is None:
-            return path, None, mode
-        identifier = metadata.get("before_artifact_id")
-        if not isinstance(identifier, str):
-            raise ToolError("UNDO_BACKUP_MISSING", "No before snapshot was recorded for this edit.")
-        backup = Path(identifier)
-        if not backup.is_absolute():
-            backup = self.store.artifacts_dir / backup
-        if backup.is_symlink() or not backup.resolve(strict=True).is_relative_to(
-            self.store.artifacts_dir.resolve()
-        ):
-            raise ToolError(
-                "UNDO_BACKUP_INVALID", "Before snapshot leaves the session artifact directory."
-            )
-        if backup.stat().st_size > MAX_EDIT_BYTES:
-            raise ToolError("UNDO_BACKUP_INVALID", "Before snapshot exceeds the edit size limit.")
-        previous = self._bounded_bytes(backup)
-        if sha256_bytes(previous) != before:
-            raise ToolError(
-                "UNDO_BACKUP_CHANGED", "Before snapshot hash does not match the original journal."
-            )
-        return path, previous, mode
-
-    def _restore(self, path: Path, content: bytes | None, mode: int) -> None:
-        if content is None:
-            path.unlink()
-            fsync_directory(path.parent)
-            return
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=path.parent, prefix=".stellarweaver-undo-", delete=False
-            ) as stream:
-                temporary = Path(stream.name)
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.chmod(temporary, mode)
-            os.replace(temporary, path)
-            fsync_directory(path.parent)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-
     def _pending_undo(self) -> JSONDict | None:
         intents: dict[str, JSONDict] = {}
         for event in self.store.load_events():
@@ -470,8 +479,8 @@ class ChangesManager:
                     raise ToolError(
                         "UNDO_METADATA_MISSING", "A creation has inconsistent before metadata."
                     )
-                path, previous, mode = self._checked_target(metadata)
-                current = self._bounded_bytes(path)
+                path, previous, mode = self.undo_file.checked_target(metadata)
+                current = self.undo_file.bounded_bytes(path)
                 preview = "".join(
                     difflib.unified_diff(
                         current.decode("utf-8").splitlines(keepends=True),
@@ -498,7 +507,7 @@ class ChangesManager:
                         "message": decision["reason"],
                         "target_operation_id": target,
                     }
-                path, previous, mode = self._checked_target(metadata)
+                path, previous, mode = self.undo_file.checked_target(metadata)
                 intent = {
                     "undo_id": identifier,
                     "target_operation_id": target,
@@ -512,7 +521,7 @@ class ChangesManager:
                 }
                 await self._emit("changes.undo.started", intent)
                 started = True
-                self._restore(path, previous, mode)
+                self.undo_file.restore(path, previous, mode)
                 result = {
                     **intent,
                     "status": "ok",

@@ -23,6 +23,7 @@ from stellarweaver.web.identity import Member, load_members
 from stellarweaver.web.isolation import Isolation
 from stellarweaver.web.local_accounts import LocalConfig, is_project
 from stellarweaver.web.oidc import OIDC, OIDCConfig
+from stellarweaver.web.skills import configured_skill_roots
 from stellarweaver.web.worker import run_team_worker, run_worker
 
 
@@ -265,16 +266,6 @@ def main() -> None:
         else:
             assert token is not None
             bearers, subjects, oidc = {token: principal}, {}, None
-        skill_roots = [
-            (label, Path(path))
-            for label, name in (
-                ("Agents", "SW_WEB_AGENT_SKILLS_ROOT"),
-                ("Agents / skills-codex", "SW_WEB_NESTED_SKILLS_ROOT"),
-                ("Codex", "SW_WEB_CODEX_SKILLS_ROOT"),
-            )
-            if (path := os.getenv(name))
-            and (name != "SW_WEB_NESTED_SKILLS_ROOT" or Path(path).exists())
-        ]
         experiment_root = os.getenv("SW_WEB_EXPERIMENT_ROOT")
         app = create_app(
             engine,
@@ -290,7 +281,7 @@ def main() -> None:
             oidc=oidc,
             legacy_owner=local_owner[1] if local_owner else None,
             local=local,
-            skill_roots=skill_roots,
+            skill_roots=configured_skill_roots(),
             experiment_file=Path(experiment_root) / "report.json" if experiment_root else None,
         )
         uvicorn.run(

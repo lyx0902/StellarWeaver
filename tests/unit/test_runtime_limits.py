@@ -39,6 +39,49 @@ async def test_model_call_budget_stops_without_a_third_request(tmp_path: Path) -
         assert len(agent.results) == 2
 
 
+async def test_disabled_run_budget_keeps_processing_after_old_call_and_token_caps(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.txt").write_bytes(b"hello")
+    reply = tool_reply("read_file", {"path": "a.txt"})
+    model = FakeModel(
+        [
+            AssistantReply(
+                tool_calls=reply.tool_calls,
+                stop_reason="tool_calls",
+                usage={"prompt_tokens": 80000, "completion_tokens": 20000},
+            ),
+            reply,
+            AssistantReply("Done"),
+        ]
+    )
+    with SessionStore(tmp_path, tmp_path / "state") as store:
+        registry = ToolRegistry(
+            tmp_path,
+            PolicyEngine("read-only", workspace=tmp_path),
+            artifacts_dir=store.artifacts_dir,
+        )
+        agent = Agent(
+            model,
+            registry,
+            store=store,
+            enforce_run_budget=False,
+            limits=LimitsConfig(
+                max_model_calls=1,
+                max_tool_calls=1,
+                max_wall_seconds=1,
+                max_input_tokens_total=100,
+                max_output_tokens_total=20,
+            ),
+        )
+        assert agent._remaining() is None
+        outcome = await agent.run("Continue reading")
+        assert outcome.run_status == "completed"
+        assert outcome.model_calls == 3 and outcome.tool_calls == 2
+        assert outcome.input_tokens >= 80000 and outcome.output_tokens >= 20000
+        assert all(request.max_output_tokens == 4096 for request in model.requests)
+
+
 @pytest.mark.parametrize("budget", ["input", "output"])
 async def test_reported_token_overrun_blocks_every_side_effect(tmp_path: Path, budget: str) -> None:
     usage = {

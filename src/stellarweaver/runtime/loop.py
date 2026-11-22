@@ -121,6 +121,8 @@ class Agent:
         project_context: bool = True,
         enable_web_search: bool = False,
         harness_config: HarnessConfig | None = None,
+        enforce_run_budget: bool = True,
+        adaptive_round_retention: bool = False,
     ) -> None:
         if not 0 <= max_retries <= 2:
             raise ValueError("max_retries must be between 0 and 2")
@@ -132,11 +134,12 @@ class Agent:
         self._enable_web_search = enable_web_search
         self.set_provider(provider)
         self.limits = limits or LimitsConfig()
+        self.enforce_run_budget = enforce_run_budget
         self.store = store or SessionStore(registry.workspace.root)
         self._owns_store = store is None
         if not isinstance(self.store, SessionStore) and registry.policy.preset != "read-only":
             if (
-                registry.policy.preset != "ask"
+                registry.policy.preset not in {"ask", "auto"}
                 or not registry.policy.interactive
                 or registry.policy.approval is None
             ):
@@ -156,7 +159,7 @@ class Agent:
         self.harness_config = harness_config or HarnessConfig()
         self.preflight = preflight or empty_preflight
         self.completion_check = completion_check
-        self._context = ContextManager()
+        self._context = ContextManager(adaptive_round_retention=adaptive_round_retention)
         self._instructions = InstructionLoader(registry.workspace)
         self._repo_map = RepoMap(registry.workspace)
         self._context_boundary = 0
@@ -262,11 +265,32 @@ class Agent:
                 raise
             self._cancel_requested = True
 
-    def _remaining(self) -> float:
+    def _time_exhausted(self) -> bool:
+        return (
+            self.enforce_run_budget
+            and time.monotonic() - self._start >= self.limits.max_wall_seconds
+        )
+
+    def _remaining(self) -> float | None:
+        if not self.enforce_run_budget:
+            return None
         remaining = self.limits.max_wall_seconds - (time.monotonic() - self._start)
         if remaining <= 0:
             raise BudgetExceeded("max_wall_seconds")
         return remaining
+
+    def _output_limit(self) -> int:
+        if not self.enforce_run_budget:
+            return self.max_output_tokens
+        return min(
+            self.max_output_tokens, self.limits.max_output_tokens_total - self._output_tokens
+        )
+
+    def _tools_exhausted(self) -> bool:
+        return (
+            self.enforce_run_budget
+            and self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls
+        )
 
     async def _result(self, result: ToolResult) -> None:
         event = self.store.record_result(self._assistant_id, result)
@@ -384,21 +408,26 @@ class Agent:
             dispatch_task: asyncio.Task[ToolResult] | None = None
             try:
                 remaining = self._remaining()
-                if self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls:
+                if self._tools_exhausted():
                     raise BudgetExceeded("max_tool_calls")
                 self._tool_calls += 1
                 dispatch_task = asyncio.create_task(
                     self.registry.dispatch(call, operation_id=self._operations[call.call_id])
                 )
                 result = await asyncio.wait_for(asyncio.shield(dispatch_task), remaining)
-                if time.monotonic() - self._start >= self.limits.max_wall_seconds:
+                if self._time_exhausted():
                     stop = ("budget_exceeded", "max_wall_seconds")
             except (BudgetExceeded, TimeoutError) as exc:
-                stop = ("budget_exceeded", str(exc) or "max_wall_seconds")
+                if isinstance(exc, TimeoutError) and not self.enforce_run_budget:
+                    reason = "Tool dispatch timed out"
+                    stop = ("failed", reason)
+                else:
+                    reason = str(exc) or "max_wall_seconds"
+                    stop = ("budget_exceeded", reason)
                 result = (
                     await self._drain_dispatch(dispatch_task, call)
                     if dispatch_task is not None
-                    else self._skipped(call, str(exc) or "max_wall_seconds")
+                    else self._skipped(call, reason)
                 )
             except asyncio.CancelledError:
                 stop = ("cancelled", "user cancelled")
@@ -446,12 +475,15 @@ class Agent:
     def _checked_request(self, request: ModelRequest, input_estimate: int) -> ModelRequest:
         self._remaining()
         model_limit = self.limits.max_model_calls
-        if model_limit is not None and self._model_calls >= model_limit:
+        if self.enforce_run_budget and model_limit is not None and self._model_calls >= model_limit:
             raise BudgetExceeded("max_model_calls")
-        available = self.limits.max_output_tokens_total - self._output_tokens
+        available = self._output_limit()
         if available <= 0:
             raise BudgetExceeded("max_output_tokens_total")
-        if self._input_tokens + input_estimate > self.limits.max_input_tokens_total:
+        if (
+            self.enforce_run_budget
+            and self._input_tokens + input_estimate > self.limits.max_input_tokens_total
+        ):
             raise BudgetExceeded("max_input_tokens_total (estimated reservation)")
         checked = replace(request, max_output_tokens=min(request.max_output_tokens, available))
         window = self.provider.capabilities().context_window_tokens
@@ -607,7 +639,7 @@ class Agent:
                     "model.failed",
                     {
                         "request_index": self._model_calls,
-                        "reason": "total deadline",
+                        "reason": "total deadline" if self.enforce_run_budget else "model timeout",
                         **accounting,
                     },
                 )
@@ -618,10 +650,14 @@ class Agent:
                             "request_index": self._model_calls,
                             "discarded": True,
                             "chunk_count": self._chunk_index,
-                            "reason": "total deadline",
+                            "reason": "total deadline"
+                            if self.enforce_run_budget
+                            else "model timeout",
                         },
                     )
-                raise BudgetExceeded("max_wall_seconds during model request") from exc
+                if self.enforce_run_budget:
+                    raise BudgetExceeded("max_wall_seconds during model request") from exc
+                raise ProviderError("Model request timed out") from exc
             except Exception as exc:
                 error = (
                     exc
@@ -668,7 +704,8 @@ class Agent:
                     header_delay = error.retry_after_seconds
                     if not math.isnan(header_delay):
                         delay = max(delay, header_delay)
-                if delay >= self._remaining():
+                remaining = self._remaining()
+                if remaining is not None and delay >= remaining:
                     raise BudgetExceeded("max_wall_seconds during Retry-After/backoff") from None
                 await self._emit(
                     "model.retry_scheduled",
@@ -762,9 +799,7 @@ class Agent:
         window = self.provider.capabilities().context_window_tokens
         if window is None:
             raise BudgetExceeded("A reliable context_window_tokens value is required")
-        output = min(
-            self.max_output_tokens, self.limits.max_output_tokens_total - self._output_tokens
-        )
+        output = self._output_limit()
         if output < 1:
             raise BudgetExceeded("max_output_tokens_total")
         instructions = (
@@ -804,16 +839,18 @@ class Agent:
                 if evidence is not None and key != self._last_evidence:
                     await self._emit("task.evidence", evidence)
                     self._last_evidence = key
-            if self.harness_config.budget_guidance and not shrink:
+            if self.harness_config.budget_guidance and self.enforce_run_budget and not shrink:
                 model_left = (
                     None
                     if self.limits.max_model_calls is None
                     else self.limits.max_model_calls - self._model_calls
                 )
+                remaining = self._remaining()
+                assert remaining is not None
                 guidance = self._task_evidence.guidance(
                     model_left,
                     self.limits.max_tool_calls - self._tool_calls - self._completion_attempts,
-                    self._remaining(),
+                    remaining,
                     self.limits.max_input_tokens_total - self._input_tokens,
                     self.limits.max_output_tokens_total - self._output_tokens,
                 )
@@ -939,7 +976,9 @@ class Agent:
                         "input_budget": projection.input_budget,
                         "through_message_position": projection.through_message_position,
                         "usage_estimated": True,
-                        "strategy": "deterministic_recorded_evidence",
+                        "strategy": projection.summary.get(
+                            "retention", "deterministic_recorded_evidence"
+                        ),
                     },
                 )
                 self._last_projection_key = key
@@ -1178,8 +1217,12 @@ class Agent:
             except (BudgetExceeded, ContextBudgetExceeded) as exc:
                 completion = self._completion("budget_exceeded", str(exc))
             except TimeoutError:
-                completion = self._completion(
-                    "budget_exceeded", "max_wall_seconds during setup or execution"
+                completion = (
+                    self._completion(
+                        "budget_exceeded", "max_wall_seconds during setup or execution"
+                    )
+                    if self.enforce_run_budget
+                    else self._completion("failed", "Setup or execution timed out")
                 )
             except SessionBusy as exc:
                 completion = self._completion("blocked", f"WORKSPACE_BUSY: {exc}")
@@ -1222,9 +1265,7 @@ class Agent:
                     (completion[1] if completion[0] == "cancelled" else "user cancelled")
                     + ("; " + cleanup_problem if cleanup_problem else ""),
                 )
-            elif (
-                deadline.expired() or time.monotonic() - self._start >= self.limits.max_wall_seconds
-            ):
+            elif deadline.expired() or self._time_exhausted():
                 completion = self._completion(
                     "budget_exceeded",
                     "max_wall_seconds including setup and cleanup"
@@ -1244,20 +1285,20 @@ class Agent:
     async def _check_completion(self) -> bool:
         """Run the opt-in verifier and request at most one repair in this run."""
         assert self.completion_check is not None
-        if self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls:
+        if self._tools_exhausted():
             raise BudgetExceeded("max_tool_calls before completion verification")
         remaining = self._remaining()
         self._completion_attempts += 1
         attempt = self._completion_attempts
         await self._emit("reproduction.started", {"attempt": attempt})
-        proof = await self.completion_check(remaining)
+        proof = await self.completion_check(remaining if remaining is not None else math.inf)
         record = {"attempt": attempt, **asdict(proof)}
         self._completion_proofs.append(record)
         await self._emit("reproduction.completed", record)
         if proof.status != "failed" or attempt != 1:
             return False
         model_limit = self.limits.max_model_calls
-        if model_limit is not None and self._model_calls >= model_limit:
+        if self.enforce_run_budget and model_limit is not None and self._model_calls >= model_limit:
             raise BudgetExceeded("max_model_calls after failed completion verification")
         message = Message(
             "user",
@@ -1322,12 +1363,12 @@ class Agent:
             initial_stop: tuple[RunStatus, str] | None = None
             if reply.stop_reason not in {"stop", "tool_calls", "end_turn"}:
                 initial_stop = ("failed", f"incomplete model response: {reply.stop_reason}")
-            elif (
+            elif self.enforce_run_budget and (
                 self._input_tokens > self.limits.max_input_tokens_total
                 or self._output_tokens > self.limits.max_output_tokens_total
             ):
                 initial_stop = ("budget_exceeded", "reported model token budget exceeded")
-            elif time.monotonic() - self._start >= self.limits.max_wall_seconds:
+            elif self._time_exhausted():
                 initial_stop = ("budget_exceeded", "max_wall_seconds")
             if reply.tool_calls:
                 stop = await self._tools(reply, initial_stop)
