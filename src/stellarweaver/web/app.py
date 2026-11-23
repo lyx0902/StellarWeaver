@@ -177,7 +177,7 @@ class ReviewFeedback(BaseModel):
 
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    decision: Literal["approve", "deny"]
+    decision: Literal["approve", "approve-session", "deny"]
 
 
 class WorkspaceAlias(BaseModel):
@@ -223,11 +223,17 @@ def public_event(event: JSONDict) -> JSONDict:
                 "before_tokens_estimated",
                 "after_tokens_estimated",
                 "input_budget",
+                "calibration_factor",
+                "before_raw_utf8_bytes",
+                "after_raw_utf8_bytes",
             )
             if key in payload
         }
     elif kind in {"changes.undo.started", "changes.undo.completed"}:
-        visible = {k: payload[k] for k in ("path", "target_operation_id", "status") if k in payload}
+        visible = {
+            k: payload[k] for k in ("path", "paths", "target_operation_id", "status")
+            if k in payload
+        }
     elif kind == "tool.completed":
         visible = {k: payload[k] for k in ("tool_name", "status", "operation_id") if k in payload}
         if payload.get("status") == "ok":
@@ -255,7 +261,12 @@ def public_event(event: JSONDict) -> JSONDict:
                 "input_tokens",
                 "input_estimated",
                 "estimated",
+                "input_estimate",
+                "input_estimate_error_ratio",
+                "calibration_factor",
+                "raw_input_utf8_bytes",
                 "purpose",
+                "exploration_id",
             )
             if key in payload
         }
@@ -283,6 +294,9 @@ def public_event(event: JSONDict) -> JSONDict:
                 "patch_staging",
                 "task_evidence",
                 "budget_guidance",
+                "calibrated_context_budget",
+                "sticky_context_checkpoint",
+                "protect_fresh_tool_output",
             )
             if key in payload
         }
@@ -717,6 +731,23 @@ def create_app(
             raise HTTPException(404, "找不到会话。")
         return Response(status_code=204)
 
+    @app.delete("/api/v1/threads/{session_id}", status_code=202)
+    def delete_thread(session_id: UUID, p: Principal = require_principal) -> JSONDict:
+        require_write(p)
+        if p.access is None or p.member_id is None:
+            raise HTTPException(404, "找不到会话。")
+        try:
+            accepted = db.delete_thread(
+                engine, str(p.tenant), str(session_id), p.access, p.member_id
+            )
+        except db.RunUnavailable as exc:
+            raise HTTPException(
+                409, "会话有待运行的任务或正在使用它的复验，请等待任务结束。"
+            ) from exc
+        if not accepted:
+            raise HTTPException(404, "找不到会话。")
+        return {"status": "accepted"}
+
     @app.get("/api/v1/runs")
     async def runs(
         p: Principal = require_principal,
@@ -978,6 +1009,15 @@ def create_app(
 
         def read_export() -> str:
             with db.scoped(engine, str(p.tenant)) as conn:
+                visible = conn.execute(
+                    text("""
+                        SELECT id FROM sw.sessions
+                        WHERE id=:session AND deleted_at IS NULL FOR SHARE
+                    """),
+                    {"session": row["session_id"]},
+                ).scalar_one_or_none()
+                if visible is None:
+                    raise HTTPException(404, "Run not found")
                 output = render_export(build_export(conn, row), format)
                 db.audit(conn, str(p.tenant), p.member_id, str(run_id), "run.export")
                 return output
@@ -1031,7 +1071,8 @@ def create_app(
                     "target": {
                         "operation_id": edit["operation_id"],
                         "tool_name": edit["tool_name"],
-                        "path": edit["data"]["path"],
+                        "path": edit["data"].get("path", ""),
+                        **({"paths": edit["data"]["paths"]} if edit["tool_name"] == "apply_patch" else {}),
                     }
                     if edit
                     else None
@@ -1065,7 +1106,12 @@ def create_app(
         def read_report() -> JSONDict | None:
             with db.scoped(engine, tenant) as conn:
                 value: JSONDict | None = conn.execute(
-                    text("SELECT report FROM sw.runs WHERE id=:id"), {"id": str(run_id)}
+                    text("""
+                        SELECT r.report FROM sw.runs r JOIN sw.sessions s
+                          ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
+                        WHERE r.id=:id AND s.deleted_at IS NULL
+                    """),
+                    {"id": str(run_id)},
                 ).scalar_one_or_none()
                 if value is not None:
                     db.audit(conn, tenant, actor, str(run_id), "report.read")
@@ -1200,14 +1246,14 @@ def create_app(
             raise HTTPException(422, str(exc)) from exc
         except db.RequestConflict as exc:
             raise HTTPException(409, "Request ID already used with different input") from exc
+        except db.ThreadUnavailable as exc:
+            raise HTTPException(409, "补丁来源会话已不可用。") from exc
         except db.ExecutionModeConflict as exc:
             raise HTTPException(503, "Workbench database is in inline mode") from exc
         except db.RunUnavailable as exc:
             raise HTTPException(429, "Workbench queue is full") from exc
         except db.QuotaReached as exc:
             raise HTTPException(429, "Account quota reached") from exc
-        except db.ThreadUnavailable as exc:
-            raise HTTPException(404, "Workspace not available") from exc
         return ids
 
     @app.get("/api/v1/runs/{run_id}/events", response_class=StreamingResponse)
@@ -1247,6 +1293,10 @@ def create_app(
                     )
                 except OperationalError:
                     # The browser reconnects with its last committed cursor.
+                    return
+                except HTTPException as exc:
+                    if exc.status_code != 404:
+                        raise
                     return
                 for event in page:
                     cursor = event["seq"]

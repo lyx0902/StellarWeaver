@@ -23,9 +23,11 @@ from stellarweaver.instructions import InstructionLoader  # noqa: E402
 from stellarweaver.providers.fake import FakeModel  # noqa: E402
 from stellarweaver.web import db  # noqa: E402
 from stellarweaver.web.app import LOCAL_TENANT, create_app  # noqa: E402
+from stellarweaver.web.identity import Access, Member  # noqa: E402
 from stellarweaver.web.isolation import DockerRunner, Isolation  # noqa: E402
 from stellarweaver.web.local_accounts import LocalConfig  # noqa: E402
 from stellarweaver.web.oidc import SESSION_COOKIE  # noqa: E402
+from stellarweaver.web.thread_cleanup import purge_deleted_thread  # noqa: E402
 from stellarweaver.web.worker import run_team_worker  # noqa: E402
 
 HEADERS = {"X-StellarWeaver-Request": "1"}
@@ -165,6 +167,140 @@ def completed(client: TestClient, run_id: str, *, approve: bool = False):
             assert decision.status_code == 204, decision.text
         time.sleep(0.1)
     pytest.fail("Queued run did not complete")
+
+
+@pytest.mark.postgres
+def test_thread_cleanup_retries_and_preserves_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from stellarweaver.web import thread_cleanup
+
+    dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
+    if not dsn:
+        pytest.skip("requires a migrated PostgreSQL test database")
+    engine = db.engine_for(dsn)
+    tenant_id, member_id, other_member, workspace = uuid4(), uuid4(), uuid4(), str(uuid4())
+    tenant, member = str(tenant_id), str(member_id)
+    db.register(engine, tenant, {workspace: "thread-delete-test"})
+    for actor in (member_id, other_member):
+        db.register_member(
+            engine,
+            Member(id=actor, tenant=tenant_id, role="admin", name="Tester", workspace_indexes=(0,)),
+            [workspace],
+        )
+    access = Access((workspace,), member)
+    source, _ = db.submit(
+        engine, tenant, workspace, str(uuid4()), "private prompt", "fake", member=member
+    )
+    session, run = source["session_id"], source["run_id"]
+    with pytest.raises(db.RunUnavailable):
+        db.delete_thread(engine, tenant, session, access, member)
+    with db.scoped(engine, tenant) as conn:
+        conn.execute(text("UPDATE sw.runs SET status='completed' WHERE id=:run"), {"run": run})
+        db.model_usage(
+            conn,
+            tenant,
+            member,
+            run,
+            "model.started",
+            {"request_index": 1, "input_tokens": 20, "max_output_tokens": 5},
+        )
+    review = {"run_id": run, "session_id": session, "patch": "private source patch"}
+    verification, _ = db.submit(
+        engine,
+        tenant,
+        workspace,
+        str(uuid4()),
+        "verification",
+        "fake",
+        member=member,
+        review=review,
+        enqueue=True,
+    )
+    with pytest.raises(db.RunUnavailable):
+        db.delete_thread(engine, tenant, session, access, member)
+    with db.scoped(engine, tenant) as conn:
+        conn.execute(
+            text("UPDATE sw.runs SET status='completed' WHERE id=:run"),
+            {"run": verification["run_id"]},
+        )
+        conn.execute(
+            text("DELETE FROM sw.run_jobs WHERE run_id=:run"), {"run": verification["run_id"]}
+        )
+    assert not db.delete_thread(
+        engine, tenant, session, Access((workspace,), str(other_member)), str(other_member)
+    )
+    assert db.delete_thread(engine, tenant, session, access, member)
+    assert db.delete_thread(engine, tenant, session, access, member)
+    assert db.snapshot(engine, tenant, run, access) is None
+    with pytest.raises(db.ThreadUnavailable):
+        db.submit(
+            engine,
+            tenant,
+            workspace,
+            str(uuid4()),
+            "another review",
+            "fake",
+            member=member,
+            review=review,
+            enqueue=True,
+        )
+    artifacts = tmp_path / tenant / run
+    artifacts.mkdir(parents=True)
+    (artifacts / "report.txt").write_text("private output")
+    retained = tmp_path / tenant / verification["run_id"]
+    retained.mkdir()
+
+    def fail_once(root: Path, path: Path) -> None:
+        raise PermissionError("artifact locked")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(thread_cleanup, "_remove_state_tree", fail_once)
+        purge_deleted_thread(engine, tmp_path, tenant)
+    with db.scoped(engine, tenant) as conn:
+        assert (
+            conn.execute(text("SELECT prompt FROM sw.runs WHERE id=:id"), {"id": run}).scalar_one()
+            == ""
+        )
+        assert conn.execute(text("SELECT sum(tokens) FROM sw.model_usage")).scalar_one() == 25
+        assert (
+            conn.execute(
+                text("SELECT count(*) FROM sw.audit WHERE action='thread.delete'")
+            ).scalar_one()
+            == 1
+        )
+        assert (
+            conn.execute(
+                text("SELECT purged_at FROM sw.sessions WHERE id=:session"), {"session": session}
+            ).scalar_one()
+            is None
+        )
+        conn.execute(
+            text("UPDATE sw.sessions SET purge_after=now() WHERE id=:session"), {"session": session}
+        )
+    assert artifacts.is_dir()
+    remove_state_tree = thread_cleanup._remove_state_tree
+
+    def interrupt_cleanup(root: Path, path: Path) -> None:
+        remove_state_tree(root, path)
+        if path == artifacts:
+            raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch, pytest.raises(KeyboardInterrupt):
+        patch.setattr(thread_cleanup, "_remove_state_tree", interrupt_cleanup)
+        purge_deleted_thread(engine, tmp_path, tenant)
+    assert not artifacts.exists()
+    purge_deleted_thread(engine, tmp_path, tenant)
+    assert not artifacts.exists()
+    assert retained.is_dir()
+    with db.scoped(engine, tenant) as conn:
+        assert (
+            conn.execute(
+                text("SELECT purged_at FROM sw.sessions WHERE id=:session"), {"session": session}
+            ).scalar_one()
+            is not None
+        )
+    engine.dispose()
 
 
 @pytest.mark.postgres
@@ -325,7 +461,34 @@ def test_password_accounts_workspace_selection_archives_and_chat(
             followup_events = owner.get(f"/api/v1/runs/{followup_id}/events").text
             assert "离线普通对话" in followup_events
             assert "tool.completed" not in followup_events
-            assert (state / "chat" / tenant / session_id).is_dir()
+            chat_state = state / "chat" / tenant / session_id
+            assert chat_state.is_dir()
+            assert other.delete(archive, headers=HEADERS).status_code == 404
+            assert owner.delete(archive, headers=HEADERS).status_code == 202
+            assert owner.delete(archive, headers=HEADERS).status_code == 202
+            assert not any(
+                row["session_id"] == session_id for row in owner.get("/api/v1/threads").json()
+            )
+            for run_id in (chat_id, followup_id):
+                for suffix in ("", "/events", "/report", "/export", "/patch"):
+                    assert owner.get(f"/api/v1/runs/{run_id}{suffix}").status_code == 404
+            assert start(owner, ws[-1]["id"], "deleted", session_id).status_code == 409
+            deadline = time.monotonic() + 8
+            while chat_state.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert not chat_state.exists()
+            project_session = project.json()["session_id"]
+            project_state = state / "g4" / tenant / project_session
+            assert project_state.is_dir()
+            assert (
+                owner.delete(f"/api/v1/threads/{project_session}", headers=HEADERS).status_code
+                == 202
+            )
+            deadline = time.monotonic() + 8
+            while project_state.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            assert not project_state.exists()
+            assert (root / "second" / ".git").is_dir()
             assert not api_state.exists()
             (root / "second").rename(root / "moved-second")
             missing = start(owner, ws[1]["id"], "missing project")

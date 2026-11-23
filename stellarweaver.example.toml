@@ -38,6 +38,7 @@ trigger_ratio = 0.80
 target_ratio = 0.55
 reserve_tokens = 2048
 recent_complete_rounds = 6
+fresh_tool_rounds = 2
 
 [retry]
 max_retries = 2
@@ -51,3 +52,17 @@ repair_controller = "off"
 patch_staging = false
 task_evidence = false
 budget_guidance = false
+pipeline_metrics = false
+multi_edit_tools = false
+post_edit_syntax_hook = false
+smart_tool_truncation = false
+navigation_prefilter = false
+multi_file_apply = false
+parallel_read_tools = false
+scoped_test_grants = false
+incremental_sandbox_snapshots = false
+import_aware_repomap = false
+subagent_exploration = false
+calibrated_context_budget = false
+sticky_context_checkpoint = false
+protect_fresh_tool_output = false

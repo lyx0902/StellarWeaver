@@ -18,6 +18,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as SchemaValidationError
 from pydantic import BaseModel, ValidationError
 
+from stellarweaver.config import HarnessConfig
 from stellarweaver.domain import JSONDict, Message, ToolCall, ToolResult, ToolStatus
 from stellarweaver.policy import BENCHMARK_TOOLS, DS_SEARCH, READ_TOOLS, PolicyEngine
 from stellarweaver.policy.hooks import Decision, HookEvent, HookManager, Stage
@@ -35,6 +36,8 @@ class ToolContext:
     operation_id: str = ""
     command_runner: CommandRunner | None = None
     sandbox_commands: tuple[tuple[str, ...], ...] | None = None
+    post_edit_syntax_hook: bool = False
+    parallel_read: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,49 @@ class RegisteredTool:
     authorization_tool: Literal["run_command"] | None = None
 
 
+_PARALLEL_READS = frozenset(
+    {
+        "list_files",
+        "read_file",
+        "search_text",
+        "find_symbol",
+        "find_references",
+        "find_related_tests",
+        "git_status",
+        "git_diff",
+    }
+)
+
+
+class ReadDispatch:
+    """Coordinate serial journal stages around one concurrent read-only execution."""
+
+    def __init__(self) -> None:
+        self.prepared: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self.execute = asyncio.Event()
+        self.executed = asyncio.Event()
+        self.publish = asyncio.Event()
+        self.abandoned = False
+
+    def task_done(self, _task: asyncio.Task[ToolResult]) -> None:
+        if not self.prepared.done():
+            self.prepared.set_result(False)
+        self.executed.set()
+
+    async def before_execute(self, *, batch: bool) -> None:
+        if not self.prepared.done():
+            self.prepared.set_result(batch)
+        await self.execute.wait()
+
+    async def before_publish(self) -> None:
+        if not self.prepared.done():
+            self.prepared.set_result(False)
+        self.executed.set()
+        if self.abandoned:
+            raise asyncio.CancelledError()
+        await self.publish.wait()
+
+
 class ToolRegistry:
     def __init__(
         self,
@@ -74,6 +120,7 @@ class ToolRegistry:
         hooks: HookManager | None = None,
         command_boundary: str | None = None,
         sandbox_commands: tuple[tuple[str, ...], ...] | None = None,
+        harness: HarnessConfig | None = None,
     ) -> None:
         self.workspace = Workspace(workspace)
         self.policy = policy
@@ -82,6 +129,7 @@ class ToolRegistry:
         self.command_runner = command_runner
         self.command_boundary = command_boundary
         self.sandbox_commands = sandbox_commands
+        self.post_edit_syntax_hook = harness.post_edit_syntax_hook if harness else False
         self.hooks = hooks or HookManager()
         self.artifacts_dir = artifacts_dir or self.workspace.root / ".stellarweaver" / "artifacts"
         self._tools: dict[str, RegisteredTool] = {}
@@ -92,7 +140,8 @@ class ToolRegistry:
         from stellarweaver.tools import commands, files, git, search
 
         if builtins:
-            for module in (files, search, commands, git):
+            files.register_tools(self, multi_edit=harness.multi_edit_tools if harness else False)
+            for module in (search, commands, git):
                 module.register_tools(self)
 
     def register(
@@ -180,9 +229,22 @@ class ToolRegistry:
             if inspect.isawaitable(result):
                 await result
 
-    async def dispatch(self, call: ToolCall, *, operation_id: str | None = None) -> ToolResult:
+    def can_parallel_read(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        return bool(
+            name in _PARALLEL_READS
+            and tool is not None
+            and tool.read_only
+            and not tool.remote
+            and tool.schema is None
+            and tool.authorization_tool is None
+        )
+
+    async def dispatch(
+        self, call: ToolCall, *, operation_id: str | None = None, read: ReadDispatch | None = None
+    ) -> ToolResult:
         with ExitStack() as scope:
-            return await self._dispatch(call, operation_id or uuid.uuid4().hex, scope)
+            return await self._dispatch(call, operation_id or uuid.uuid4().hex, scope, read)
 
     async def _run_hooks(
         self,
@@ -218,7 +280,11 @@ class ToolRegistry:
         return decision
 
     async def _dispatch(
-        self, call: ToolCall, operation_id: str, write_scope: ExitStack
+        self,
+        call: ToolCall,
+        operation_id: str,
+        write_scope: ExitStack,
+        read: ReadDispatch | None,
     ) -> ToolResult:
         started = time.monotonic()
         status: ToolStatus = "error"
@@ -231,6 +297,8 @@ class ToolRegistry:
             tool = self._tools.get(call.name)
             if tool is None:
                 raise ToolError("UNKNOWN_TOOL", f"Unknown tool: {call.name}")
+            if read is not None and not self.can_parallel_read(call.name):
+                raise ToolError("AUTHORIZATION_CHANGED", "The registered read tool changed.")
             try:
                 raw = json.loads(call.arguments_json)
             except (json.JSONDecodeError, ValueError) as exc:
@@ -263,6 +331,8 @@ class ToolRegistry:
                 operation_id,
                 self.command_runner,
                 self.sandbox_commands,
+                self.post_edit_syntax_hook,
+                read is not None,
             )
             prepared = await tool.prepare(args, context)
             policy, hooks = self.policy, self.hooks
@@ -335,6 +405,8 @@ class ToolRegistry:
             if self.before_execute is not None:
                 await self.before_execute(call, deepcopy(invocation))
             force = await self._run_hooks(hooks, "PreToolUse", invocation) == "ask"
+            if force and read is not None:
+                await read.before_execute(batch=False)
             decision = await policy.decide(
                 authorized, force_approval=force, before_approval=permission_hook
             )
@@ -354,6 +426,9 @@ class ToolRegistry:
                 await revalidate()
                 await self._record("tool.started", deepcopy(invocation))
                 await revalidate()
+                if read is not None:
+                    await read.before_execute(batch=True)
+                    await revalidate()
                 executing = True
                 outcome = await prepared.execute()
                 status = cast(ToolStatus, outcome.get("status", "ok"))
@@ -362,6 +437,8 @@ class ToolRegistry:
                 payload = outcome.get("data", {})
                 content = outcome.get("content", json.dumps(payload, ensure_ascii=False))
                 artifacts = tuple(outcome.get("artifact_ids", ()))
+                if read is not None:
+                    await read.before_publish()
                 post = await self._run_hooks(
                     hooks,
                     "PostToolUse",
@@ -378,6 +455,8 @@ class ToolRegistry:
             content = f"WORKSPACE_BUSY: {exc}"
         except ToolError as exc:
             if exc.code in HARD_PATH_ERRORS or exc.code == "AUTHORIZATION_CHANGED":
+                if read is not None and read.prepared.done() and read.prepared.result():
+                    await read.before_publish()
                 await self._record(
                     "security.guard_denied",
                     {
@@ -403,6 +482,8 @@ class ToolRegistry:
             status = "unknown"
             payload = ToolError("EXECUTION_UNKNOWN", f"{type(exc).__name__}: {exc}").as_data()
             content = f"EXECUTION_UNKNOWN: {type(exc).__name__}: {exc}"
+        if read is not None:
+            await read.before_publish()
         result = ToolResult(
             call.call_id,
             operation_id,

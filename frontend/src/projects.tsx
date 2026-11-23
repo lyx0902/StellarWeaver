@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useId, useRef, useState, type FormEvent, type MouseEvent } from 'react'
 import { api, type Thread, type Workspace } from './api'
 import { runLabel } from './conversation'
 
@@ -100,12 +100,83 @@ export function ProjectAliasDialog({ item, onClose, onSave }: {
   </dialog>
 }
 
+export function DeleteThreadDialog({ title, project, onClose, onDelete }: {
+  title: string; project: boolean; onClose: () => void; onDelete: () => Promise<void>
+}) {
+  const dialog = useRef<HTMLDialogElement>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => { dialog.current?.showModal() }, [])
+
+  async function remove() {
+    setBusy(true)
+    setError('')
+    try {
+      await onDelete()
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setBusy(false)
+    }
+  }
+
+  return <dialog className="project-picker delete-thread-dialog" ref={dialog}
+    aria-labelledby="delete-thread-title" aria-describedby="delete-thread-description"
+    onCancel={event => {
+      event.preventDefault()
+      if (!busy) onClose()
+    }}>
+    <h2 id="delete-thread-title">删除会话</h2>
+    <p className="delete-thread-name">{title}</p>
+    <p id="delete-thread-description">此会话的所有消息、运行记录和制品将被永久删除。
+      {project && '项目会话专属工作区中尚未导出的改动也会一并清理。'}</p>
+    {error && <p className="error" role="alert">{error}</p>}
+    <footer>
+      <button type="button" autoFocus disabled={busy} onClick={onClose}>取消</button>
+      <button type="button" className="delete-thread-confirm" disabled={busy}
+        onClick={() => void remove()}>{busy ? '正在删除…' : '确认删除'}</button>
+    </footer>
+  </dialog>
+}
+
+function ThreadActions({ thread, label, onArchive, onDelete }: {
+  thread: Thread; label: string; onArchive: () => void; onDelete: () => void
+}) {
+  const id = useId()
+  const popup = useRef<HTMLDivElement>(null)
+
+  function place(event: MouseEvent<HTMLButtonElement>) {
+    const menu = popup.current
+    if (!menu) return
+    const anchor = event.currentTarget.getBoundingClientRect()
+    menu.style.left = Math.max(6, anchor.right - 112) + 'px'
+    menu.style.top = (anchor.bottom + 84 <= window.innerHeight ? anchor.bottom + 4 : anchor.top - 80) + 'px'
+  }
+
+  return <>
+    <button className="thread-action-trigger" type="button" title="会话操作"
+      aria-label={'会话操作 ' + label} popoverTarget={id} onClick={place}>⋯</button>
+    <div id={id} ref={popup} className="thread-actions" popover="auto" role="group" aria-label={'会话操作 ' + label}>
+      <button type="button" disabled={thread.status === 'active'} onClick={() => {
+        popup.current?.hidePopover()
+        onArchive()
+      }}>{thread.archived ? '恢复' : '归档'}</button>
+      {thread.can_delete && <button type="button" className="thread-delete-action"
+        disabled={thread.status === 'active'} onClick={() => {
+          popup.current?.hidePopover()
+          onDelete()
+        }}>删除</button>}
+    </div>
+  </>
+}
+
 export function WorkspaceGroup({ item, threads, selectedSession, runId, selectedWorkspace, waiting, writable, manage,
-  onNew, onOpen, onArchive, onRename }: {
+  onNew, onOpen, onArchive, onRename, onDelete }: {
   item: Workspace; threads: Thread[]; selectedSession?: string; runId: string; selectedWorkspace?: string
   waiting: boolean; writable: boolean; manage: boolean; onNew: (id: string) => void
   onOpen: (id: string) => void; onArchive: (thread: Thread) => void
   onRename: (item: Workspace) => void
+  onDelete: (thread: Thread, label: string, project: boolean) => void
 }) {
   function row(thread: Thread) {
     const selected = thread.session_id === selectedSession || thread.run_id === runId
@@ -118,9 +189,8 @@ export function WorkspaceGroup({ item, threads, selectedSession, runId, selected
         {(thread.status !== 'completed' || thread.needs_approval || (selected && waiting)) &&
           <small className={status === '待审批' ? 'pending-label' : ''}>{status}</small>}
       </button>
-      {manage && writable && thread.status !== 'active' && <button className="archive-action" type="button"
-        aria-label={(thread.archived ? '恢复 ' : '归档 ') + label} title={thread.archived ? '恢复' : '归档'}
-        onClick={() => onArchive(thread)}>{thread.archived ? '↶' : '⋯'}</button>}
+      {writable && (manage || thread.can_delete) && <ThreadActions thread={thread} label={label}
+        onArchive={() => onArchive(thread)} onDelete={() => onDelete(thread, label, item.kind !== 'chat')} />}
     </div>
   }
   const archived = threads.filter(thread => thread.archived)

@@ -82,26 +82,32 @@ def classify(result: ToolResult) -> str | None:
 class RepairController:
     def __init__(self, *, enforce: bool) -> None:
         self.enforce = enforce
-        self.edits: dict[str, tuple[str | None, str]] = {}
+        self.edits: dict[str, tuple[str | None, str | None]] = {}
         self.failures: Counter[tuple[str | None, str, str]] = Counter()
         self.notes: JSONDict | None = None
         self._note_subject: str | None = None
 
     def observe(self, result: ToolResult, *, command: bool) -> tuple[JSONDict | None, bool]:
         data = result.data
-        path, after = data.get("path"), data.get("after_sha256")
-        if (
-            result.tool_name in {"create_file", "edit_file"}
-            and result.status == "ok"
-            and isinstance(path, str)
-            and isinstance(after, str)
-        ):
-            initial = self.edits.get(path, (data.get("before_sha256"), after))[0]
-            if initial == after:
-                self.edits.pop(path, None)
-            else:
-                self.edits[path] = (initial, after)
-            self.notes = None
+        path = data.get("path")
+        if result.status == "ok" and result.tool_name in {
+            "create_file",
+            "edit_file",
+            "apply_patch",
+        }:
+            edited = data.get("files", []) if result.tool_name == "apply_patch" else [data]
+            for entry in edited:
+                relative, digest = entry.get("path"), entry.get("after_sha256")
+                if not isinstance(relative, str) or not (
+                    isinstance(digest, str) or entry.get("action") == "delete"
+                ):
+                    continue
+                initial = self.edits.get(relative, (entry.get("before_sha256"), digest))[0]
+                if initial == digest:
+                    self.edits.pop(relative, None)
+                else:
+                    self.edits[relative] = (initial, digest)
+                self.notes = None
         candidate = fingerprint(self.edits) if self.edits else None
         diagnostic = data.get("diagnostic", {})
         details = data.get("details", {})

@@ -159,6 +159,8 @@ erDiagram
 | `created_at` | `timestamptz`，默认 `now()`。 |
 | `isolated` | `boolean`，默认 `false`。标识线程是否采用隔离任务工作区。 |
 | `archived_at` | `timestamptz`，可为 `NULL`，非空表示已归档。 |
+| `deleted_at` | `timestamptz`，记录删除请求受理时间。受理后会话退出列表，历史、导出和续接入口关闭。 |
+| `purge_after`、`purged_at` | `timestamptz`，分别记录 worker 可开始或重试清理的时间，以及全部清理完成的时间。 |
 
 线程持有工作区关联、归属和事件计数，让新追问另建运行时仍沿用同一历史及事件序列。续接提交会锁住线程行，校验工作区、归属、隔离模式和归档状态，再判断上一轮能否继续。归档通过写入时间戳实现，取消归档将其清空，已有运行与证据仍保留。隔离线程的实际 worktree 由租户和线程 ID 在状态卷中定位。 [提交、历史和归档](../src/stellarweaver/web/db.py) · [工作区定位](../src/stellarweaver/web/isolation.py)
 
@@ -315,6 +317,7 @@ erDiagram
 | `g9_auto_mode` | 扩充运行模式约束，接纳 `auto`。既有会话的模式值沿用原记录。 |
 | `g10_workbench_parity` | 增加工作区技能信任、运行级技能选择和撤销请求。将旧默认日额度迁移为每周 10,000,000 tokens，保留明细和已配置的非默认数值。 |
 | `g11_context_window` | 保存运行提交时的模型窗口，从已有主模型请求回填历史窗口。 |
+| `g12_thread_deletion` | 增加会话删除和清理状态。Worker 清理会话正文和制品，审计与用量继续关联保留的运行标识。 |
 
 通过 Compose 启动时，`migrate` 服务先用管理员权限升级，再启动日常服务。开发环境可以用 `STELLARWEAVER_MIGRATION_DSN` 指定管理员 DSN 后运行 `uv run --locked --extra web python -m stellarweaver.web migrate`，并通过 `STELLARWEAVER_DATABASE_DSN` 为 API 或 worker 提供应用账号 DSN。数据库镜像初始化脚本在首次创建空数据卷时建立数据库角色。运行中的密码轮换需同步更新数据库角色与 Compose 配置。
 

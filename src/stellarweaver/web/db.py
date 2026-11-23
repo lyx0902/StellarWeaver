@@ -461,7 +461,7 @@ def submit(
             conn.execute(
                 text("""
             SELECT r.id,r.session_id,r.prompt,r.provider,r.mode,r.continuation,r.review,r.skills,r.undo,
-                s.workspace_id,s.isolated,r.member_id::text AS member_id
+                s.workspace_id,s.isolated,s.deleted_at,r.member_id::text AS member_id
             FROM sw.runs r JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
             WHERE r.request_key=:key
         """),
@@ -471,6 +471,8 @@ def submit(
             .first()
         )
         if existing:
+            if existing["deleted_at"] is not None:
+                raise ThreadUnavailable()
             if (
                 existing["member_id"] != member
                 or (
@@ -547,6 +549,20 @@ def submit(
                 raise ThreadUnavailable()
         if not allow_create:
             raise RunUnavailable()
+        if review is not None:
+            # Serialize verification submission with deletion of its source worktree.
+            source = conn.execute(
+                text("""
+                    SELECT s.id FROM sw.sessions s JOIN sw.runs r
+                    ON (s.tenant_id,s.id)=(r.tenant_id,r.session_id)
+                    WHERE s.id=:session AND r.id=:run AND s.workspace_id=:workspace
+                    AND s.deleted_at IS NULL AND r.status='completed' FOR UPDATE OF s
+                """),
+                {"session": review["session_id"], "run": review["run_id"], "workspace": workspace},
+            ).scalar_one_or_none()
+            if source is None:
+                raise ThreadUnavailable()
+
         if session_id is None:
             conn.execute(
                 text("""INSERT INTO sw.sessions(tenant_id,id,workspace_id,isolated,member_id)
@@ -556,7 +572,7 @@ def submit(
         else:
             thread = (
                 conn.execute(
-                    text("""SELECT workspace_id,isolated,archived_at,member_id::text AS member_id FROM sw.sessions
+                    text("""SELECT workspace_id,isolated,archived_at,deleted_at,member_id::text AS member_id FROM sw.sessions
                      WHERE id=:session FOR UPDATE"""),
                     params,
                 )
@@ -568,6 +584,7 @@ def submit(
                 or str(thread["workspace_id"]) != workspace
                 or thread["isolated"] != isolated
                 or thread["archived_at"] is not None
+                or thread["deleted_at"] is not None
                 or (member is not None and thread["member_id"] != member)
             ):
                 raise ThreadUnavailable()
@@ -630,7 +647,7 @@ def snapshot(
                 s.member_id::text AS member_id
             FROM sw.runs r JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
             LEFT JOIN sw.run_jobs j ON (r.tenant_id,r.id)=(j.tenant_id,j.run_id)
-            WHERE r.id=:id AND {_ACCESS}
+            WHERE r.id=:id AND s.deleted_at IS NULL AND {_ACCESS}
         """),
                 {"id": run_id, **_visible(access)},
             )
@@ -721,7 +738,10 @@ def event_page(engine: Engine, tenant: str, run_id: str, after: int) -> list[JSO
         return list(
             conn.execute(
                 text("""
-            SELECT event FROM sw.events WHERE run_id=:id AND seq>:after ORDER BY seq LIMIT 128
+            SELECT e.event FROM sw.events e JOIN sw.sessions s
+              ON (e.tenant_id,e.session_id)=(s.tenant_id,s.id)
+            WHERE e.run_id=:id AND s.deleted_at IS NULL AND e.seq>:after
+            ORDER BY e.seq LIMIT 128
         """),
                 {"id": run_id, "after": after},
             ).scalars()
@@ -741,7 +761,7 @@ def recent(
                         status='interrupted' OR COALESCE((outcome->>'unfinished_tools')::integer,0)>0
                             AS requires_acknowledgement
                     FROM sw.runs r JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
-                    WHERE r.session_id=:session AND {_ACCESS}
+                    WHERE r.session_id=:session AND s.deleted_at IS NULL AND {_ACCESS}
                     ORDER BY r.created_at DESC,r.id DESC LIMIT 50
                 """),
                 {"session": session, **_visible(access)},
@@ -757,7 +777,7 @@ def recent(
                 SELECT r.id AS run_id,r.session_id,r.status,left(r.prompt,120) AS prompt,r.created_at,
                     review IS NOT NULL AS is_review
                 FROM sw.runs r JOIN sw.sessions s ON (r.tenant_id,r.session_id)=(s.tenant_id,s.id)
-                WHERE {_ACCESS}
+                WHERE s.deleted_at IS NULL AND {_ACCESS}
                 ORDER BY r.created_at DESC,r.id DESC LIMIT 50
             """),
                 _visible(access),
@@ -777,6 +797,7 @@ def recent_threads(engine: Engine, tenant: str, access: Access | None = None) ->
             SELECT latest.id::text AS run_id,latest.session_id::text AS session_id,
                 s.workspace_id::text AS workspace_id,latest.status,latest.is_review,
                 s.archived_at IS NOT NULL AS archived,
+                (s.member_id=CAST(:actor AS uuid)) IS TRUE AS can_delete,
                 (SELECT left(r.prompt,120) FROM sw.runs r
                  WHERE (r.tenant_id,r.session_id)=(latest.tenant_id,latest.session_id)
                  ORDER BY r.created_at,r.id LIMIT 1) AS title,
@@ -786,7 +807,7 @@ def recent_threads(engine: Engine, tenant: str, access: Access | None = None) ->
                       AND a.expires_at>clock_timestamp()
                 ) AS needs_approval
             FROM latest JOIN sw.sessions s ON (s.tenant_id,s.id)=(latest.tenant_id,latest.session_id)
-            WHERE {_ACCESS}
+            WHERE s.deleted_at IS NULL AND {_ACCESS}
             ORDER BY latest.created_at DESC,latest.id DESC
         """),
             _visible(access),
@@ -800,7 +821,8 @@ def archive_thread(
     with scoped(engine, tenant) as conn:
         locked = conn.execute(
             text(f"""
-            SELECT s.id FROM sw.sessions s WHERE s.id=:session AND {_ACCESS} FOR UPDATE
+            SELECT s.id FROM sw.sessions s
+            WHERE s.id=:session AND s.deleted_at IS NULL AND {_ACCESS} FOR UPDATE
         """),
             {"session": session, **access.bindings()},
         ).scalar_one_or_none()
@@ -822,4 +844,46 @@ def archive_thread(
         """),
             {"session": session, "archived": archive},
         )
+        return True
+
+
+def delete_thread(engine: Engine, tenant: str, session: str, access: Access, actor: str) -> bool:
+    with scoped(engine, tenant) as conn:
+        row = conn.execute(
+            text(f"""
+                SELECT s.deleted_at FROM sw.sessions s
+                WHERE s.id=:session AND s.member_id=:actor AND {_ACCESS} FOR UPDATE
+            """),
+            {"session": session, **access.bindings(), "actor": actor},
+        ).one_or_none()
+        if row is None:
+            return False
+        if row.deleted_at is not None:
+            return True
+        if conn.execute(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM sw.runs WHERE status='active'
+                    AND (session_id=:session OR review->>'session_id'=:source)
+                )
+            """),
+            {"session": session, "source": session},
+        ).scalar_one():
+            raise RunUnavailable()
+        run = conn.execute(
+            text("""
+                SELECT id::text FROM sw.runs WHERE session_id=:session
+                ORDER BY created_at DESC,id DESC LIMIT 1
+            """),
+            {"session": session},
+        ).scalar_one_or_none()
+        if run is None:
+            return False
+        conn.execute(
+            text("""
+                UPDATE sw.sessions SET deleted_at=now(), purge_after=now() WHERE id=:session
+            """),
+            {"session": session},
+        )
+        audit(conn, tenant, actor, run, "thread.delete")
         return True

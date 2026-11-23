@@ -8,6 +8,7 @@ import json
 import math
 import random
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal, cast
@@ -15,8 +16,16 @@ from uuid import uuid4
 
 from stellarweaver.changes import ChangeObservationUnknown
 from stellarweaver.config import ContextConfig, HarnessConfig, LimitsConfig
-from stellarweaver.context import ContextBudgetExceeded, ContextManager, ContextProtocolError
-from stellarweaver.context.manager import thinking_history
+from stellarweaver.context import (
+    ContextBudgetExceeded,
+    ContextManager,
+    ContextProjection,
+    ContextProtocolError,
+)
+from stellarweaver.context import (
+    estimate_tokens as estimate_tokens,
+)
+from stellarweaver.context.manager import ContextBaseline, ContextSize, thinking_history
 from stellarweaver.context.navigation import IssueSignals
 from stellarweaver.context.repo_map import RepoMap
 from stellarweaver.domain import (
@@ -44,7 +53,7 @@ from stellarweaver.runtime.repair import RepairController
 from stellarweaver.runtime.task_evidence import TaskEvidence
 from stellarweaver.session.journal import RunJournal
 from stellarweaver.session.store import SessionBusy, SessionStore
-from stellarweaver.tools.registry import ToolRegistry
+from stellarweaver.tools.registry import ReadDispatch, ToolRegistry
 from stellarweaver.tools.web_search import register_search
 from stellarweaver.tools.workspace import ToolError
 
@@ -72,11 +81,6 @@ A successful command is evidence of that command only, not proof the entire task
 
 class BudgetExceeded(Exception):
     pass
-
-
-def estimate_tokens(value: Any) -> int:
-    # Conservative UTF-8 byte estimate, including schema and protocol overhead.
-    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
 def stable_arguments(raw: str) -> Any:
@@ -132,6 +136,8 @@ class Agent:
         self.project_context = project_context
         self.registry = registry
         self._enable_web_search = enable_web_search
+        self._context_rates: deque[float] = deque(maxlen=6)
+        self._context_baseline: ContextBaseline | None = None
         self.set_provider(provider)
         self.limits = limits or LimitsConfig()
         self.enforce_run_budget = enforce_run_budget
@@ -159,9 +165,15 @@ class Agent:
         self.harness_config = harness_config or HarnessConfig()
         self.preflight = preflight or empty_preflight
         self.completion_check = completion_check
-        self._context = ContextManager(adaptive_round_retention=adaptive_round_retention)
+        self._context = ContextManager(
+            adaptive_round_retention=adaptive_round_retention,
+            smart_tool_truncation=self.harness_config.smart_tool_truncation,
+            protect_fresh_tool_output=self.harness_config.protect_fresh_tool_output,
+        )
         self._instructions = InstructionLoader(registry.workspace)
-        self._repo_map = RepoMap(registry.workspace)
+        self._repo_map = RepoMap(
+            registry.workspace, import_aware=self.harness_config.import_aware_repomap
+        )
         self._context_boundary = 0
         self._scope_paths: set[str] = set()
         self._instruction_seen: set[tuple[str, str]] = set()
@@ -176,6 +188,10 @@ class Agent:
         self._running = False
         self._previous_journal = registry.journal
         self.registry.workspace.protect(self.store.directory)
+        if self.project_context and self.harness_config.subagent_exploration:
+            from stellarweaver.runtime.exploration import register_exploration
+
+            register_exploration(self)
         self._reset_run()
 
     def _reset_run(self) -> None:
@@ -336,7 +352,10 @@ class Agent:
         evidence.extend({"kind": "completion_check", **item} for item in self._completion_proofs)
         checks: dict[str, ToolResult] = {}
         for result in self.results:
-            if result.tool_name in {"create_file", "edit_file"} and result.status == "ok":
+            if (
+                result.tool_name in {"create_file", "edit_file", "apply_patch"}
+                and result.status == "ok"
+            ):
                 checks.clear()
                 evidence.append({"kind": "change", **asdict(result)})
             if (
@@ -401,7 +420,20 @@ class Agent:
         self, reply: AssistantReply, initial_stop: tuple[RunStatus, str] | None = None
     ) -> tuple[RunStatus, str] | None:
         stop = initial_stop
-        for call in reply.tool_calls:
+        index = 0
+        while index < len(reply.tool_calls):
+            if stop is None and self.harness_config.parallel_read_tools:
+                group = []
+                for candidate in reply.tool_calls[index : index + 4]:
+                    if not self.registry.can_parallel_read(candidate.name):
+                        break
+                    group.append(candidate)
+                if len(group) > 1:
+                    consumed, stop = await self._read_group(group)
+                    index += consumed
+                    continue
+            call = reply.tool_calls[index]
+            index += 1
             if stop is not None:
                 await self._result(self._skipped(call, stop[1], stop[0] == "cancelled"))
                 continue
@@ -436,40 +468,123 @@ class Agent:
                     if dispatch_task is not None
                     else self._skipped(call, "user cancelled", True)
                 )
-            await self._result(result)
-            if self._repair is not None:
-                event, stalled = self._repair.observe(
-                    result, command=self.registry.is_command(call.name)
-                )
-                if event is not None:
-                    await self._emit("repair.diagnostic", event)
-                if stalled and stop is None:
-                    stop = (
-                        "failed",
-                        "repair controller: repeated failure without a changed candidate",
+            stop = await self._observe_tool(call, result, stop)
+        return stop
+
+    async def _read_group(self, group: list[ToolCall]) -> tuple[int, tuple[RunStatus, str] | None]:
+        pending: list[tuple[ToolCall, ReadDispatch, asyncio.Task[ToolResult]]] = []
+        try:
+            return await self._dispatch_reads(group, pending)
+        finally:
+            remaining = []
+            for _, slot, task in pending:
+                if not task.done():
+                    slot.abandoned = True
+                    task.cancel()
+                    remaining.append(task)
+            if remaining:
+                await asyncio.gather(*remaining, return_exceptions=True)
+
+    async def _dispatch_reads(
+        self,
+        group: list[ToolCall],
+        pending: list[tuple[ToolCall, ReadDispatch, asyncio.Task[ToolResult]]],
+    ) -> tuple[int, tuple[RunStatus, str] | None]:
+        ready: list[ReadDispatch] = []
+        stop: tuple[RunStatus, str] | None = None
+
+        try:
+            for call in group:
+                remaining = self._remaining()
+                if self._tools_exhausted():
+                    if not pending:
+                        raise BudgetExceeded("max_tool_calls")
+                    break
+                slot = ReadDispatch()
+                task = asyncio.create_task(
+                    self.registry.dispatch(
+                        call, operation_id=self._operations[call.call_id], read=slot
                     )
-            if self._cancel_requested and stop is None:
-                stop = ("cancelled", "user cancelled")
-            if result.status in {"denied", "blocked"} and stop is None:
-                stop = ("blocked", result.content)
-            elif result.status == "cancelled" and stop is None:
-                stop = ("cancelled", result.content)
-            elif result.status == "unknown" and stop is None:
-                stop = ("failed", "execution state unknown; do not rerun automatically")
-            elif result.status == "error":
-                fingerprint = json.dumps(
-                    [call.name, stable_arguments(call.arguments_json), stable_failure(result.data)],
-                    sort_keys=True,
                 )
-                self._failure_repeats = (
-                    self._failure_repeats + 1 if self._last_failure == fingerprint else 1
+                task.add_done_callback(slot.task_done)
+                self._tool_calls += 1
+                pending.append((call, slot, task))
+                if not await asyncio.wait_for(asyncio.shield(slot.prepared), remaining):
+                    # This invocation failed in preparation or needs interactive authorization.
+                    break
+                ready.append(slot)
+            for slot in ready:
+                slot.execute.set()
+            if ready:
+                await asyncio.wait_for(
+                    asyncio.gather(*(slot.executed.wait() for slot in ready)),
+                    self._remaining(),
                 )
-                self._last_failure = fingerprint
-                if self._failure_repeats >= 3:
-                    stop = ("failed", "three identical tool failures")
-            elif result.status == "ok":
-                self._last_failure = None
-                self._failure_repeats = 0
+        except (BudgetExceeded, TimeoutError) as exc:
+            stop = ("budget_exceeded", str(exc) or "max_wall_seconds")
+        except asyncio.CancelledError:
+            stop = ("cancelled", "user cancelled")
+
+        if stop is not None:
+            for _, slot, task in pending:
+                if not slot.executed.is_set():
+                    task.cancel()
+
+        for call, slot, task in pending:
+            if slot not in ready and not slot.executed.is_set() and stop is not None:
+                task.cancel()
+            slot.execute.set()
+            slot.publish.set()
+            try:
+                remaining = self._remaining() if stop is None else None
+                result = await asyncio.wait_for(asyncio.shield(task), remaining)
+            except (BudgetExceeded, TimeoutError) as exc:
+                stop = ("budget_exceeded", str(exc) or "max_wall_seconds")
+                result = await self._drain_dispatch(task, call)
+            except asyncio.CancelledError:
+                if stop is None:
+                    stop = ("cancelled", "user cancelled")
+                result = await self._drain_dispatch(task, call)
+            stop = await self._observe_tool(call, result, stop)
+        if not pending:
+            # The outer loop records every unused call after a budget or cancellation stop.
+            assert stop is not None
+        return len(pending), stop
+
+    async def _observe_tool(
+        self, call: ToolCall, result: ToolResult, stop: tuple[RunStatus, str] | None
+    ) -> tuple[RunStatus, str] | None:
+        await self._result(result)
+        if self._repair is not None:
+            event, stalled = self._repair.observe(
+                result, command=self.registry.is_command(call.name)
+            )
+            if event is not None:
+                await self._emit("repair.diagnostic", event)
+            if stalled and stop is None:
+                stop = ("failed", "repair controller: repeated failure without a changed candidate")
+        if self._cancel_requested and stop is None:
+            stop = ("cancelled", "user cancelled")
+        if result.status in {"denied", "blocked"} and stop is None:
+            stop = ("blocked", result.content)
+        elif result.status == "cancelled" and stop is None:
+            stop = ("cancelled", result.content)
+        elif result.status == "unknown" and stop is None:
+            stop = ("failed", "execution state unknown; do not rerun automatically")
+        elif result.status == "error":
+            fingerprint = json.dumps(
+                [call.name, stable_arguments(call.arguments_json), stable_failure(result.data)],
+                sort_keys=True,
+            )
+            self._failure_repeats = (
+                self._failure_repeats + 1 if self._last_failure == fingerprint else 1
+            )
+            self._last_failure = fingerprint
+            if self._failure_repeats >= 3:
+                stop = ("failed", "three identical tool failures")
+        elif result.status == "ok":
+            self._last_failure = None
+            self._failure_repeats = 0
         return stop
 
     def _checked_request(self, request: ModelRequest, input_estimate: int) -> ModelRequest:
@@ -555,6 +670,8 @@ class Agent:
 
     def set_provider(self, provider: ModelProvider) -> None:
         self.provider = provider
+        self._context_rates.clear()
+        self._context_baseline = None
         if self._enable_web_search:
             self.registry.unregister(DS_SEARCH)
             if provider.capabilities().web_search:
@@ -570,7 +687,7 @@ class Agent:
             (message,), max_output_tokens=min(1024, self.max_output_tokens), web_search=True
         )
         try:
-            reply = await self._request_model(request, estimate_tokens(message.recorded()))
+            reply = await self._request_model(request, ContextSize(estimate_tokens(message.recorded())))
         except BudgetExceeded as exc:
             raise ToolError("WEB_SEARCH_BUDGET_EXCEEDED", str(exc)) from exc
         except ProviderError as exc:
@@ -580,25 +697,50 @@ class Agent:
         return reply
 
     async def _request_model(
-        self, initial_request: ModelRequest, input_estimate: int
+        self,
+        initial_request: ModelRequest,
+        input_size: ContextSize,
+        *,
+        exploration_id: str | None = None,
     ) -> AssistantReply:
         request = initial_request
+        input_estimate = input_size.tokens
+        calibrate = (
+            self.harness_config.calibrated_context_budget
+            and not request.web_search
+            and exploration_id is None
+        )
+        context_metrics = (
+            {
+                "calibration_factor": input_size.factor,
+                "raw_input_utf8_bytes": input_size.raw_utf8_bytes,
+                "input_estimate": input_estimate,
+            }
+            if calibrate
+            else {}
+        )
         capabilities = self.provider.capabilities()
-        stream_requested = self.stream and not request.web_search
+        stream_requested = self.stream and not request.web_search and exploration_id is None
         streaming = stream_requested and capabilities.streaming
         settings = dict(capabilities.request_settings)
+        trace = (
+            {"purpose": "delegate_exploration", "exploration_id": exploration_id}
+            if exploration_id is not None
+            else {}
+        )
         if request.web_search:
             settings["thinking"] = "disabled"
             settings.pop("reasoning_effort", None)
             settings["purpose"] = DS_SEARCH
-        for retry_index in range(self.max_retries + 1):
+        retries = 0 if exploration_id is not None else self.max_retries
+        for retry_index in range(retries + 1):
             request = self._checked_request(request, input_estimate)
-            self._model_calls += 1
+            request_index = self._model_calls + 1
             self._chunk_index = 0
             await self._emit(
                 "model.started",
                 {
-                    "request_index": self._model_calls,
+                    "request_index": request_index,
                     "retry_index": retry_index,
                     "streaming": streaming,
                     "stream_fallback": stream_requested and not streaming,
@@ -607,8 +749,11 @@ class Agent:
                     "max_output_tokens": request.max_output_tokens,
                     "input_estimated": True,
                     **settings,
+                    **trace,
+                    **context_metrics,
                 },
             )
+            self._model_calls = request_index
             try:
                 async with asyncio.timeout(self._remaining()):
                     reply = (
@@ -641,6 +786,7 @@ class Agent:
                         "request_index": self._model_calls,
                         "reason": "total deadline" if self.enforce_run_budget else "model timeout",
                         **accounting,
+                        **trace,
                     },
                 )
                 if streaming:
@@ -675,10 +821,13 @@ class Agent:
                     {
                         "request_index": self._model_calls,
                         "error_type": type(exc).__name__,
-                        "message": str(error),
+                        "message": str(error)
+                        if exploration_id is None
+                        else "Exploration model request failed",
                         "retryable": error.retryable,
                         "status_code": error.status_code,
                         **accounting,
+                        **trace,
                     },
                 )
                 if streaming and (self._chunk_index or error.partial_stream):
@@ -691,7 +840,7 @@ class Agent:
                             "reason": "provider failure",
                         },
                     )
-                if not error.retryable or retry_index >= self.max_retries:
+                if not error.retryable or retry_index >= retries:
                     raise error from None
                 # A retry is another full request, never a tool replay.
                 self._checked_request(request, input_estimate)
@@ -724,6 +873,14 @@ class Agent:
             accounting = self._account_usage(
                 reply.usage, input_estimate, estimate_tokens(asdict(reply))
             )
+            if self.harness_config.pipeline_metrics or calibrate:
+                accounting.update(context_metrics)
+                accounting["input_estimate"] = input_estimate
+                if not accounting["input_estimated"] and accounting["input_tokens"] > 0:
+                    actual = accounting["input_tokens"]
+                    accounting["input_estimate_error_ratio"] = (input_estimate - actual) / actual
+                    if calibrate:
+                        self._context_rates.append(actual / input_size.raw_utf8_bytes)
             response_identity = {}
             if reply.provider_model is not None:
                 response_identity["response_model"] = reply.provider_model
@@ -737,6 +894,7 @@ class Agent:
                     "usage": reply.usage,
                     **accounting,
                     **response_identity,
+                    **trace,
                 },
             )
             return reply
@@ -748,7 +906,7 @@ class Agent:
         path = invocation.get("path", invocation.get("cwd"))
         if isinstance(path, str):
             self._scope_paths.add(path)
-        if call.name == "stage_patch":
+        if call.name in {"stage_patch", "apply_patch"}:
             self._scope_paths.update(invocation.get("paths", ()))
         try:
             instructions = self._instructions.for_paths(sorted(self._scope_paths))
@@ -791,7 +949,7 @@ class Agent:
         force: bool = False,
         shrink: bool = False,
         previous_size: int = 0,
-    ) -> tuple[ModelRequest, int]:
+    ) -> tuple[ModelRequest, ContextProjection]:
         refresh = getattr(self.registry, "refresh_extensions", None)
         if refresh is not None:
             await refresh()
@@ -826,8 +984,9 @@ class Agent:
             )
             self._instruction_logged = fingerprint
         history = self.projected_history()
+        sticky = self.harness_config.sticky_context_checkpoint
         if schemas and self.provider.capabilities().requires_reasoning_history:
-            history = thinking_history(history)
+            history = thinking_history(history, stable_evidence=sticky)
         goal = next((item.content for item in reversed(history) if item.role == "user"), "")
         evidence = guidance = None
         if self.project_context and self._task_evidence is not None:
@@ -903,8 +1062,8 @@ class Agent:
         while insertion < len(history) and history[insertion].role == "system":
             insertion += 1
 
-        def combined(include_map: bool) -> tuple[Message, ...]:
-            extra = [*derived]
+        def project(include_map: bool) -> ContextProjection:
+            extra = []
             if include_map and repo is not None and repo.message is not None:
                 extra.append(repo.message)
             if include_map and self._repair is not None and self._repair.notes is not None:
@@ -931,39 +1090,60 @@ class Agent:
                         + json.dumps(guidance, sort_keys=True),
                     )
                 )
-            return (*history[:insertion], *extra, *history[insertion:])
+            # Refresh evidence after complete groups so it does not rewrite the cached prefix.
+            source = (
+                history if sticky else (*history[:insertion], *derived, *extra, *history[insertion:])
+            )
+            return self._context.build(
+                source,
+                schemas,
+                output,
+                effective_window,
+                self.context_config,
+                force=force,
+                calibration_factor=calibration_factor,
+                baseline=self._context_baseline if sticky else None,
+                current_instructions=derived if sticky else (),
+                current_evidence=extra if sticky else (),
+                shrink_from=shrink_from,
+            )
 
         # On a server context-length error shrink once; no old tool dispatch is involved.
         effective_window = int(window * 0.70) if shrink else window
+        shrink_from = (
+            previous_size
+            if shrink and (sticky or self.harness_config.protect_fresh_tool_output)
+            else None
+        )
+        calibration_factor = (
+            min(1.0, max(0.30, max(self._context_rates) * 1.05)) if self._context_rates else 1.0
+        )
         try:
-            projection = self._context.build(
-                combined(not shrink),
-                schemas,
-                output,
-                effective_window,
-                self.context_config,
-                force=force,
-            )
+            projection = project(not shrink)
         except ContextBudgetExceeded:
-            # The repo map is an optional index; applicable instructions remain mandatory.
-            projection = self._context.build(
-                combined(False),
-                schemas,
-                output,
-                effective_window,
-                self.context_config,
-                force=force,
-            )
+            if shrink:
+                raise
+            # Applicable instructions remain mandatory when optional evidence is omitted.
+            projection = project(False)
         if shrink and projection.estimated_tokens >= previous_size:
             raise BudgetExceeded(
                 "Server context length exceeded; required context cannot shrink safely"
             )
         if projection.compacted:
+            metrics = (
+                {
+                    "calibration_factor": projection.size.factor,
+                    "before_raw_utf8_bytes": projection.before.raw_utf8_bytes,
+                    "after_raw_utf8_bytes": projection.size.raw_utf8_bytes,
+                }
+                if self.harness_config.calibrated_context_budget
+                else {}
+            )
             key = json.dumps(projection.summary, ensure_ascii=False, sort_keys=True)
-            if key != self._last_projection_key:
+            if sticky or key != self._last_projection_key:
                 events = self.store.load_events()
                 checkpoint = self.store.write_checkpoint(
-                    {**projection.summary, "projection_includes_derived_system_messages": True},
+                    {**projection.summary, "projection_includes_derived_system_messages": not sticky},
                     events[-1].seq if events else 0,
                 )
                 await self._publish(self.store.last_event)
@@ -979,11 +1159,14 @@ class Agent:
                         "strategy": projection.summary.get(
                             "retention", "deterministic_recorded_evidence"
                         ),
+                        **metrics,
                     },
                 )
                 self._last_projection_key = key
+            if sticky:
+                self._context_baseline = ContextBaseline(history, projection.history)
         self._instruction_seen = set(fingerprint)
-        return ModelRequest(projection.messages, schemas, output), projection.estimated_tokens
+        return ModelRequest(projection.messages, schemas, output), projection
 
     def projected_history(self) -> tuple[Message, ...]:
         """Current model conversation boundary; raw session messages remain complete."""
@@ -997,9 +1180,9 @@ class Agent:
             raise ValueError("Cannot compact an active task")
         if not self.messages:
             return {"compacted": False, "reason": "No conversation to compact"}
-        request, estimated = await self._prepare_context(tuple(self.registry.schemas()), force=True)
+        request, projection = await self._prepare_context(tuple(self.registry.schemas()), force=True)
         return {
-            "estimated_input_tokens": estimated,
+            "estimated_input_tokens": projection.estimated_tokens,
             "projected_messages": len(request.messages),
             "original_messages": len(self.messages),
             "model_calls": 0,
@@ -1012,6 +1195,7 @@ class Agent:
         self._scope_paths.clear()
         self._instruction_seen.clear()
         self._last_projection_key = ""
+        self._context_baseline = None
         result = {
             "through_message_position": self._context_boundary,
             "history_preserved": True,
@@ -1319,26 +1503,26 @@ class Agent:
             await self._emit("harness.profile", self.harness_config.model_dump())
         while True:
             schemas = tuple(self.registry.schemas())
-            request, input_estimate = await self._prepare_context(schemas)
+            request, projection = await self._prepare_context(schemas)
             try:
-                reply = await self._request_model(request, input_estimate)
+                reply = await self._request_model(request, projection.size)
             except ProviderError as exc:
                 if not exc.context_length_exceeded:
                     return self._completion("failed", str(exc))
-                request, smaller_estimate = await self._prepare_context(
-                    schemas, force=True, shrink=True, previous_size=input_estimate
+                request, smaller = await self._prepare_context(
+                    schemas, force=True, shrink=True, previous_size=projection.estimated_tokens
                 )
                 await self._emit(
                     "context.retry",
                     {
                         "reason": "server_context_length_exceeded",
-                        "before_tokens_estimated": input_estimate,
-                        "after_tokens_estimated": smaller_estimate,
+                        "before_tokens_estimated": projection.estimated_tokens,
+                        "after_tokens_estimated": smaller.estimated_tokens,
                         "max_retries": 1,
                     },
                 )
                 try:
-                    reply = await self._request_model(request, smaller_estimate)
+                    reply = await self._request_model(request, smaller.size)
                 except ProviderError as retry_error:
                     return self._completion("failed", str(retry_error))
             ids = [call.call_id for call in reply.tool_calls]

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import codecs
 import difflib
 import fnmatch
 import hashlib
+import io
 import os
 import stat
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from stellarweaver.tools.workspace import MAX_EDIT_BYTES, ToolError, sha256_bytes
 
@@ -48,15 +51,77 @@ class EditFileArgs(Arguments):
     expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-def _diff(path: str, old: str, new: str) -> str:
-    return "".join(
-        difflib.unified_diff(
-            old.splitlines(keepends=True),
-            new.splitlines(keepends=True),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-        )
+class EditSpan(Arguments):
+    old_text: str = Field(min_length=1, max_length=MAX_EDIT_BYTES)
+    new_text: str = Field(max_length=MAX_EDIT_BYTES)
+
+
+class MultiEditFileArgs(Arguments):
+    path: str
+    expected_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    old_text: str | None = Field(default=None, min_length=1, max_length=MAX_EDIT_BYTES)
+    new_text: str | None = Field(default=None, max_length=MAX_EDIT_BYTES)
+    edits: list[EditSpan] | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_form(self) -> MultiEditFileArgs:
+        if self.edits is not None:
+            if self.model_fields_set.intersection({"old_text", "new_text"}):
+                raise ValueError("Send edits or old_text and new_text")
+        elif self.old_text is None or self.new_text is None:
+            raise ValueError("Send edits or both old_text and new_text")
+        return self
+
+
+def syntax_diagnostic(
+    ctx: ToolContext, path: Path, relative: str, content: bytes
+) -> dict[str, Any]:
+    if not ctx.post_edit_syntax_hook or path.suffix != ".py":
+        return {}
+    try:
+        ast.parse(content, filename=relative)
+    except SyntaxError as exc:
+        return {
+            "syntax_diagnostic": {
+                "code": "PYTHON_SYNTAX_ERROR",
+                "message": exc.msg,
+                "path": relative,
+                "line": exc.lineno,
+                "column": exc.offset,
+                "end_line": exc.end_lineno,
+                "end_column": exc.end_offset,
+            }
+        }
+    except RecursionError:
+        return {
+            "syntax_diagnostic": {
+                "code": "PYTHON_SYNTAX_CHECK_INCOMPLETE",
+                "message": "Source exceeds the Python parser recursion limit.",
+                "path": relative,
+            }
+        }
+    return {}
+
+
+def syntax_hint(diagnostic: dict[str, Any]) -> str:
+    line = diagnostic.get("line")
+    location = f"line {line}: " if line is not None else ""
+    return f"\n[syntax_diagnostic] {location}{diagnostic['message']}"
+
+
+def _diff(path: str, old: str, new: str, *, mark_unterminated: bool = False) -> str:
+    lines = difflib.unified_diff(
+        io.StringIO(old, newline="\n").readlines() if mark_unterminated else old.splitlines(True),
+        io.StringIO(new, newline="\n").readlines() if mark_unterminated else new.splitlines(True),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
     )
+    if mark_unterminated:
+        return "".join(
+            line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+            for line in lines
+        )
+    return "".join(lines)
 
 
 def fsync_directory(path: Path) -> None:
@@ -154,7 +219,7 @@ async def prepare_list_files(args: ListFilesArgs, ctx: ToolContext) -> PreparedT
 
     root = ctx.workspace.resolve(args.path, allow_directory=True)
 
-    async def execute() -> dict[str, Any]:
+    def listing() -> dict[str, Any]:
         ctx.workspace.recheck(args.path, root, allow_directory=True)
         paths: list[str] = []
         truncated = False
@@ -197,6 +262,9 @@ async def prepare_list_files(args: ListFilesArgs, ctx: ToolContext) -> PreparedT
             "data": {"paths": paths, "count": len(paths), "truncated": truncated},
         }
 
+    async def execute() -> dict[str, Any]:
+        return await asyncio.to_thread(listing) if ctx.parallel_read else listing()
+
     return PreparedTool({"path": ctx.workspace.relative(root)}, execute)
 
 
@@ -210,12 +278,15 @@ async def prepare_read_file(args: ReadFileArgs, ctx: ToolContext) -> PreparedToo
             "INVALID_ARGUMENTS", "read_file requires an ordered range of at most 400 lines."
         )
 
-    async def execute() -> dict[str, Any]:
+    def read() -> dict[str, Any]:
         ctx.workspace.recheck(args.path, path)
         data = _scan_file(path, args.start_line, end)
         data["path"] = ctx.workspace.relative(path)
         text = "\n".join(f"{row['line']}: {row['text']}" for row in data["lines"])
         return {"content": text, "data": data}
+
+    async def execute() -> dict[str, Any]:
+        return await asyncio.to_thread(read) if ctx.parallel_read else read()
 
     return PreparedTool({"path": ctx.workspace.relative(path)}, execute)
 
@@ -252,8 +323,10 @@ async def prepare_create_file(args: CreateFileArgs, ctx: ToolContext) -> Prepare
         except FileExistsError as exc:
             raise ToolError("FILE_EXISTS", "New-file target already exists.") from exc
         fsync_directory(path.parent)
+        syntax = syntax_diagnostic(ctx, path, relative, content)
+        hint = syntax_hint(syntax["syntax_diagnostic"]) if syntax else ""
         return {
-            "content": f"Created {relative}\n{diff}",
+            "content": f"Created {relative}\n{diff}{hint}",
             "data": {
                 "path": relative,
                 "sha256": sha256_bytes(content),
@@ -263,6 +336,7 @@ async def prepare_create_file(args: CreateFileArgs, ctx: ToolContext) -> Prepare
                 "diff": diff,
                 "operation_id": ctx.operation_id,
                 "diff_artifact_id": str(artifact),
+                **syntax,
             },
             "artifact_ids": (str(artifact),),
         }
@@ -280,7 +354,9 @@ async def prepare_create_file(args: CreateFileArgs, ctx: ToolContext) -> Prepare
     )
 
 
-async def prepare_edit_file(args: EditFileArgs, ctx: ToolContext) -> PreparedTool:
+async def prepare_edit_file(
+    args: EditFileArgs | MultiEditFileArgs, ctx: ToolContext
+) -> PreparedTool:
     from stellarweaver.tools.registry import PreparedTool
 
     path = ctx.workspace.resolve(args.path)
@@ -293,24 +369,50 @@ async def prepare_edit_file(args: EditFileArgs, ctx: ToolContext) -> PreparedToo
             "File content changed after the earlier read.",
             {"path": args.path, "expected_sha256": args.expected_sha256, "actual_sha256": old_hash},
         )
-    count = text.count(args.old_text)
-    if count == 0:
-        raise ToolError("EDIT_NOT_FOUND", "old_text does not occur exactly in this file.")
-    if count > 1:
-        raise ToolError(
-            "EDIT_AMBIGUOUS",
-            "old_text occurs more than once; provide a larger unique context.",
-            {"matches": count},
-        )
-    replacement = args.new_text
-    if "\r\n" in text and "\n" not in text.replace("\r\n", ""):
-        replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
-    new_text = text.replace(args.old_text, replacement, 1)
+    batch = isinstance(args, MultiEditFileArgs) and args.edits is not None
+    if isinstance(args, MultiEditFileArgs) and args.edits is not None:
+        edits = args.edits
+    else:
+        assert args.old_text is not None and args.new_text is not None
+        edits = [EditSpan(old_text=args.old_text, new_text=args.new_text)]
+    crlf = "\r\n" in text and "\n" not in text.replace("\r\n", "")
+    spans: list[tuple[int, int, str, int]] = []
+    for index, edit in enumerate(edits, 1):
+        count = text.count(edit.old_text)
+        details: dict[str, Any] = {"edit_index": index} if batch else {}
+        if count == 0:
+            raise ToolError(
+                "EDIT_NOT_FOUND", "old_text does not occur exactly in this file.", details
+            )
+        if count > 1:
+            raise ToolError(
+                "EDIT_AMBIGUOUS",
+                "old_text occurs more than once; provide a larger unique context.",
+                {**details, "matches": count},
+            )
+        start = text.index(edit.old_text)
+        replacement = edit.new_text
+        if crlf:
+            replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+        spans.append((start, start + len(edit.old_text), replacement, index))
+    parts: list[str] = []
+    previous_end = 0
+    for start, end, replacement, index in sorted(spans):
+        if start < previous_end:
+            raise ToolError(
+                "EDIT_OVERLAPPING",
+                "Edit ranges overlap in the original file.",
+                {"edit_index": index},
+            )
+        parts.extend((text[previous_end:start], replacement))
+        previous_end = end
+    parts.append(text[previous_end:])
+    new_text = "".join(parts)
     new_bytes = new_text.encode("utf-8")
     if len(new_bytes) > MAX_EDIT_BYTES:
         raise ToolError("FILE_TOO_LARGE", "Result exceeds the 1 MiB edit limit.")
     relative = ctx.workspace.relative(path)
-    diff = _diff(relative, text, new_text)
+    diff = _diff(relative, text, new_text, mark_unterminated=batch)
 
     async def recheck() -> None:
         checked = ctx.workspace.resolve(args.path)
@@ -352,8 +454,10 @@ async def prepare_edit_file(args: EditFileArgs, ctx: ToolContext) -> PreparedToo
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         new_hash = sha256_bytes(new_bytes)
+        syntax = syntax_diagnostic(ctx, path, relative, new_bytes)
+        hint = syntax_hint(syntax["syntax_diagnostic"]) if syntax else ""
         return {
-            "content": f"Edited {relative}\n{diff}",
+            "content": f"Edited {relative}\n{diff}{hint}",
             "data": {
                 "path": relative,
                 "old_hash": old_hash,
@@ -364,9 +468,10 @@ async def prepare_edit_file(args: EditFileArgs, ctx: ToolContext) -> PreparedToo
                 "after_sha256": new_hash,
                 "sha256": new_hash,
                 "diff": diff,
-                "replacement_count": 1,
+                "replacement_count": len(spans),
                 "operation_id": ctx.operation_id,
                 "diff_artifact_id": str(artifact),
+                **syntax,
             },
             "artifact_ids": (str(backup), str(artifact)),
         }
@@ -387,7 +492,9 @@ async def prepare_edit_file(args: EditFileArgs, ctx: ToolContext) -> PreparedToo
     )
 
 
-def register_tools(registry: ToolRegistry) -> None:
+def register_tools(
+    registry: ToolRegistry, *, multi_edit: bool = False, readonly_only: bool = False
+) -> None:
     registry.register(
         "list_files",
         "List workspace files respecting ignore and protected-path rules.",
@@ -400,6 +507,8 @@ def register_tools(registry: ToolRegistry) -> None:
         ReadFileArgs,
         prepare_read_file,
     )
+    if readonly_only:
+        return
     registry.register(
         "create_file",
         "Exclusively create a new UTF-8 file after authorization.",
@@ -408,7 +517,12 @@ def register_tools(registry: ToolRegistry) -> None:
     )
     registry.register(
         "edit_file",
-        "Replace one exact unique text span after checking expected_sha256.",
-        EditFileArgs,
+        (
+            "Edit one file. Send old_text and new_text or edits with unique, non-overlapping "
+            "old_text spans from the original file, and its expected_sha256."
+            if multi_edit
+            else "Replace one exact unique text span after checking expected_sha256."
+        ),
+        MultiEditFileArgs if multi_edit else EditFileArgs,
         prepare_edit_file,
     )

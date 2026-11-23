@@ -8,6 +8,7 @@ from sqlalchemy.engine import Connection
 from stellarweaver.changes import UndoFile
 from stellarweaver.domain import JSONDict
 from stellarweaver.session.locking import workspace_write_lock
+from stellarweaver.tools.patch_write import manifest, write_files
 from stellarweaver.tools.workspace import ToolError, Workspace
 from stellarweaver.web.db import audit
 from stellarweaver.web.journal import PgJournal
@@ -18,10 +19,11 @@ def latest_edit(conn: Connection, session: str) -> JSONDict | None:
         conn.execute(
             text("""
         SELECT o.id::text AS operation_id, r.id::text AS source_run_id,
-            o.tool_name, o.result->'data' AS data
+            o.tool_name, CASE WHEN o.tool_name='apply_patch'
+                THEN o.intent || (o.result->'data') ELSE o.result->'data' END AS data
         FROM sw.operations o JOIN sw.runs r ON (r.tenant_id,r.id)=(o.tenant_id,o.run_id)
         WHERE r.session_id=:session AND r.review IS NULL AND o.state='ok'
-            AND o.tool_name IN ('create_file','edit_file')
+            AND o.tool_name IN ('create_file','edit_file','apply_patch')
             AND NOT EXISTS (
                 SELECT 1 FROM sw.operations pending JOIN sw.runs prior
                     ON (prior.tenant_id,prior.id)=(pending.tenant_id,pending.run_id)
@@ -32,7 +34,8 @@ def latest_edit(conn: Connection, session: str) -> JSONDict | None:
             AND NOT EXISTS (
                 SELECT 1 FROM sw.events e WHERE e.session_id=:session
                     AND e.event->'payload'->>'target_operation_id'=o.id::text
-                    AND e.event->>'type' IN ('changes.undo.started','changes.undo.completed')
+                    AND e.event->>'type'='changes.undo.completed'
+                    AND e.event->'payload'->>'status'='ok'
             )
             AND NOT EXISTS (
                 SELECT 1 FROM sw.events started WHERE started.session_id=:session
@@ -69,18 +72,28 @@ def undo_edit(journal: PgJournal, request: JSONDict) -> None:
                 journal.finish_in_transaction(conn, {"run_status": "cancelled"}, "run.cancelled")
                 return
             data = edit["data"]
-            if (edit["tool_name"] == "edit_file") != isinstance(data.get("before_sha256"), str):
+            grouped = edit["tool_name"] == "apply_patch"
+            if not grouped and (edit["tool_name"] == "edit_file") != isinstance(
+                data.get("before_sha256"), str
+            ):
                 raise ToolError("UNDO_METADATA_MISSING", "Invalid before hash for this operation.")
             artifacts = journal.artifacts_dir.parent / str(UUID(edit["source_run_id"]))
             file = UndoFile(workspace, artifacts)
-            path, previous, mode = file.checked_target(data)
             details = {
-                "path": data["path"],
                 "target_operation_id": edit["operation_id"],
                 "source_run_id": edit["source_run_id"],
-                "expected_sha256": data["after_sha256"],
-                "restore_sha256": data.get("before_sha256"),
             }
+            if grouped:
+                entries = manifest(data)
+                details.update(paths=[entry["path"] for entry in entries], files=entries)
+                grouped_changes = file.checked_patch(data)
+            else:
+                path, previous, mode = file.checked_target(data)
+                details.update(
+                    path=data["path"],
+                    expected_sha256=data["after_sha256"],
+                    restore_sha256=data.get("before_sha256"),
+                )
             journal.add_event_in_transaction(conn, "changes.undo.started", details)
             audit(
                 conn,
@@ -91,7 +104,13 @@ def undo_edit(journal: PgJournal, request: JSONDict) -> None:
                 edit["operation_id"],
             )
         try:
-            file.restore(path, previous, mode)
+            if grouped:
+                write_files(workspace, grouped_changes, conflict="UNDO_CONFLICT")
+            else:
+                file.restore(path, previous, mode)
+        except ToolError:
+            journal.append_event("changes.undo.completed", {**details, "status": "blocked"})
+            raise
         except OSError:
             journal.finish_run(
                 {
@@ -105,6 +124,11 @@ def undo_edit(journal: PgJournal, request: JSONDict) -> None:
             return
         journal.append_event("changes.undo.completed", {**details, "status": "ok"})
     journal.finish_run(
-        {"run_status": "completed", "final_text": f"已撤销隔离工作区中的文件修改：{data['path']}"},
+        {
+            "run_status": "completed",
+            "final_text": f"已撤销隔离工作区中的 {len(details['paths'])} 个文件的修改。"
+            if grouped
+            else f"已撤销隔离工作区中的文件修改：{details['path']}",
+        },
         "run.completed",
     )

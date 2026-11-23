@@ -7,7 +7,7 @@ import secrets
 import tarfile
 import tempfile
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Annotated, BinaryIO
@@ -22,8 +22,12 @@ from stellarweaver.tools.commands import _wait_cleanup
 from stellarweaver.tools.development import Action, DevelopmentArgs, development_argv
 from stellarweaver.tools.workspace import ToolError, Workspace
 from stellarweaver.web.isolation import _MAX_BYTES, _MAX_FILES, DockerRunner, Isolation
-
-ARCHIVE_LIMIT = _MAX_BYTES + 12 * 1024 * 1024
+from stellarweaver.web.snapshots import (
+    ARCHIVE_LIMIT,
+    SnapshotCache,
+    SnapshotMismatch,
+    verify_transfer,
+)
 
 
 def _validate_archive(archive: BinaryIO) -> None:
@@ -72,6 +76,7 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
     if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token) or not 1 <= slots <= 8:
         raise ValueError("Configure a private runner token and between one and eight slots")
     active: dict[UUID, Job] = {}
+    snapshots = SnapshotCache()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -107,9 +112,15 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
         action: Action | None = None,
         target: str | None = None,
         framework: str | None = None,
+        metrics: bool = False,
+        snapshot: Annotated[str | None, Query(pattern=r"^[a-f0-9]{64}$")] = None,
+        base: Annotated[str | None, Query(pattern=r"^[a-f0-9]{64}$")] = None,
+        scope: Annotated[str | None, Query(pattern=r"^[a-f0-9]{32}$")] = None,
         authorization: Annotated[str | None, Header()] = None,
     ) -> JSONDict:
         authorize(authorization)
+        if (snapshot is None) != (scope is None) or (base is not None and snapshot is None):
+            raise HTTPException(422, "Incomplete snapshot metadata")
         if (
             command is not None
             and command < len(isolation.commands)
@@ -134,6 +145,7 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
         try:
             with (
                 tempfile.TemporaryDirectory() as directory,
+                ExitStack() as stack,
                 # Docker reads the file descriptor directly after the validation pass.
                 (Path(directory) / "source.tar").open("w+b", buffering=0) as archive,
             ):
@@ -144,7 +156,23 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
                         if archive.tell() + len(chunk) > ARCHIVE_LIMIT:
                             raise HTTPException(413, "Snapshot too large")
                         archive.write(chunk)
-                validation = asyncio.create_task(asyncio.to_thread(_validate_archive, archive))
+                runnable: BinaryIO = archive
+                if snapshot is not None and scope is not None:
+                    cache_scope, expected = scope, snapshot
+                    runnable = stack.enter_context((Path(directory) / "merged.tar").open("w+b"))
+
+                    def materialize() -> None:
+                        previous = snapshots.get(cache_scope, base) if base is not None else None
+                        verify_transfer(
+                            archive, runnable, expected, baseline=previous, base_digest=base
+                        )
+                        snapshots.put(cache_scope, expected, runnable.read(ARCHIVE_LIMIT + 1))
+                        runnable.seek(0)
+
+                    task_validation = asyncio.to_thread(materialize)
+                else:
+                    task_validation = asyncio.to_thread(_validate_archive, archive)
+                validation = asyncio.create_task(task_validation)
                 try:
                     await asyncio.shield(validation)
                 except asyncio.CancelledError:
@@ -152,10 +180,10 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
                     raise
                 if job.cancelled or await request.is_disconnected():
                     raise HTTPException(409, "Verification cancelled")
-                runner = DockerRunner(Path(directory), isolation)
+                runner = DockerRunner(Path(directory), isolation, pipeline_metrics=metrics)
                 task = job.task = asyncio.create_task(
                     runner.run_archive(
-                        archive,
+                        runnable,
                         argv,
                         config=ExecutionConfig(max_output_bytes_per_stream=65536),
                         timeout_seconds=timeout_seconds,
@@ -175,7 +203,11 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
                 job.cleanup_confirmed = bool(
                     result["data"]["process_management"]["cleanup_confirmed"]
                 )
+                if snapshot is not None:
+                    result["data"]["snapshot_manifest_sha256"] = snapshot
                 return result
+        except SnapshotMismatch as exc:
+            raise HTTPException(412 if base is not None else 422, "Snapshot mismatch") from exc
         except (ValueError, tarfile.TarError) as exc:
             raise HTTPException(422, "Invalid snapshot") from exc
         except ToolError as exc:

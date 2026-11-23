@@ -15,7 +15,7 @@ from stellarweaver.tools.commands import CommandRunner
 from stellarweaver.tools.development import register_development_tools
 from stellarweaver.tools.navigation import register_navigation
 from stellarweaver.tools.registry import ToolRegistry
-from stellarweaver.tools.staging import register_staging
+from stellarweaver.tools.staging import register_apply_patch, register_staging
 
 
 def attach_harness(registry: ToolRegistry, config: AppConfig) -> None:
@@ -31,7 +31,12 @@ def attach_harness(registry: ToolRegistry, config: AppConfig) -> None:
             allow_argv=config.execution.allow_argv,
             development=config.harness.development_tools,
         )
-        registry.command_runner = DockerRunner(registry.workspace.root, isolation)
+        registry.command_runner = DockerRunner(
+            registry.workspace.root,
+            isolation,
+            pipeline_metrics=config.harness.pipeline_metrics,
+            incremental_snapshots=config.harness.incremental_sandbox_snapshots,
+        )
         registry.command_boundary = fingerprint(config.execution.model_dump())
         registry.sandbox_commands = None if isolation.allow_argv else isolation.commands
         if not isolation.allow_argv:
@@ -41,9 +46,11 @@ def attach_harness(registry: ToolRegistry, config: AppConfig) -> None:
             raise ValueError("Development tools require a configured sandbox")
         register_development_tools(registry)
     if config.harness.issue_navigation:
-        register_navigation(registry)
+        register_navigation(registry, prefilter=config.harness.navigation_prefilter)
     if config.harness.patch_staging:
         register_staging(registry)
+    if config.harness.multi_file_apply:
+        register_apply_patch(registry)
 
 
 def build_agent(
@@ -76,6 +83,7 @@ def build_agent(
         approval=approval,
         policy_file=policy_file,
         allow_sandbox_development=allow_sandbox_development,
+        scoped_test_grants=config.harness.scoped_test_grants,
     )
     registry = ToolRegistry(
         store.workspace,
@@ -87,6 +95,7 @@ def build_agent(
         hooks=hooks,
         command_boundary=command_boundary,
         sandbox_commands=sandbox_commands,
+        harness=config.harness,
     )
     if not chat_only:
         attach_harness(registry, config)

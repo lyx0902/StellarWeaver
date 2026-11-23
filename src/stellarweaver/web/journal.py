@@ -220,6 +220,21 @@ class PgJournal:
             ).scalar_one()
             return selected
 
+    def prior_test_grants(self) -> list[JSONDict]:
+        with scoped(self.engine, self.tenant) as conn:
+            return list(
+                conn.execute(
+                    text("""
+                    SELECT o.decision FROM sw.operations o JOIN sw.runs r
+                        ON (r.tenant_id,r.id)=(o.tenant_id,o.run_id)
+                    WHERE r.session_id=:session AND r.id<>:run
+                        AND o.decision->'session_test_grant'='true'::jsonb
+                    ORDER BY r.created_at DESC LIMIT 256
+                """),
+                    self._keys,
+                ).scalars()
+            )
+
     def latest_interruption(self) -> JSONDict | None:
         with scoped(self.engine, self.tenant) as conn:
             previous = (

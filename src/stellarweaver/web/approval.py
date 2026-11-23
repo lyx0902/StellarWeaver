@@ -52,23 +52,43 @@ def pending(conn: Connection, run_id: str) -> JSONDict | None:
     return {**row["preview"], "id": str(row["id"]), "expires_at": row["expires_at"].isoformat()}
 
 
-def decide(journal: PgJournal, identifier: str, decision: Literal["approve", "deny"]) -> None:
+def decide(
+    journal: PgJournal, identifier: str, decision: Literal["approve", "approve-session", "deny"]
+) -> None:
     with scoped(journal.engine, journal.tenant) as conn:
         status = lock_run(conn, journal.run_id)
         if status.get("status") != "active" or status.get("cancel_requested"):
             raise DecisionConflict()
-        state = "approved" if decision == "approve" else "denied"
+        session = decision == "approve-session"
+        state = "denied" if decision == "deny" else "approved"
         accepted = conn.execute(
             text("""
-            UPDATE sw.approvals SET state=:state WHERE tenant_id=:tenant AND run_id=:run AND id=:id
-              AND state='pending' AND expires_at>clock_timestamp() RETURNING id
+            UPDATE sw.approvals
+            SET state=:state, preview=CASE WHEN :session
+                THEN preview || '{"approved_scope":"session"}'::jsonb ELSE preview END
+            WHERE tenant_id=:tenant AND run_id=:run AND id=:id
+              AND state='pending' AND expires_at>clock_timestamp()
+              AND (NOT :session OR preview->'offer_test_scope'='true'::jsonb)
+            RETURNING id
         """),
-            {"state": state, "tenant": journal.tenant, "run": journal.run_id, "id": identifier},
+            {
+                "state": state,
+                "tenant": journal.tenant,
+                "run": journal.run_id,
+                "id": identifier,
+                "session": session,
+            },
         ).scalar_one_or_none()
         if accepted is None:
             raise DecisionConflict()
         journal.add_event_in_transaction(
-            conn, "approval.decided", {"id": identifier, "decision": state}
+            conn,
+            "approval.decided",
+            {
+                "id": identifier,
+                "decision": state,
+                **({"scope": "session"} if session else {}),
+            },
         )
         audit(
             conn,
@@ -139,7 +159,9 @@ class ApprovalGate:
                 "cwd": ".",
                 "timeout_seconds": invocation["timeout_seconds"],
             }
-        elif tool in {"edit_file", "create_file", "stage_patch"}:
+            if check is not None and invocation.get("offer_test_scope") is True:
+                preview["offer_test_scope"] = True
+        elif tool in {"edit_file", "create_file", "stage_patch", "apply_patch"}:
             patch = invocation.get("preview")
             if not isinstance(patch, str) or len(patch.encode()) > 64 * 1024:
                 # A partial patch is not a sufficient consent preview.
@@ -148,7 +170,7 @@ class ApprovalGate:
                 "tool": tool,
                 "diff": patch,
             }
-            if tool == "stage_patch":
+            if tool in {"stage_patch", "apply_patch"}:
                 preview.update(
                     {key: invocation[key] for key in ("base_commit", "patch_sha256", "paths")}
                 )
@@ -229,7 +251,8 @@ class ApprovalGate:
                     text("""
                     UPDATE sw.approvals SET state='consumed'
                     WHERE tenant_id=:tenant AND run_id=:run AND id=:id AND state='approved'
-                        AND fingerprint=:fingerprint AND expires_at>clock_timestamp() RETURNING id
+                        AND fingerprint=:fingerprint AND expires_at>clock_timestamp()
+                        RETURNING COALESCE(preview->>'approved_scope','once')
                 """),
                     params,
                 ).scalar_one_or_none()
@@ -237,7 +260,7 @@ class ApprovalGate:
                     self.journal.add_event_in_transaction(
                         conn, "approval.consumed", {"id": operation}
                     )
-                    return "once"
+                    return str(used)
                 state = conn.execute(
                     text("""
                     SELECT state FROM sw.approvals WHERE tenant_id=:tenant AND run_id=:run AND id=:id

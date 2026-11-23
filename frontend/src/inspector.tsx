@@ -173,7 +173,10 @@ export function Inspector({ active, onSelect, onClose, delivery, events, canAppl
       {actionError && <p className="notice" role="alert">{actionError}</p>}
       {active === 'changes' && undoTarget && <section className="undo-file" aria-label="撤销文件修改">
         {confirmUndo === undoTarget.operation_id ? <>
-          <p>撤销隔离工作区中对 <code>{undoTarget.path}</code> 的最近一次修改？</p>
+          {undoTarget.paths ? <>
+            <p>撤销这次补丁对以下 {undoTarget.paths.length} 个文件的修改？</p>
+            <ul>{undoTarget.paths.map(path => <li key={path}><code>{path}</code></li>)}</ul>
+          </> : <p>撤销隔离工作区中对 <code>{undoTarget.path}</code> 的最近一次修改？</p>}
           <div className="actions">
             <button type="button" disabled={busy} onClick={() => void act(() => onUndo(undoTarget))}>确认撤销</button>
             <button type="button" disabled={busy} onClick={() => setConfirmUndo(null)}>取消</button>

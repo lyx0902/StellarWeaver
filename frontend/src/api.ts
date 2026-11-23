@@ -12,7 +12,7 @@ export type Workspaces = {
 export type AuthOptions = { oidc: boolean; bearer: boolean; password?: boolean }
 export type Thread = {
   run_id: string; session_id: string; workspace_id: string; title: string; status: string
-  needs_approval: boolean; is_review: boolean; archived?: boolean
+  needs_approval: boolean; is_review: boolean; archived?: boolean; can_delete?: boolean
 }
 export type Mode = 'read-only' | 'repair' | 'auto'
 export type Approval = {
@@ -21,8 +21,10 @@ export type Approval = {
   before_sha256?: string; after_sha256?: string
   base_commit?: string; patch_sha256?: string; paths?: string[]
   query?: string
+  offer_test_scope?: boolean
   security?: { level: string; capabilities: string[]; reason_codes: string[] }
 }
+export type ApprovalDecision = 'approve' | 'approve-session' | 'deny'
 export type Delivery = {
   run_id: string; verification: string; scope: string
   baseline_comparable: boolean; changed_paths: string[]
@@ -43,7 +45,7 @@ export type PatchPreflight = {
 }
 export type ReviewFeedback = { path: string; hunk?: string; text: string }
 export type SkillSelection = { id: string; name: string; source: string; sha256: string }
-export type UndoTarget = { operation_id: string; path: string; tool_name: string }
+export type UndoTarget = { operation_id: string; path: string; paths?: string[]; tool_name: string }
 export type Run = {
   run_id: string; session_id: string; status: string; prompt: string; provider?: string
   context_window_tokens?: number | null

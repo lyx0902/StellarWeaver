@@ -25,6 +25,7 @@ from stellarweaver.tools.git import (
     prepare_git_diff,
     prepare_git_status,
 )
+from stellarweaver.tools.patch_write import FileState, FileWrite, manifest, read_target, write_files
 from stellarweaver.tools.registry import PreparedTool, ToolContext
 from stellarweaver.tools.workspace import MAX_EDIT_BYTES, ToolError, Workspace, sha256_bytes
 
@@ -85,6 +86,9 @@ class UndoFile:
         before = metadata.get("before_sha256")
         if before is None:
             return path, None, mode
+        return path, self.checked_backup(metadata), mode
+
+    def checked_backup(self, metadata: JSONDict) -> bytes:
         identifier = metadata.get("before_artifact_id")
         if not isinstance(identifier, str):
             raise ToolError("UNDO_BACKUP_MISSING", "No before snapshot was recorded for this edit.")
@@ -100,11 +104,30 @@ class UndoFile:
         if backup.stat().st_size > MAX_EDIT_BYTES:
             raise ToolError("UNDO_BACKUP_INVALID", "Before snapshot exceeds the edit size limit.")
         previous = self.bounded_bytes(backup)
-        if sha256_bytes(previous) != before:
+        if sha256_bytes(previous) != metadata.get("before_sha256"):
             raise ToolError(
                 "UNDO_BACKUP_CHANGED", "Before snapshot hash does not match the original journal."
             )
-        return path, previous, mode
+        return previous
+
+    def checked_patch(self, metadata: JSONDict) -> list[FileWrite]:
+        changes = []
+        for entry in reversed(manifest(metadata)):
+            path, mode = entry["path"], entry["mode"]
+            current = read_target(self.workspace, path)
+            if current.digest != entry["after_sha256"] or (
+                current.mode is not None and current.mode != mode
+            ):
+                raise ToolError(
+                    "UNDO_CONFLICT", "A patch target changed after the edit.", {"path": path}
+                )
+            restored = (
+                FileState(self.checked_backup(entry), mode)
+                if entry["before_sha256"] is not None
+                else FileState()
+            )
+            changes.append(FileWrite(path, current, restored))
+        return changes
 
     def restore(self, path: Path, content: bytes | None, mode: int) -> None:
         if content is None:
@@ -308,7 +331,7 @@ class ChangesManager:
         return [
             (result, {**intents.get(result.operation_id, {}), **result.data})
             for result in self.store.load_results()
-            if result.tool_name in {"create_file", "edit_file"}
+            if result.tool_name in {"create_file", "edit_file", "apply_patch"}
             and result.operation_id not in undone
             and result.status in {"ok", "unknown"}
         ]
@@ -332,6 +355,15 @@ class ChangesManager:
             lines.append("No active built-in edits.")
         latest: dict[str, JSONDict] = {}
         for result, metadata in edits:
+            if result.tool_name == "apply_patch":
+                paths = [item["path"] for item in metadata.get("files", [])]
+                lines.append(
+                    f"{result.operation_id} apply_patch {', '.join(paths)} [{result.status}]"
+                )
+                lines.append(str(metadata.get("diff", metadata.get("preview", ""))))
+                for item in metadata.get("files", []):
+                    latest[item["path"]] = {**item, "_result_status": result.status}
+                continue
             path = str(metadata.get("path", "<unknown>"))
             latest[path] = {**metadata, "_result_status": result.status}
             lines.append(f"{result.operation_id} {result.tool_name} {path} [{result.status}]")
@@ -360,9 +392,14 @@ class ChangesManager:
             if (
                 expected is not None
                 and expected.get("_result_status") == "ok"
-                and observed.get("state") == "file"
-                and observed.get("sha256") == expected.get("after_sha256")
-                and observed.get("mode") == expected.get("mode")
+                and (
+                    (observed.get("state") == "missing" and expected.get("action") == "delete")
+                    or (
+                        observed.get("state") == "file"
+                        and observed.get("sha256") == expected.get("after_sha256")
+                        and observed.get("mode") == expected.get("mode")
+                    )
+                )
             ):
                 continue
             original = baseline_files.get(path)
@@ -465,6 +502,8 @@ class ChangesManager:
                         "target_operation_id": target,
                         "message": "The latest edit has unknown effects; inspect it before undo.",
                     }
+                if original.tool_name == "apply_patch":
+                    return await self._undo_patch(metadata, identifier, target)
                 if original.tool_name == "edit_file" and not isinstance(
                     metadata.get("before_sha256"), str
                 ):
@@ -546,6 +585,66 @@ class ChangesManager:
             }
             await self._emit("changes.undo.rejected", result)
             return result
+
+    async def _undo_patch(self, metadata: JSONDict, identifier: str, target: str) -> JSONDict:
+        files = manifest(metadata)
+        changes = self.undo_file.checked_patch(metadata)
+        invocation = {
+            "tool": "apply_patch",
+            "workspace": str(self.workspace.root),
+            "paths": [item["path"] for item in files],
+            "operation_id": identifier,
+            "action": "undo",
+            "undo_of_operation_id": target,
+            "preview": "".join(
+                line
+                for change in changes
+                for line in difflib.unified_diff(
+                    (change.before.content or b"").decode().splitlines(keepends=True),
+                    (change.after.content or b"").decode().splitlines(keepends=True),
+                    fromfile=f"a/{change.path}",
+                    tofile=f"b/{change.path}",
+                )
+            ),
+        }
+        decision = await self.policy.decide(invocation)
+        await self._emit("changes.undo.authorization", {**invocation, **decision})
+        if decision["decision"] != "allow":
+            return {
+                "status": "blocked" if decision["decision"] == "blocked" else "denied",
+                "code": "PERMISSION_DENIED",
+                "message": decision["reason"],
+                "target_operation_id": target,
+            }
+        changes = self.undo_file.checked_patch(metadata)
+        intent = {
+            "undo_id": identifier,
+            "target_operation_id": target,
+            "paths": invocation["paths"],
+            "files": files,
+        }
+        await self._emit("changes.undo.started", intent)
+        try:
+            write_files(self.workspace, changes, conflict="UNDO_CONFLICT")
+        except ToolError as exc:
+            result = {**intent, "status": "blocked", "code": exc.code, "message": exc.message}
+        except OSError as exc:
+            # Keep the started event for recovery if compensation could not be confirmed.
+            return {
+                **intent,
+                "status": "unknown",
+                "code": "UNDO_STATE_UNKNOWN",
+                "message": str(exc),
+            }
+        else:
+            result = {
+                **intent,
+                "status": "ok",
+                "code": "UNDO_COMPLETED",
+                "message": f"Undid one patch operation affecting {len(files)} files.",
+            }
+        await self._emit("changes.undo.completed", result)
+        return result
 
 
 __all__ = ["ChangeObservationUnknown", "ChangesManager"]

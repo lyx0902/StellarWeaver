@@ -18,6 +18,7 @@ from stellarweaver.web.execution import execute
 from stellarweaver.web.isolation import DockerRunner, Isolation, saved_worktree, task_worktree
 from stellarweaver.web.journal import PgJournal
 from stellarweaver.web.remote_runner import RemoteRunner
+from stellarweaver.web.thread_cleanup import purge_deleted_thread
 
 
 def recover_interrupted(engine: Engine, tenant: str, *, include_claimed: bool) -> None:
@@ -67,7 +68,11 @@ def run_worker(
         if isolation is not None:
             isolation.reap()
         recover_interrupted(engine, tenant, include_claimed=True)
+        next_purge = 0.0
         while not stop.is_set():
+            if monotonic() >= next_purge:
+                purge_deleted_thread(engine, state_dir, tenant)
+                next_purge = monotonic() + 1
             job = db.claim(engine, tenant, owner, lease=lock)
             if job is None:
                 if once:
@@ -243,11 +248,14 @@ def run_team_worker(
         ) as workers:
             try:
                 while not shutdown.is_set():
-                    if local is not None and monotonic() >= next_refresh:
-                        for tenant in local_accounts.tenants(engine):
-                            if tenant not in order:
-                                recover_interrupted(engine, tenant, include_claimed=True)
-                                order.append(tenant)
+                    if monotonic() >= next_refresh:
+                        if local is not None:
+                            for tenant in local_accounts.tenants(engine):
+                                if tenant not in order:
+                                    recover_interrupted(engine, tenant, include_claimed=True)
+                                    order.append(tenant)
+                        for tenant in order:
+                            purge_deleted_thread(engine, state_dir, tenant)
                         next_refresh = monotonic() + 1
                     for future in tuple(running):
                         if future.done():

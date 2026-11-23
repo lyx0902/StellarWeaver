@@ -22,13 +22,14 @@ from sqlalchemy.exc import DBAPIError, OperationalError  # noqa: E402
 from stellarweaver.domain import AssistantReply, Message, ToolCall, ToolResult  # noqa: E402
 from stellarweaver.providers.base import ProviderError  # noqa: E402
 from stellarweaver.providers.fake import FakeModel  # noqa: E402
+from stellarweaver.tools.development import decode_development  # noqa: E402
 from stellarweaver.tools.workspace import sha256_bytes  # noqa: E402
 from stellarweaver.web.app import LOCAL_TENANT, Principal, create_app  # noqa: E402
 from stellarweaver.web.approval import VERIFY_ARGV, DecisionConflict, request_cancel  # noqa: E402
 from stellarweaver.web.db import claim, engine_for, register, scoped, service_lock, submit  # noqa: E402
 from stellarweaver.web.delivery import Delivery  # noqa: E402
 from stellarweaver.web.identity import Member  # noqa: E402
-from stellarweaver.web.isolation import Isolation, saved_worktree  # noqa: E402
+from stellarweaver.web.isolation import DockerRunner, Isolation, git, saved_worktree  # noqa: E402
 from stellarweaver.web.journal import JobOwnershipLost, PgJournal, pack  # noqa: E402
 from stellarweaver.web.offline import BAD, FIXED, WRONG  # noqa: E402
 from stellarweaver.web.worker import run_worker  # noqa: E402
@@ -442,15 +443,28 @@ def test_workbench_pins_project_skill_restores_evidence_and_exports(
 
 
 @pytest.mark.postgres
+@pytest.mark.parametrize("multi_edit", [False, True])
 def test_workbench_undo_restores_and_guards_real_worktree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, multi_edit: bool
 ) -> None:
     dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
     if not dsn:
         pytest.skip("Set STELLARWEAVER_TEST_DATABASE_DSN to a migrated test database")
     workspace = tmp_path / "repo"
     workspace.mkdir()
-    base = b"before\n"
+    base = b"before\n\nsecond\n" if multi_edit else b"before\n"
+    modified = b"agent\n\nupdated\n" if multi_edit else b"agent\n"
+    monkeypatch.setenv("SW_WEB_MULTI_EDIT_TOOLS", "1" if multi_edit else "0")
+    edit_args = (
+        {
+            "edits": [
+                {"old_text": "before", "new_text": "agent"},
+                {"old_text": "second", "new_text": "updated"},
+            ]
+        }
+        if multi_edit
+        else {"old_text": "before", "new_text": "agent"}
+    )
     (workspace / "note.txt").write_bytes(base)
     subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
     subprocess.run(["git", "add", "note.txt"], cwd=workspace, check=True)
@@ -484,8 +498,7 @@ def test_workbench_undo_restores_and_guards_real_worktree(
                             json.dumps(
                                 {
                                     "path": "note.txt",
-                                    "old_text": "before",
-                                    "new_text": "agent",
+                                    **edit_args,
                                     "expected_sha256": sha256_bytes(base),
                                 }
                             ),
@@ -544,7 +557,7 @@ def test_workbench_undo_restores_and_guards_real_worktree(
             execute_one()
             assert wait_done(client, token, ids["run_id"])["status"] == "completed"
             work = saved_worktree(state, str(principal.tenant), ids["session_id"])
-            assert (work / "note.txt").read_bytes() == b"agent\n" and (work / "new.txt").is_file()
+            assert (work / "note.txt").read_bytes() == modified and (work / "new.txt").is_file()
 
             def undo(previous, path):
                 route = f"/api/v1/runs/{previous}/undo"
@@ -567,7 +580,7 @@ def test_workbench_undo_restores_and_guards_real_worktree(
             blocked = undo(removed["run_id"], "note.txt")
             assert blocked["outcome"]["error_code"] == "UNDO_CONFLICT"
             assert (work / "note.txt").read_bytes() == b"user concurrent change\n"
-            (work / "note.txt").write_bytes(b"agent\n")
+            (work / "note.txt").write_bytes(modified)
             restored = undo(blocked["run_id"], "note.txt")
             assert restored["status"] == "completed" and (work / "note.txt").read_bytes() == base
             assert (workspace / "note.txt").read_bytes() == base and not (
@@ -580,6 +593,184 @@ def test_workbench_undo_restores_and_guards_real_worktree(
                 "note.txt",
                 "new.txt",
             }
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("kind", ["patch", "sandbox-grant"])
+def test_batch2_workbench_group_undo_and_scoped_grants(tmp_path, monkeypatch, kind):
+    dsn = os.getenv("STELLARWEAVER_TEST_DATABASE_DSN")
+    if not dsn:
+        pytest.skip("Set STELLARWEAVER_TEST_DATABASE_DSN to a migrated test database")
+    root, state = tmp_path / "repo", tmp_path / "state"
+    root.mkdir()
+    original, deleted = b"value = 1\n", b"other = 2\n"
+    (root / "first.py").write_bytes(original)
+    (root / "second.py").write_bytes(deleted)
+    git(root, "init", "--template=")
+    git(root, "add", "first.py", "second.py")
+    git(
+        root,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=f@example.invalid",
+        "commit",
+        "-qm",
+        "base",
+    )
+    token, principal = uuid4().hex, Principal(uuid4(), (root,))
+    tenant, workspaces = str(principal.tenant), principal.workspace_map()
+    isolation = Isolation("unused", (tuple(VERIFY_ARGV),), "batch-2-fixture", development=True)
+    monkeypatch.setattr(Isolation, "reap", lambda *args: None)
+    monkeypatch.setenv("SW_WEB_MULTI_FILE_APPLY", "1")
+    monkeypatch.setenv("SW_WEB_SCOPED_TEST_GRANTS", "1")
+    executed = []
+
+    async def runner(_self, argv, *_args, **_kwargs):
+        action, arguments = decode_development(argv)
+        assert action == "run_tests"
+        executed.append(arguments.target)
+        return {"content": "fixture pass", "data": {"exit_code": 0, "argv": argv}}
+
+    monkeypatch.setattr(DockerRunner, "__call__", runner)
+    if kind == "patch":
+        actions = iter(
+            [
+                (
+                    "apply_patch",
+                    {
+                        "changes": [
+                            {
+                                "path": "first.py",
+                                "content": "value = 3\n",
+                                "expected_sha256": sha256_bytes(original),
+                            },
+                            {"path": "new.py", "content": "new = True\n", "expected_sha256": None},
+                            {
+                                "path": "second.py",
+                                "content": None,
+                                "expected_sha256": sha256_bytes(deleted),
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+    else:
+        actions = iter(
+            [
+                ("run_tests", {"target": "first.py", "framework": "pytest"}),
+                ("run_tests", {"target": "second.py", "framework": "pytest"}),
+            ]
+        )
+
+    def make_model(_commands):
+        tool, arguments = next(actions)
+        return FakeModel(
+            [
+                AssistantReply(
+                    tool_calls=(ToolCall(uuid4().hex, tool, json.dumps(arguments)),),
+                    stop_reason="tool_calls",
+                ),
+                AssistantReply("Done"),
+            ]
+        )
+
+    monkeypatch.setattr("stellarweaver.web.execution.offline_repair_model", make_model)
+    engine = engine_for(dsn)
+    try:
+        with (
+            TestClient(
+                create_app(
+                    engine,
+                    {token: principal},
+                    state,
+                    queued=True,
+                    isolated=True,
+                    enable_repair=True,
+                ),
+                base_url="http://127.0.0.1",
+            ) as client,
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+
+            def execute_one():
+                run_worker(
+                    engine,
+                    tenant,
+                    workspaces,
+                    state,
+                    provider="fake",
+                    once=True,
+                    enable_repair=True,
+                    isolation=isolation,
+                )
+
+            def launch(**options):
+                response = client.post(
+                    "/api/v1/runs",
+                    headers=auth(token),
+                    json={
+                        "workspace_id": next(iter(workspaces)),
+                        "request_id": str(uuid4()),
+                        "prompt": "Run fixture",
+                        **options,
+                    },
+                )
+                assert response.status_code == 202, response.text
+                return response.json()
+
+            ids = launch(mode="auto" if kind == "patch" else "repair")
+            route = f"/api/v1/runs/{ids['run_id']}"
+            if kind == "patch":
+                execute_one()
+                assert wait_done(client, token, ids["run_id"])["status"] == "completed"
+                work = saved_worktree(state, tenant, ids["session_id"])
+                assert (work / "first.py").read_bytes() == b"value = 3\n"
+                assert (work / "new.py").is_file() and not (work / "second.py").exists()
+                target = client.get(route + "/undo", headers=auth(token)).json()["target"]
+                assert target["paths"] == ["first.py", "new.py", "second.py"]
+                response = client.post(
+                    route + "/undo",
+                    headers=auth(token),
+                    json={
+                        "operation_id": target["operation_id"],
+                        "request_id": str(uuid4()),
+                    },
+                )
+                assert response.status_code == 202, response.text
+                execute_one()
+                assert wait_done(client, token, response.json()["run_id"])["status"] == "completed"
+                assert (work / "first.py").read_bytes() == original
+                assert (work / "second.py").read_bytes() == deleted and not (
+                    work / "new.py"
+                ).exists()
+                assert (root / "first.py").read_bytes() == original and not (
+                    root / "new.py"
+                ).exists()
+            else:
+                worker = pool.submit(execute_one)
+                approval = wait_approval(client, token, route)
+                assert approval["tool"] == "run_tests" and approval["offer_test_scope"]
+                accepted = client.post(
+                    route + "/approvals/" + approval["id"],
+                    headers=auth(token),
+                    json={"decision": "approve-session"},
+                )
+                assert accepted.status_code == 204, accepted.text
+                worker.result(timeout=25)
+                assert wait_done(client, token, ids["run_id"])["status"] == "completed"
+                next_ids = launch(mode="repair", session_id=ids["session_id"])
+                worker = pool.submit(execute_one)
+                try:
+                    worker.result(timeout=12)
+                except TimeoutError:
+                    client.post(f"/api/v1/runs/{next_ids['run_id']}/cancel", headers=auth(token))
+                    raise
+                assert wait_done(client, token, next_ids["run_id"])["status"] == "completed"
+                assert executed == ["first.py", "second.py"]
     finally:
         engine.dispose()
 

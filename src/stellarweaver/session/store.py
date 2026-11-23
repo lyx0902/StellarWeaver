@@ -667,6 +667,17 @@ class SessionStore:
             )
         )
 
+    def prior_test_grants(self) -> list[JSONDict]:
+        return [
+            json.loads(row[0])
+            for row in self.connection.execute("""
+                SELECT decision_json FROM tool_executions
+                WHERE decision_json IS NOT NULL
+                  AND json_extract(decision_json, '$.session_test_grant') = 1
+                ORDER BY rowid DESC LIMIT 256
+                """)
+        ]
+
     @staticmethod
     def _checkpoint_row(row: sqlite3.Row) -> JSONDict:
         data = dict(row)
@@ -747,6 +758,9 @@ class SessionStore:
 
     def _reconcile_tools(self) -> JSONDict:
         """Resolve incomplete tool rounds from evidence, never execute a tool."""
+        from stellarweaver.tools.patch_write import inspect_patch
+        from stellarweaver.tools.workspace import Workspace
+
         reports: list[JSONDict] = []
         # V1 persisted assistant messages before creating any planned journal rows.
         with self.connection:
@@ -781,6 +795,7 @@ class SessionStore:
         )
         for row in rows:
             state = row["state"]
+            intent = json.loads(row["intent_json"] or "{}")
             status: ToolStatus = "cancelled"
             data: JSONDict = {
                 "code": "RECOVERED_NOT_EXECUTED",
@@ -799,7 +814,12 @@ class SessionStore:
                 content = str(decision.get("reason", "Authorization did not allow execution."))
                 data.update({"code": "PERMISSION_DENIED", "decision": decision["decision"]})
             if state == "started":
-                if row["tool_name"] in {"create_file", "edit_file"}:
+                if row["tool_name"] == "apply_patch":
+                    workspace = Workspace(self.workspace)
+                    workspace.protect(self.directory)
+                    status, content, details = inspect_patch(workspace, intent)
+                    data.update(details)
+                elif row["tool_name"] in {"create_file", "edit_file"}:
                     status, content, details = self._reconcile_file(
                         json.loads(row["intent_json"] or "{}")
                     )
@@ -820,12 +840,17 @@ class SessionStore:
                     data["code"] = "RECOVERY_RESULT_UNAVAILABLE"
             needs_attention = status in {"unknown", "blocked"}
             attention = attention or needs_attention
-            intent = json.loads(row["intent_json"] or "{}")
             artifacts = tuple(
                 str(intent[key])
                 for key in ("before_artifact_id", "diff_artifact_id")
                 if intent.get(key)
             )
+            if row["tool_name"] == "apply_patch" and status == "ok":
+                artifacts += tuple(
+                    item["before_artifact_id"]
+                    for item in data["files"]
+                    if item["before_artifact_id"] is not None
+                )
             result = ToolResult(
                 row["call_id"],
                 row["operation_id"],
@@ -898,6 +923,13 @@ class SessionStore:
 
     def _inspect_undo_state(self, intent: JSONDict) -> tuple[str, str, JSONDict]:
         from stellarweaver.tools.workspace import MAX_EDIT_BYTES, ToolError, Workspace
+
+        if "files" in intent:
+            from stellarweaver.tools.patch_write import inspect_patch
+
+            workspace = Workspace(self.workspace)
+            workspace.protect(self.directory)
+            return inspect_patch(workspace, intent, undo=True)
 
         details: JSONDict = {"code": "UNDO_RECOVERY_CONFLICT", "recovered_from_state": False}
         relative, desired, mode = (

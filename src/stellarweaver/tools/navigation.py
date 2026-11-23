@@ -18,8 +18,8 @@ class NavigationArgs(Arguments):
     limit: int = Field(default=10, ge=1, le=50)
 
 
-def register_navigation(registry: ToolRegistry) -> None:
-    index = NavigationIndex(RepoMap(registry.workspace))
+def register_navigation(registry: ToolRegistry, *, prefilter: bool = False) -> None:
+    index = NavigationIndex(RepoMap(registry.workspace), prefilter=prefilter)
 
     def bind(mode: NavigationMode) -> Prepare:
         async def prepare(args: NavigationArgs, ctx: ToolContext) -> PreparedTool:
@@ -29,7 +29,12 @@ def register_navigation(registry: ToolRegistry) -> None:
             async def execute() -> JSONDict:
                 if path is not None and args.path is not None:
                     ctx.workspace.recheck(args.path, path)
-                data = await asyncio.to_thread(index.query, mode, args.symbol, hint, args.limit)
+                lookup = (
+                    NavigationIndex(index.repo, prefilter=prefilter, sources=index.sources)
+                    if ctx.parallel_read
+                    else index
+                )
+                data = await asyncio.to_thread(lookup.query, mode, args.symbol, hint, args.limit)
                 return {"data": data}
 
             return PreparedTool({"path": hint, "symbol": args.symbol}, execute)

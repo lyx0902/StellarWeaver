@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import ast
+import io
+import os
 import re
+import stat
 import time
+import tokenize
+import unicodedata
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
+from threading import Lock
 from typing import Literal
 
-from stellarweaver.context.repo_map import RepoMap
+from stellarweaver.context.repo_map import RepoMap, direct_entry
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.workspace import ToolError, sha256_bytes
 
@@ -165,12 +172,70 @@ def _index(path: str, raw: bytes, digest: str) -> Module:
         return Module(digest, module, (), True)
 
 
-class NavigationIndex:
-    def __init__(self, repo: RepoMap) -> None:
-        self.repo = repo
-        self.cache: dict[str, Module] = {}
+def _mentions(source: bytes, needle: bytes, leaf: str) -> bool:
+    if needle in source:
+        return True
+    if source.isascii():
+        return False
+    # Python normalizes Unicode identifiers before reporting AST names.
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(source).readline)
+        text = source.decode(encoding)
+    except (LookupError, SyntaxError, UnicodeError):
+        return True
+    return leaf in unicodedata.normalize("NFKC", text)
 
-    def _file(self, path: str) -> Module | None:
+
+def _stamp(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_mtime_ns,
+        info.st_size,
+        info.st_ctime_ns,
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+    )
+
+
+class NavigationSources:
+    """Share verified source bytes between queries without sharing mutable AST results."""
+
+    def __init__(self, max_files: int, max_bytes: int = 16 * 1024 * 1024) -> None:
+        self.max_files, self.max_bytes = max_files, max_bytes
+        self.size = 0
+        self.entries: OrderedDict[str, tuple[tuple[int, ...], bytes]] = OrderedDict()
+        self.lock = Lock()
+
+    def get(self, path: str, stamp: tuple[int, ...]) -> bytes | None:
+        with self.lock:
+            entry = self.entries.get(path)
+            if entry is not None and stamp == entry[0]:
+                self.entries.move_to_end(path)
+                return entry[1]
+            return None
+
+    def put(self, path: str, stamp: tuple[int, ...], data: bytes) -> None:
+        if len(data) > self.max_bytes:
+            return
+        with self.lock:
+            old = self.entries.pop(path, None)
+            self.size += len(data) - (len(old[1]) if old else 0)
+            self.entries[path] = (stamp, data)
+            while len(self.entries) > self.max_files or self.size > self.max_bytes:
+                _, entry = self.entries.popitem(last=False)
+                self.size -= len(entry[1])
+
+
+class NavigationIndex:
+    def __init__(
+        self, repo: RepoMap, *, prefilter: bool = False, sources: NavigationSources | None = None
+    ) -> None:
+        self.repo = repo
+        self.prefilter = prefilter
+        self.cache: dict[str, Module] = {}
+        self.sources = (sources or NavigationSources(repo.max_files)) if prefilter else None
+
+    def _source(self, path: str) -> bytes | None:
         workspace = self.repo.workspace
         try:
             target = workspace.resolve(path)
@@ -182,6 +247,37 @@ class NavigationIndex:
                 return None
         except (OSError, ToolError, ValueError):
             return None
+        return raw
+
+    def _cached_source(self, name: str) -> tuple[bytes | None, bool]:
+        assert self.sources is not None
+        path = self.repo.workspace.root / name
+        try:
+            info = path.lstat()
+            if (
+                not direct_entry(info)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_size > self.repo.max_file_bytes
+            ):
+                return None, False
+            key = _stamp(info)
+            cached = self.sources.get(name, key)
+            if cached is not None:
+                return cached, True
+            data = self._source(name)
+            current = path.lstat()
+            if data is not None and direct_entry(current) and _stamp(current) == key:
+                self.sources.put(name, key, data)
+                return data, False
+        except (OSError, ValueError):
+            pass
+        return None, False
+
+    def _file(self, path: str, raw: bytes | None = None) -> Module | None:
+        if raw is None:
+            raw = self._source(path)
+        if raw is None:
+            return None
         digest = sha256_bytes(raw)
         cached = self.cache.get(path)
         if cached is None or cached.sha256 != digest:
@@ -190,7 +286,7 @@ class NavigationIndex:
 
     def query(self, mode: NavigationMode, name: str, path_hint: str | None, limit: int) -> JSONDict:
         started = time.monotonic()
-        paths, truncated = self.repo.paths()
+        paths, truncated = self.repo.paths(direct=self.prefilter)
         leaf = name.rsplit(".", 1)[-1]
         candidates = [path for path in paths if path.endswith(".py")]
         candidates.sort(
@@ -202,13 +298,48 @@ class NavigationIndex:
             )
         )
         selected = candidates[: self.repo.max_indexed_files]
+        index_truncated = len(candidates) > len(selected)
+        unavailable = 0
+        sources: dict[str, bytes] = {}
+        prefilter_details: JSONDict = {}
+        if self.prefilter and len(candidates) > self.repo.max_indexed_files:
+            needle = leaf.encode("utf-8", errors="surrogatepass")
+            scanned = hits = reused = 0
+            index_truncated = False
+            for path in candidates:
+                if mode == "find_related_tests" and not is_test(path):
+                    continue
+                scanned += 1
+                source, from_cache = self._cached_source(path)
+                reused += int(from_cache)
+                if source is None:
+                    unavailable += 1
+                    continue
+                found = _mentions(source, needle, leaf)
+                hits += int(found)
+                if found or path == path_hint:
+                    if len(sources) == self.repo.max_indexed_files:
+                        index_truncated = True
+                        break
+                    sources[path] = source
+            selected = list(sources)
+            prefilter_details = {
+                "prefilter_scanned": scanned,
+                "prefilter_matches": hits,
+                "prefilter_cache_hits": reused,
+            }
         self.cache = {path: module for path, module in self.cache.items() if path in selected}
         rows = []
-        unavailable = 0
         for path in selected:
             if mode == "find_related_tests" and not is_test(path):
                 continue
-            entry = self._file(path)
+            source = sources.get(path)
+            if source is None and self.sources is not None:
+                source, _ = self._cached_source(path)
+                if source is None:
+                    unavailable += 1
+                    continue
+            entry = self._file(path, source)
             if entry is None:
                 unavailable += 1
                 continue
@@ -248,11 +379,9 @@ class NavigationIndex:
             "dynamic_resolution": "unknown",
             "indexed_files": len(self.cache),
             "unavailable_or_partial_files": unavailable,
-            "truncated": truncated
-            or len(candidates) > len(selected)
-            or len(rows) > limit
-            or bool(unavailable),
+            "truncated": truncated or index_truncated or len(rows) > limit or bool(unavailable),
             "duration_ms": int((time.monotonic() - started) * 1000),
+            **prefilter_details,
         }
 
 

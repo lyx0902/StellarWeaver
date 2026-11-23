@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import type { Approval, Run, RunEvent } from './api'
+import type { Approval, ApprovalDecision, Run, RunEvent } from './api'
 
 const markdownComponents: Components = {
   table: ({ children }) => <div className="answer-table" role="region" aria-label="回复表格" tabIndex={0}>
@@ -96,7 +96,7 @@ function Process({ events, settled, onLogs }: {
 }
 
 export function ApprovalCard({ item, busy, onDecision }: {
-  item: Approval; busy: boolean; onDecision: (decision: 'approve' | 'deny') => void
+  item: Approval; busy: boolean; onDecision: (decision: ApprovalDecision) => void
 }) {
   return <section className="approval" aria-label="待审批操作">
     <h3>待审批操作</h3>
@@ -113,6 +113,7 @@ export function ApprovalCard({ item, busy, onDecision }: {
     </details>}
     <div className="actions">
       <button className="primary" type="button" disabled={busy} onClick={() => onDecision('approve')}>批准一次</button>
+      {item.offer_test_scope && <button type="button" disabled={busy} onClick={() => onDecision('approve-session')}>允许本会话更换目标文件</button>}
       <button type="button" disabled={busy} onClick={() => onDecision('deny')}>拒绝</button>
       <span className="muted">有效至 {new Date(item.expires_at).toLocaleTimeString()}</span>
     </div>
@@ -184,7 +185,8 @@ export function Turn({ run, events, focused, approval, hasReport, onOpen, onLogs
 
 export function ContextMeter({ events, limit }: { events: RunEvent[]; limit: number | null }) {
   const [open, setOpen] = useState(false)
-  const started = events.filter(event => event.type === 'model.started' && event.payload.purpose !== 'ds_search').at(-1)
+  const started = events.filter(event => event.type === 'model.started' &&
+    event.payload.purpose !== 'ds_search' && event.payload.purpose !== 'delegate_exploration').at(-1)
   const completed = events.filter(event =>
     event.type === 'model.completed' && event.payload.request_index === started?.payload.request_index).at(-1)
   const payload = completed?.payload ?? started?.payload

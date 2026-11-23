@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event
 from typing import cast
@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from stellarweaver.config import AppConfig, HarnessConfig, ModelConfig, PolicyConfig
+from stellarweaver.config import AppConfig, ContextConfig, HarnessConfig, ModelConfig, PolicyConfig
 from stellarweaver.domain import (
     AssistantReply,
     JSONDict,
@@ -108,12 +108,27 @@ async def run(
     config = AppConfig(
         model=web_model_config(provider, context_window_tokens),
         policy=PolicyConfig(preset=("auto" if auto else "ask") if repair else "read-only"),
+        context=ContextConfig(fresh_tool_rounds=int(os.getenv("SW_WEB_FRESH_TOOL_ROUNDS", "2"))),
         harness=HarnessConfig(
             development_tools=bool(repair and runner and runner.isolation.development),
             issue_navigation=os.getenv("SW_WEB_ISSUE_NAVIGATION") == "1",
             patch_staging=bool(repair and os.getenv("SW_WEB_PATCH_STAGING") == "1"),
             task_evidence=os.getenv("SW_WEB_TASK_EVIDENCE") == "1",
             budget_guidance=os.getenv("SW_WEB_BUDGET_GUIDANCE") == "1",
+            pipeline_metrics=os.getenv("SW_WEB_PIPELINE_METRICS") == "1",
+            multi_edit_tools=os.getenv("SW_WEB_MULTI_EDIT_TOOLS") == "1",
+            post_edit_syntax_hook=os.getenv("SW_WEB_POST_EDIT_SYNTAX_HOOK") == "1",
+            smart_tool_truncation=os.getenv("SW_WEB_SMART_TOOL_TRUNCATION") == "1",
+            navigation_prefilter=os.getenv("SW_WEB_NAVIGATION_PREFILTER") == "1",
+            multi_file_apply=bool(repair and os.getenv("SW_WEB_MULTI_FILE_APPLY") == "1"),
+            parallel_read_tools=os.getenv("SW_WEB_PARALLEL_READ_TOOLS") == "1",
+            scoped_test_grants=bool(repair and os.getenv("SW_WEB_SCOPED_TEST_GRANTS") == "1"),
+            incremental_sandbox_snapshots=os.getenv("SW_WEB_INCREMENTAL_SANDBOX_SNAPSHOTS") == "1",
+            import_aware_repomap=os.getenv("SW_WEB_IMPORT_AWARE_REPOMAP") == "1",
+            subagent_exploration=os.getenv("SW_WEB_SUBAGENT_EXPLORATION") == "1",
+            calibrated_context_budget=os.getenv("SW_WEB_CALIBRATED_CONTEXT_BUDGET") == "1",
+            sticky_context_checkpoint=os.getenv("SW_WEB_STICKY_CONTEXT_CHECKPOINT") == "1",
+            protect_fresh_tool_output=os.getenv("SW_WEB_PROTECT_FRESH_TOOL_OUTPUT") == "1",
             repair_controller=(
                 "enforce"
                 if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "enforce"
@@ -123,6 +138,16 @@ async def run(
             ),
         ),
     )
+    if runner is not None and (
+        config.harness.pipeline_metrics or config.harness.incremental_sandbox_snapshots
+    ):
+        runner = replace(
+            runner,
+            pipeline_metrics=config.harness.pipeline_metrics or runner.pipeline_metrics,
+            incremental_snapshots=(
+                config.harness.incremental_sandbox_snapshots or runner.incremental_snapshots
+            ),
+        )
     commands = runner.isolation.commands if runner else (tuple(VERIFY_ARGV),)
     if runner and journal.delivery is not None:
         journal.delivery.required_commands = commands
@@ -191,6 +216,8 @@ async def run(
                 enforce_run_budget=False,
                 adaptive_round_retention=True,
             )
+            if config.harness.scoped_test_grants:
+                agent.registry.policy.restore_test_grants(journal.prior_test_grants())
             interruption = journal.latest_interruption() if continuation else None
             if interruption is not None:
                 journal.append_event("run.recovery_context", interruption)

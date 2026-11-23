@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import json
 import os
@@ -207,6 +208,9 @@ async def prepare_search_text(args: SearchTextArgs, ctx: ToolContext) -> Prepare
         executable = shutil.which("rg")
         if executable is not None:
             return await _rg_search(executable, args, ctx, root)
+        return await asyncio.to_thread(search) if ctx.parallel_read else search()
+
+    def search() -> dict[str, Any]:
         matches: list[dict[str, Any]] = []
         skipped: list[str] = []
         truncated = False

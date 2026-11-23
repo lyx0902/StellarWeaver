@@ -85,6 +85,7 @@ class ContextConfig(StrictConfig):
     target_ratio: float = Field(default=0.55, gt=0, lt=1)
     reserve_tokens: int = Field(default=2048, ge=0)
     recent_complete_rounds: int = Field(default=6, ge=1)
+    fresh_tool_rounds: int = Field(default=2, ge=1)
 
     @model_validator(mode="after")
     def threshold_order(self) -> "ContextConfig":
@@ -106,6 +107,20 @@ class HarnessConfig(StrictConfig):
     patch_staging: bool = False
     task_evidence: bool = False
     budget_guidance: bool = False
+    pipeline_metrics: bool = False
+    multi_edit_tools: bool = False
+    post_edit_syntax_hook: bool = False
+    smart_tool_truncation: bool = False
+    navigation_prefilter: bool = False
+    multi_file_apply: bool = False
+    parallel_read_tools: bool = False
+    scoped_test_grants: bool = False
+    incremental_sandbox_snapshots: bool = False
+    import_aware_repomap: bool = False
+    subagent_exploration: bool = False
+    calibrated_context_budget: bool = False
+    sticky_context_checkpoint: bool = False
+    protect_fresh_tool_output: bool = False
 
 
 class AppConfig(StrictConfig):

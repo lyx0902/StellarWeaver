@@ -320,9 +320,14 @@ async def execute_chat(
                 interactive=True,
                 approval=ui.approve,
                 policy_file=policy_file,
+                scoped_test_grants=config.harness.scoped_test_grants,
             )
             registry = ToolRegistry(
-                workspace, engine, execution=config.execution, artifacts_dir=store.artifacts_dir
+                workspace,
+                engine,
+                execution=config.execution,
+                artifacts_dir=store.artifacts_dir,
+                harness=config.harness,
             )
             attach_harness(registry, config)
             agent = Agent(
@@ -409,7 +414,10 @@ async def execute_chat(
                                 raise ValueError(
                                     "Selected model has no usable configured context budget"
                                 )
-                            projection = ContextManager().build(
+                            projection = ContextManager(
+                                smart_tool_truncation=config.harness.smart_tool_truncation,
+                                protect_fresh_tool_output=config.harness.protect_fresh_tool_output,
+                            ).build(
                                 agent.projected_history(),
                                 registry.schemas(),
                                 config.model.max_output_tokens,
@@ -561,9 +569,16 @@ async def execute_resume(
                 interactive=sys.stdin.isatty() and sys.stdout.isatty() and not json_output,
                 approval=ui.approve,
                 policy_file=policy_file,
+                scoped_test_grants=config.harness.scoped_test_grants,
             )
+            if config.harness.scoped_test_grants:
+                engine.restore_test_grants(store.prior_test_grants())
             registry = ToolRegistry(
-                root, engine, execution=config.execution, artifacts_dir=store.artifacts_dir
+                root,
+                engine,
+                execution=config.execution,
+                artifacts_dir=store.artifacts_dir,
+                harness=config.harness,
             )
             attach_harness(registry, config)
             agent = Agent(

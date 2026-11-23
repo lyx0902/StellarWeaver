@@ -159,9 +159,11 @@ class Workspace:
         if self.resolve(value, allow_directory=allow_directory) != expected:
             raise ToolError("PATH_CHANGED", "The resolved target changed during authorization.")
 
-    def is_ignored(self, relative: str, *, is_dir: bool = False) -> bool:
-        if self.is_protected(relative) or self._is_extra_protected(
-            (self.root / relative).resolve(strict=False)
+    def is_ignored(self, relative: str, *, is_dir: bool = False, direct: bool = False) -> bool:
+        path = self.root / relative
+        if self.is_protected(relative) or (
+            self.protected_roots
+            and self._is_extra_protected(path if direct else path.resolve(strict=False))
         ):
             return True
         if any(part in SKIP_DIRECTORIES for part in Path(relative).parts):

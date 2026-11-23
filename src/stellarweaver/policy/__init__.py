@@ -26,11 +26,13 @@ READ_TOOLS = frozenset(
         "find_symbol",
         "find_references",
         "find_related_tests",
+        "delegate_exploration",
         DS_SEARCH,
     }
 )
-EDIT_TOOLS = frozenset({"create_file", "edit_file"})
+EDIT_TOOLS = frozenset({"create_file", "edit_file", "apply_patch"})
 BENCHMARK_TOOLS = (READ_TOOLS - {DS_SEARCH}) | EDIT_TOOLS
+DEVELOPMENT_TOOLS = frozenset({"run_tests", "discover_tests", "check_syntax", "run_linter"})
 
 
 class Grant(BaseModel):
@@ -41,6 +43,8 @@ class Grant(BaseModel):
     cwd: str | None = None
     server_id: str | None = None
     arguments: dict[str, Any] | None = None
+    command_boundary: str | None = Field(default=None, min_length=1)
+    framework: str | None = None
 
 
 class PolicyFile(BaseModel):
@@ -57,6 +61,8 @@ class FrozenGrant:
     cwd: str | None
     server_id: str | None = None
     arguments: dict[str, Any] | None = None
+    command_boundary: str | None = None
+    framework: str | None = None
 
 
 Approval = Callable[[dict[str, Any]], Awaitable[str]]
@@ -73,6 +79,7 @@ class PolicyEngine:
         approval: Approval | None = None,
         policy_file: Path | None = None,
         allow_sandbox_development: bool = False,
+        scoped_test_grants: bool = False,
     ) -> None:
         if preset not in {"ask", "read-only", "workspace-edit", "auto", "benchmark"}:
             raise ValueError("Unknown policy preset")
@@ -81,6 +88,7 @@ class PolicyEngine:
         self.interactive = interactive
         self.approval = approval
         self.allow_sandbox_development = allow_sandbox_development
+        self.scoped_test_grants = scoped_test_grants
         self._grants: tuple[FrozenGrant, ...] = ()
         self._session: set[str] = set()
         if policy_file is not None:
@@ -109,6 +117,20 @@ class PolicyEngine:
                 elif grant.tool.startswith("mcp__"):
                     if not grant.server_id or grant.arguments is None:
                         raise ValueError("MCP grants require exact server_id and arguments")
+                elif grant.tool in DEVELOPMENT_TOOLS:
+                    if (
+                        not self.scoped_test_grants
+                        or not grant.command_boundary
+                        or grant.framework not in {"pytest", "unittest"}
+                        or grant.paths
+                        or grant.argv is not None
+                        or grant.cwd is not None
+                        or grant.server_id is not None
+                        or grant.arguments is not None
+                    ):
+                        raise ValueError(
+                            "Development grants require scoped_test_grants, a command boundary and framework"
+                        )
                 elif grant.tool not in READ_TOOLS:
                     raise ValueError(f"Unknown policy tool: {grant.tool}")
                 grants.append(
@@ -119,6 +141,8 @@ class PolicyEngine:
                         grant.cwd,
                         grant.server_id,
                         grant.arguments,
+                        grant.command_boundary,
+                        grant.framework,
                     )
                 )
             self._grants = tuple(grants)
@@ -149,6 +173,10 @@ class PolicyEngine:
 
     def _matches(self, invocation: dict[str, Any]) -> bool:
         for grant in self._grants:
+            if grant.tool == "apply_patch" == invocation["tool"]:
+                paths = invocation.get("paths")
+                if isinstance(paths, list) and paths and all(path in grant.paths for path in paths):
+                    return True
             if grant.tool != invocation["tool"]:
                 continue
             if grant.tool in {"run_command", "mcp_start"}:
@@ -184,7 +212,15 @@ class PolicyEngine:
                 "preset": self.preset,
                 "interactive": self.interactive,
                 "allow_sandbox_development": self.allow_sandbox_development,
-                "grants": [asdict(grant) for grant in self._grants],
+                "grants": [
+                    {
+                        key: value
+                        for key, value in asdict(grant).items()
+                        if key not in {"command_boundary", "framework"} or value is not None
+                    }
+                    for grant in self._grants
+                ],
+                **({"scoped_test_grants": True} if self.scoped_test_grants else {}),
             }
         )
 
@@ -196,6 +232,62 @@ class PolicyEngine:
             and invocation.get("development_action") is not None
             and invocation.get("development_action") == invocation.get("registered_tool")
         )
+
+    def _development_scope(self, invocation: dict[str, Any]) -> str | None:
+        boundary = invocation.get("command_boundary")
+        if (
+            not self.scoped_test_grants
+            or not self._sandbox_development(invocation)
+            or not isinstance(boundary, str)
+            or not boundary
+            or invocation.get("cwd") != "."
+            or invocation.get("development_action") not in DEVELOPMENT_TOOLS
+        ):
+            return None
+        from stellarweaver.tools.development import decode_development
+
+        argv = invocation.get("argv")
+        decoded = decode_development(argv) if isinstance(argv, list) else None
+        if decoded is None:
+            return None
+        action, args = decoded
+        if (
+            action != invocation["development_action"]
+            or args.target != invocation.get("path")
+            or args.framework != invocation.get("framework")
+        ):
+            return None
+        # Only target is omitted. The transport, interpreter, action and framework remain bound.
+        return "development:" + fingerprint(
+            {
+                key: invocation.get(key)
+                for key in (
+                    "workspace",
+                    "registered_tool",
+                    "executor",
+                    "command_boundary",
+                    "policy_binding",
+                    "hooks_binding",
+                    "cwd",
+                    "framework",
+                    "timeout_seconds",
+                )
+            }
+        )
+
+    def restore_test_grants(self, decisions: list[dict[str, Any]]) -> None:
+        for decision in decisions:
+            authorized = {**decision, "tool": "run_command"}
+            if (
+                decision.get("session_test_grant") is True
+                and decision.get("authorization_tool") == "run_command"
+                and decision.get("decision") == "allow"
+                and decision.get("policy_binding") == self.binding()
+                and decision.get("workspace") == str(self.workspace)
+                and self.prohibition(authorized) is None
+                and (scope := self._development_scope(authorized)) is not None
+            ):
+                self._session.add(scope)
 
     def prohibition(self, invocation: dict[str, Any]) -> str | None:
         tool = invocation["tool"]
@@ -250,6 +342,17 @@ class PolicyEngine:
             }
         if self.preset == "benchmark":
             return {"decision": "allow", "reason": "Frozen benchmark policy"}
+        test_scope = None if force_approval else self._development_scope(invocation)
+        if test_scope and (
+            test_scope in self._session
+            or any(
+                grant.tool == invocation["registered_tool"]
+                and grant.command_boundary == invocation["command_boundary"]
+                and grant.framework == invocation["framework"]
+                for grant in self._grants
+            )
+        ):
+            return {"decision": "allow", "reason": "Explicit scoped sandbox development grant"}
         if (
             not force_approval
             and self.allow_sandbox_development
@@ -272,7 +375,12 @@ class PolicyEngine:
                     "decision": "allow",
                     "reason": "Auto allows scoped editing and sandbox checks",
                 }
-            return await self._ask(invocation, one_shot=True, check=before_approval)
+            return await self._ask(
+                invocation,
+                one_shot=test_scope is None,
+                check=before_approval,
+                test_scope=test_scope,
+            )
         scope = self._scope(invocation)
         one_shot = force_approval or assess(invocation).level == "L2"
         if not force_approval and (
@@ -281,10 +389,17 @@ class PolicyEngine:
             return {"decision": "allow", "reason": "Explicit scoped grant"}
         if not force_approval and self.preset == "workspace-edit" and tool in EDIT_TOOLS:
             return {"decision": "allow", "reason": "workspace-edit allows built-in edits"}
-        return await self._ask(invocation, one_shot=one_shot, check=before_approval)
+        return await self._ask(
+            invocation, one_shot=one_shot, check=before_approval, test_scope=test_scope
+        )
 
     async def _ask(
-        self, invocation: dict[str, Any], *, one_shot: bool, check: ApprovalCheck | None
+        self,
+        invocation: dict[str, Any],
+        *,
+        one_shot: bool,
+        check: ApprovalCheck | None,
+        test_scope: str | None = None,
     ) -> dict[str, Any]:
         approval = self.approval
         if not self.interactive or approval is None:
@@ -294,10 +409,20 @@ class PolicyEngine:
             }
         if check is not None:
             await check()
-        answer = await approval({**deepcopy(invocation), "one_shot": one_shot})
+        answer = await approval(
+            {
+                **deepcopy(invocation),
+                "one_shot": one_shot,
+                **({"offer_test_scope": True} if test_scope else {}),
+            }
+        )
         if not one_shot and answer in {"session", "allow-session"}:
-            self._session.add(self._scope(invocation))
-            return {"decision": "allow", "reason": "User allowed this session scope"}
+            self._session.add(test_scope or self._scope(invocation))
+            return {
+                "decision": "allow",
+                "reason": "User allowed this session scope",
+                **({"session_test_grant": True} if test_scope else {}),
+            }
         if answer in {"once", "allow", "allow-once"}:
             return {"decision": "allow", "reason": "User allowed this invocation"}
         return {"decision": "deny", "reason": "User denied this invocation"}

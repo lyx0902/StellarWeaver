@@ -105,11 +105,23 @@ class Delivery:
 
     def result(self, result: ToolResult) -> None:
         data = result.data
-        if result.tool_name in {"edit_file", "create_file"} and result.status == "ok":
+        if (
+            result.tool_name in {"edit_file", "create_file", "apply_patch"}
+            and result.status == "ok"
+        ):
             self.edits += 1
             self.patches.append(
                 {
-                    **{k: data[k] for k in ("path", "before_sha256", "after_sha256") if k in data},
+                    **{
+                        k: data[k]
+                        for k in ("path", "paths", "before_sha256", "after_sha256")
+                        if k in data
+                    },
+                    **(
+                        {"path": ", ".join(data.get("paths", []))}
+                        if result.tool_name == "apply_patch"
+                        else {}
+                    ),
                     "operation_id": result.operation_id,
                     "diff": clip(data.get("diff", ""), MAX_PATCH),
                 }

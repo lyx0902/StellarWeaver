@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import os
+import stat
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ class RepoMapEntry:
     sha256: str | None = None
     symbols: tuple[str, ...] = ()
     parse_error: bool = False
+    imports: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,45 @@ def _symbols(tree: ast.Module, *, max_symbols: int = 100) -> tuple[str, ...]:
     return tuple(result)
 
 
+def python_module(relative: str) -> str:
+    parts = relative.removesuffix(".py").split("/")
+    if parts[0] == "src" and len(parts) > 1:
+        parts.pop(0)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _imports(tree: ast.Module, relative: str) -> tuple[str, ...]:
+    module = python_module(relative)
+    package = module if relative.endswith("/__init__.py") else module.rpartition(".")[0]
+    imports: dict[str, None] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imports.update(dict.fromkeys(alias.name for alias in node.names))
+        elif isinstance(node, ast.ImportFrom):
+            parts = package.split(".") if package else []
+            if node.level > len(parts):
+                continue
+            base = ".".join(
+                [
+                    *(parts[: len(parts) - node.level + 1] if node.level else []),
+                    *([node.module] if node.module else []),
+                ]
+            )
+            if base:
+                imports[base] = None
+            if base:
+                imports.update(dict.fromkeys(f"{base}.{alias.name}" for alias in node.names))
+    return tuple(imports)
+
+
+def direct_entry(info: os.stat_result) -> bool:
+    return not stat.S_ISLNK(info.st_mode) and not (
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
 class RepoMap:
     def __init__(
         self,
@@ -93,6 +134,7 @@ class RepoMap:
         max_files: int = 2000,
         max_indexed_files: int = 100,
         max_file_bytes: int = 262144,
+        import_aware: bool = False,
     ) -> None:
         if min(max_files, max_indexed_files, max_file_bytes) < 1:
             raise ValueError("Repo map scan limits must be positive")
@@ -100,6 +142,7 @@ class RepoMap:
         self.max_files = max_files
         self.max_indexed_files = max_indexed_files
         self.max_file_bytes = max_file_bytes
+        self.import_aware = import_aware
         self._cache: dict[str, RepoMapEntry] = {}
 
     def invalidate(self, path: str) -> None:
@@ -116,8 +159,10 @@ class RepoMap:
             and not self.workspace.is_ignored(relative)
         )
 
-    def paths(self) -> tuple[list[str], bool]:
+    def paths(self, *, direct: bool = False) -> tuple[list[str], bool]:
         paths: list[str] = []
+        if direct:
+            return self._direct_paths()
         for directory, folders, files in os.walk(self.workspace.root, followlinks=False):
             parent = Path(directory)
             folders[:] = sorted(
@@ -139,6 +184,40 @@ class RepoMap:
                 paths.append(relative)
         return paths, False
 
+    def _direct_paths(self) -> tuple[list[str], bool]:
+        paths: list[str] = []
+        pending = [(self.workspace.root, "")]
+        while pending:
+            directory, prefix = pending.pop()
+            folders = []
+            try:
+                with os.scandir(directory) as contents:
+                    for item in sorted(contents, key=lambda entry: entry.name):
+                        relative = prefix + item.name
+                        try:
+                            info = item.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if not direct_entry(info):
+                            continue
+                        if stat.S_ISDIR(info.st_mode):
+                            if item.name not in _IDE_DIRECTORIES and not self.workspace.is_ignored(
+                                relative, is_dir=True, direct=True
+                            ):
+                                folders.append((Path(item.path), relative + "/"))
+                        elif (
+                            stat.S_ISREG(info.st_mode)
+                            and Path(item.name).suffix.casefold() not in _BINARY_SUFFIXES
+                            and not self.workspace.is_ignored(relative, direct=True)
+                        ):
+                            if len(paths) >= self.max_files:
+                                return paths, True
+                            paths.append(relative)
+            except OSError:
+                continue
+            pending.extend(reversed(folders))
+        return paths, False
+
     def _entry(self, relative: str) -> RepoMapEntry:
         if not relative.endswith(".py"):
             return RepoMapEntry(relative)
@@ -156,7 +235,8 @@ class RepoMap:
                 return cached
             try:
                 tree = ast.parse(raw, filename=relative)
-                entry = RepoMapEntry(relative, digest, _symbols(tree))
+                imports = _imports(tree, relative) if self.import_aware else ()
+                entry = RepoMapEntry(relative, digest, _symbols(tree), imports=imports)
             except (SyntaxError, ValueError, RecursionError):
                 entry = RepoMapEntry(relative, digest, parse_error=True)
             self._cache[relative] = entry
@@ -206,6 +286,24 @@ class RepoMap:
             paths = combined[: self.max_files]
         words = tuple(word.casefold() for word in keywords if word)
         related = {str(Path(path).parent).replace("\\", "/") for path in visited}
+        neighbors: set[str] = set()
+        indexed_imports: dict[str, RepoMapEntry] = {}
+        if self.import_aware and preferred:
+            modules = {path: python_module(path) for path in paths if path.endswith(".py")}
+            indexed_imports = {path: self._entry(path) for path in modules}
+            anchor_modules = {modules[path] for path in preferred if path in modules}
+            outgoing = {
+                name
+                for path in preferred
+                if path in indexed_imports
+                for name in indexed_imports[path].imports
+            }
+            neighbors = {
+                path
+                for path, entry in indexed_imports.items()
+                if modules[path] in outgoing or anchor_modules.intersection(entry.imports)
+            }
+            self._cache = {path: entry for path, entry in self._cache.items() if path in modules}
 
         def rank(path: str, symbols: tuple[str, ...] = ()) -> tuple[int, str]:
             score = 0
@@ -215,6 +313,8 @@ class RepoMap:
                 score += 5000
             if path in visited:
                 score += 1000
+            if path in neighbors:
+                score += 450
             if str(Path(path).parent).replace("\\", "/") in related:
                 score += 100
             haystack = (path + " " + " ".join(symbols)).casefold()
@@ -224,7 +324,10 @@ class RepoMap:
             return -score, path
 
         ordered = sorted(paths, key=rank)
-        indexed = {path: self._entry(path) for path in ordered[: self.max_indexed_files]}
+        indexed = {
+            path: indexed_imports[path] if path in indexed_imports else self._entry(path)
+            for path in ordered[: self.max_indexed_files]
+        }
         entries = [indexed.get(path, RepoMapEntry(path)) for path in ordered]
         entries.sort(key=lambda item: rank(item.path, item.symbols))
         preamble = (
@@ -256,7 +359,14 @@ class RepoMap:
                 candidate_count = estimate_tokens(asdict(candidate))
                 truncated = True
                 if candidate_count > max_tokens:
-                    continue
+                    if entry.path not in neighbors:
+                        continue
+                    basic = RepoMapEntry(entry.path)
+                    line = basic.path
+                    candidate = Message("system", preamble + "\n".join([*lines, line]))
+                    candidate_count = estimate_tokens(asdict(candidate))
+                    if candidate_count > max_tokens:
+                        continue
                 entry = basic
             lines.append(line)
             selected.append(entry)

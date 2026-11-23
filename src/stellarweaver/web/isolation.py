@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -10,14 +11,24 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from time import perf_counter
 from typing import Any, BinaryIO, Literal
 from uuid import UUID, uuid4
 
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.commands import RunCommandArgs, _wait_cleanup, execute_command
 from stellarweaver.tools.workspace import ToolError, Workspace
+from stellarweaver.web.snapshots import (
+    ARCHIVE_LIMIT,
+    SnapshotCache,
+    SnapshotMismatch,
+    SnapshotState,
+    Transfer,
+    pack_transfer,
+    verify_transfer,
+)
 
 _MAX_FILES = 6000
 _MAX_BYTES = 32 * 1024 * 1024
@@ -284,6 +295,44 @@ class DockerRunner:
     root: Path
     isolation: Isolation
     dependencies: Path | None = None
+    pipeline_metrics: bool = False
+    incremental_snapshots: bool = False
+    snapshots: SnapshotState = field(default_factory=SnapshotState, repr=False, compare=False)
+    baselines: SnapshotCache = field(
+        default_factory=lambda: SnapshotCache(max_entries=1),
+        repr=False,
+        compare=False,
+    )
+
+    def _pack(self, archive: BinaryIO) -> tuple[Transfer | None, int]:
+        if not self.incremental_snapshots:
+            _archive(self.root, archive)
+            return None, 0
+        previous = self.snapshots.previous
+        baseline = self.baselines.get(self.snapshots.scope, previous.digest) if previous else None
+        with io.BytesIO() as upload:
+            item = pack_transfer(
+                self.root,
+                snapshot_paths(self.root),
+                upload,
+                previous if baseline is not None else None,
+            )
+            try:
+                verify_transfer(
+                    upload,
+                    archive,
+                    item.digest,
+                    baseline=baseline,
+                    base_digest=item.base,
+                )
+            except SnapshotMismatch:
+                item = pack_transfer(self.root, snapshot_paths(self.root), upload, None)
+                verify_transfer(upload, archive, item.digest)
+        full = archive.read(ARCHIVE_LIMIT + 1)
+        archive.seek(0)
+        self.baselines.put(self.snapshots.scope, item.digest, full)
+        self.snapshots.previous = item
+        return item, len(full)
 
     async def __call__(
         self,
@@ -304,13 +353,15 @@ class DockerRunner:
             tempfile.TemporaryDirectory() as scratch,
             (Path(scratch) / "input.tar").open("w+b") as archive,
         ):
-            snapshot = asyncio.create_task(asyncio.to_thread(_archive, self.root, archive))
+            started = perf_counter()
+            snapshot = asyncio.create_task(asyncio.to_thread(self._pack, archive))
             try:
-                await asyncio.shield(snapshot)
+                transfer, full_size = await asyncio.shield(snapshot)
             except asyncio.CancelledError:
                 await _wait_cleanup(snapshot)
                 raise
-            return await self.run_archive(
+            pack_ms = (perf_counter() - started) * 1000
+            result = await self.run_archive(
                 archive,
                 argv,
                 config=config,
@@ -318,6 +369,16 @@ class DockerRunner:
                 timeout_seconds=timeout_seconds,
                 **({"cwd": relative} if relative != "." else {}),
             )
+            if self.pipeline_metrics:
+                timings = result["data"].setdefault("sandbox_timing_ms", {})
+                timings["pack"] = pack_ms
+                if transfer is not None:
+                    timings.update(transfer.metrics())
+                    timings["packed_snapshot_bytes"] = transfer.size
+                    timings["transfer_bytes"] = full_size
+            if transfer is not None:
+                result["data"]["snapshot_manifest_sha256"] = transfer.digest
+            return result
 
     async def run_archive(
         self,
@@ -331,12 +392,14 @@ class DockerRunner:
     ) -> JSONDict:
         if not self.isolation.permits(argv) or (cwd != "." and not self.isolation.allow_argv):
             raise ToolError("COMMAND_NOT_CONFIGURED", "Select a configured verification command.")
+        started = perf_counter()
         hashing = asyncio.create_task(asyncio.to_thread(_archive_digest, archive))
         try:
             snapshot = await asyncio.shield(hashing)
         except asyncio.CancelledError:
             await _wait_cleanup(hashing)
             raise
+        hashed = perf_counter()
         name = f"sw-g4-{uuid4().hex}"
         image = await execute_command(
             ["docker", "image", "inspect", "--format", "{{json .}}", self.isolation.image],
@@ -362,6 +425,7 @@ class DockerRunner:
             raise ToolError(
                 "RUNNER_IMAGE_UNAVAILABLE", "Runner image does not match the pinned ID."
             )
+        inspected = perf_counter()
         readonly = self.isolation.profile == "sandbox-read-only"
         identity = (
             ["--user", "0:0", "--cap-add", "SETUID", "--cap-add", "SETGID"]
@@ -429,6 +493,7 @@ class DockerRunner:
                 raise
             if created["data"]["exit_code"] != 0:
                 raise ToolError("RUNNER_CREATE_FAILED", "Docker could not create the runner.")
+            created_at = perf_counter()
             result = await execute_command(
                 ["docker", "start", "-a", "-i", name],
                 self.root.parent,
@@ -438,7 +503,16 @@ class DockerRunner:
                 stdin_file=archive,
             )
         finally:
+            executed_at = perf_counter()
             cleanup = await _wait_cleanup(self._remove(name))
+        if self.pipeline_metrics:
+            result["data"]["sandbox_timing_ms"] = {
+                "archive_hash": (hashed - started) * 1000,
+                "image_inspect": (inspected - hashed) * 1000,
+                "container_create": (created_at - inspected) * 1000,
+                "execute": (executed_at - created_at) * 1000,
+                "cleanup": (perf_counter() - executed_at) * 1000,
+            }
         result["data"].update(
             argv=argv,
             cwd=cwd,

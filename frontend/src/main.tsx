@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent, type PointerEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, downloadRun, receive, type Approval, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type SkillSelection, type Thread, type UndoTarget, type Workspace, type Workspaces } from './api'
+import { api, downloadRun, receive, type Approval, type ApprovalDecision, type AuthOptions, type Delivery, type Mode, type PatchPreflight, type ReviewFeedback, type Run, type RunEvent, type SkillSelection, type Thread, type UndoTarget, type Workspace, type Workspaces } from './api'
 import { AdminPanel } from './admin'
 import { ApprovalCard, ContextMeter, Turn, runLabel } from './conversation'
 import { Inspector, type InspectorTab } from './inspector'
-import { ProjectAliasDialog, ProjectPicker, WorkspaceGroup } from './projects'
+import { DeleteThreadDialog, ProjectAliasDialog, ProjectPicker, WorkspaceGroup } from './projects'
 import { ComposerSkills, SkillsPanel } from './skills'
 import { ExperimentPanel } from './experiment'
 import './style.css'
@@ -50,9 +50,11 @@ function App() {
   const [showNavigation, setShowNavigation] = useState(false)
   const [showPicker, setShowPicker] = useState(false)
   const [renameTarget, setRenameTarget] = useState<Workspace | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<{ thread: Thread; label: string; project: boolean } | null>(null)
   const [width, setWidth] = useState(() => clampWidth(Number(localStorage.getItem(widthKey)) || 420))
   const request = useRef<{ input: string; id: string } | null>(null)
   const reviewRequest = useRef<{ input: string; id: string } | null>(null)
+  const deletedSessions = useRef(new Set<string>())
   const scroll = useRef<HTMLDivElement>(null)
   const composer = useRef<HTMLTextAreaElement>(null)
   const nearBottom = useRef(true)
@@ -146,7 +148,7 @@ function App() {
     async function refresh() {
       try {
         const rows = await api<Thread[]>(token, 'threads', { signal: abort.signal })
-        if (!abort.signal.aborted) setThreads(rows)
+        if (!abort.signal.aborted) setThreads(rows.filter(thread => !deletedSessions.current.has(thread.session_id)))
       } catch (err) {
         if (!abort.signal.aborted) setError(String(err))
       }
@@ -211,7 +213,7 @@ function App() {
         } catch (err) {
           if (abort.signal.aborted) return
           if (/Run not found|access token required/i.test(String(err))) {
-            setError(String(err))
+            setError(/Run not found/i.test(String(err)) ? '会话已不可用。' : String(err))
             return
           }
         }
@@ -420,13 +422,26 @@ function App() {
       await api<void>(token, 'threads/' + thread.session_id, {
         method: 'PATCH', body: JSON.stringify({ archived: !thread.archived }),
       })
-      setThreads(await api<Thread[]>(token, 'threads'))
+      const rows = await api<Thread[]>(token, 'threads')
+      setThreads(rows.filter(row => !deletedSessions.current.has(row.session_id)))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
   }
 
-  async function decide(item: Approval, decision: 'approve' | 'deny') {
+  async function deleteThread(thread: Thread) {
+    await api(token, 'threads/' + thread.session_id, { method: 'DELETE' })
+    deletedSessions.current.add(thread.session_id)
+    setThreads(rows => rows.filter(row => row.session_id !== thread.session_id))
+    if (run?.session_id === thread.session_id || runId === thread.run_id) {
+      setWorkspace(thread.workspace_id)
+      setTurns([])
+      setSkillDraft(null)
+      openRun('', null, true)
+    }
+  }
+
+  async function decide(item: Approval, decision: ApprovalDecision) {
     setDeciding(true)
     setError('')
     try {
@@ -534,7 +549,8 @@ function App() {
           threads={threads.filter(thread => thread.workspace_id === item.id)} selectedSession={run?.session_id}
           runId={runId} selectedWorkspace={selectedWorkspace} waiting={Boolean(approval)} writable={writable}
           manage={Boolean(listing.manage_workspaces)} onNew={newThread} onOpen={openRun}
-          onArchive={thread => void archive(thread)} onRename={setRenameTarget} />)}
+          onArchive={thread => void archive(thread)} onRename={setRenameTarget}
+          onDelete={(thread, label, project) => setDeleteTarget({ thread, label, project })} />)}
         {!threads.length && <p className="sidebar-empty">还没有线程。</p>}
       </nav>
       <div className="sidebar-footer">
@@ -680,6 +696,8 @@ function App() {
     {showPicker && <ProjectPicker onClose={() => setShowPicker(false)} onCreate={createProject} />}
     {renameTarget && <ProjectAliasDialog item={renameTarget} onClose={() => setRenameTarget(null)}
       onSave={alias => renameProject(renameTarget, alias)} />}
+    {deleteTarget && <DeleteThreadDialog title={deleteTarget.label} project={deleteTarget.project}
+      onClose={() => setDeleteTarget(null)} onDelete={() => deleteThread(deleteTarget.thread)} />}
   </main>
 }
 

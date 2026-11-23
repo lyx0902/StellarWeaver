@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from stellarweaver.config import ContextConfig, LimitsConfig, get_api_key, load_config
+from stellarweaver.config import (
+    ContextConfig,
+    HarnessConfig,
+    LimitsConfig,
+    get_api_key,
+    load_config,
+)
 from stellarweaver.domain import AssistantReply, JSONDict, ToolCall
 from stellarweaver.evals.provenance import archive as archive_provenance
 from stellarweaver.evals.provenance import identity as scoring_identity
@@ -430,7 +436,19 @@ async def run_suite(
                     store=store,
                     max_output_tokens=2048,
                     stream=True,
-                    context_config=ContextConfig(recent_complete_rounds=3),
+                    context_config=ContextConfig(
+                        recent_complete_rounds=3,
+                        fresh_tool_rounds=settings.context.fresh_tool_rounds,
+                    ),
+                    harness_config=HarnessConfig(
+                        calibrated_context_budget=settings.harness.calibrated_context_budget,
+                        sticky_context_checkpoint=settings.harness.sticky_context_checkpoint,
+                        protect_fresh_tool_output=settings.harness.protect_fresh_tool_output,
+                        smart_tool_truncation=(
+                            settings.harness.protect_fresh_tool_output
+                            and settings.harness.smart_tool_truncation
+                        ),
+                    ),
                 )
                 prompt = task["task_prompt"]
                 if task["category"] != "understanding":

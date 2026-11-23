@@ -15,13 +15,20 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from stellarweaver.cli import build_provider, effective_config
-from stellarweaver.config import AppConfig, ExecutionConfig, LimitsConfig, ModelConfig
+from stellarweaver.config import (
+    AppConfig,
+    ContextConfig,
+    ExecutionConfig,
+    LimitsConfig,
+    ModelConfig,
+)
 from stellarweaver.domain import JSONDict
 from stellarweaver.evals.provenance import canonical_json
 from stellarweaver.evals.swebench_official import GRADER_VERSION
@@ -85,6 +92,22 @@ LIMITS = {
     "max_input_tokens_total": 320_000,
     "max_output_tokens_total": 16_000,
 }
+_PIPELINE_OPTIONS = (
+    "pipeline_metrics",
+    "multi_edit_tools",
+    "post_edit_syntax_hook",
+    "smart_tool_truncation",
+    "navigation_prefilter",
+    "multi_file_apply",
+    "parallel_read_tools",
+    "scoped_test_grants",
+    "incremental_sandbox_snapshots",
+    "import_aware_repomap",
+    "subagent_exploration",
+    "calibrated_context_budget",
+    "sticky_context_checkpoint",
+    "protect_fresh_tool_output",
+)
 VISIBLE_PYTEST = """\
 import os
 import runpy
@@ -350,7 +373,9 @@ def git_base(task: Task, assets: Path, workspace: Path) -> None:
         raise ValueError("Task checkout must contain only the pinned base commit")
 
 
-def visible_runner(recipe: Recipe, workspace: Path, assets: Path) -> CommandRunner:
+def visible_runner(
+    recipe: Recipe, workspace: Path, assets: Path, *, pipeline_metrics: bool = False
+) -> CommandRunner:
     fixed = ["pytest", *recipe.pytest_args]
     mounts = ["--mount", f"type=bind,src={workspace},dst=/work,readonly"]
     if recipe.dependencies:
@@ -399,6 +424,7 @@ def visible_runner(recipe: Recipe, workspace: Path, assets: Path) -> CommandRunn
             "no:cacheprovider",
             *recipe.pytest_args,
         ]
+        started = perf_counter()
         try:
             result = await execute_command(
                 command,
@@ -408,6 +434,7 @@ def visible_runner(recipe: Recipe, workspace: Path, assets: Path) -> CommandRunn
                 timeout_seconds=min(timeout_seconds or 120, 120),
             )
         finally:
+            executed_at = perf_counter()
             await asyncio.to_thread(
                 subprocess.run,
                 ["docker", "rm", "--force", name],
@@ -416,6 +443,11 @@ def visible_runner(recipe: Recipe, workspace: Path, assets: Path) -> CommandRunn
                 timeout=15,
             )
         result["data"].update(argv=argv, cwd=".", backend="linux_docker")
+        if pipeline_metrics:
+            result["data"]["sandbox_timing_ms"] = {
+                "execute": (executed_at - started) * 1000,
+                "cleanup": (perf_counter() - executed_at) * 1000,
+            }
         return result
 
     return run
@@ -432,6 +464,7 @@ async def solve_task(
     argv = ["pytest", *recipe.pytest_args]
     sandbox = getattr(args, "sandbox_commands", False)
     development = getattr(args, "development_tools", False)
+    pipeline_options = {name: getattr(args, name, False) for name in _PIPELINE_OPTIONS}
     if development and not sandbox:
         raise ValueError("Development tools require --sandbox-commands")
     runner: CommandRunner
@@ -464,9 +497,13 @@ async def solve_task(
                 recipe.image, (tuple(argv),), "stellarweaver-swe-fixture", development=development
             ),
             dependency,
+            pipeline_metrics=pipeline_options["pipeline_metrics"],
+            incremental_snapshots=pipeline_options["incremental_sandbox_snapshots"],
         )
     else:
-        runner = visible_runner(recipe, workspace, args.assets)
+        runner = visible_runner(
+            recipe, workspace, args.assets, pipeline_metrics=pipeline_options["pipeline_metrics"]
+        )
     policy = attempt / "policy.json"
     grants = [{"tool": "run_command", "argv": argv, "cwd": "."}]
     save(policy, {"workspace": str(workspace), "grants": grants})
@@ -480,6 +517,7 @@ async def solve_task(
     config = config.model_copy(
         update={
             "limits": limits,
+            "context": ContextConfig(fresh_tool_rounds=getattr(args, "fresh_tool_rounds", 2)),
             "harness": config.harness.model_copy(
                 update={
                     "development_tools": development,
@@ -487,6 +525,7 @@ async def solve_task(
                     "repair_controller": getattr(args, "repair_controller", "off"),
                     "task_evidence": getattr(args, "task_evidence", False),
                     "budget_guidance": getattr(args, "budget_guidance", False),
+                    **pipeline_options,
                 }
             ),
         }
@@ -688,6 +727,7 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
         "repair_controller",
         "task_evidence",
         "budget_guidance",
+        *_PIPELINE_OPTIONS,
     ):
         if (value := getattr(args, name, None)) not in (None, False, "off"):
             settings[name] = value
@@ -937,6 +977,9 @@ def parser() -> argparse.ArgumentParser:
     solve_cmd.add_argument("--issue-navigation", action="store_true")
     solve_cmd.add_argument("--task-evidence", action="store_true")
     solve_cmd.add_argument("--budget-guidance", action="store_true")
+    for name in _PIPELINE_OPTIONS:
+        solve_cmd.add_argument("--" + name.replace("_", "-"), action="store_true")
+    solve_cmd.add_argument("--fresh-tool-rounds", type=int, default=2)
     solve_cmd.add_argument(
         "--repair-controller", choices=("off", "feedback", "enforce"), default="off"
     )
