@@ -1,66 +1,118 @@
 # StellarWeaver 整体架构
 
-StellarWeaver 将一次编码任务组织为模型决策、受控工具执行与可核对的运行记录。CLI 在本机直接装配 Agent，Web 先持久化请求，再由 worker 装配同一套 Agent。模型适配器、工具注册表和 Journal 提供稳定接口。离线评测复用工具链，独立评分从冻结的候选补丁取证。本文描述当前实现，目标架构与各阶段验收见 [Harness 实施与验收](HARNESS_ACCEPTANCE.md#当前实现进度核对)。
+StellarWeaver 由交互入口、任务装配、共享 Harness、执行环境和持久化组成。CLI 直接在终端进程运行 Agent。Web 的 FastAPI 受理任务并持久入队，worker 领取后装配同一套运行时。独立评测可用相同的 Agent 和工具产生候选，独立评分器再读取冻结的补丁和评分资料。本文以当前仓库实现为准。 [实施进度与验收](HARNESS_ACCEPTANCE.md#当前实现进度核对)
 
 ```mermaid
-flowchart LR
-    CLI[CLI] --> Agent[共享 Agent]
-    UI[React 工作台] -->|REST| API[FastAPI]
-    API -->|提交与查询| PG[(PostgreSQL)]
-    PG -->|领取任务| Worker[应用 worker]
-    Worker -->|装配| Agent
-    Agent --> Provider[ModelProvider]
-    Provider --> Model[DeepSeek 或 FakeModel]
-    Agent --> Tools[工具注册与授权]
-    Agent --> Journal[RunJournal]
-    Journal -->|CLI| SQLite[(SQLite 会话与制品)]
+flowchart TB
+    subgraph Entrypoints["交互与评测入口"]
+        direction LR
+        CLI["CLI<br/>交互、单次执行、恢复"]
+        Web["React 工作台<br/>项目任务、普通对话、补丁审阅"]
+        Eval["评测 CLI<br/>准备、运行、评分"]
+    end
+
+    subgraph Assembly["任务装配"]
+        direction LR
+        Direct["CLI 装配<br/>配置、工作目录与终端确认"]
+        API["FastAPI<br/>身份、工作区、任务与事件接口"]
+        Queue[("PostgreSQL<br/>持久任务队列")]
+        Worker["Web worker<br/>领取、准备环境与运行收尾"]
+        Batch["SWE-bench Lite 运行器<br/>冻结配置与逐题工作区"]
+    end
+
+    subgraph Harness["共享 Harness"]
+        direction TB
+        Agent["build_agent → Agent<br/>循环取回回复并分派工具"]
+        Context["上下文与指令<br/>历史证据、技能目录、仓库导航"]
+        Provider["ModelProvider<br/>DeepSeek、兼容端点或 FakeModel"]
+        Tools["ToolRegistry 与 PolicyEngine<br/>参数、路径、版本、授权和复检"]
+        Journal["RunJournal<br/>消息、操作、检查点与终态"]
+        Agent --> Context
+        Agent <-->|模型请求与回复| Provider
+        Agent <-->|工具调用与结果| Tools
+        Agent --> Journal
+    end
+
+    subgraph State["执行环境与数据"]
+        direction LR
+        Local[("SQLite<br/>CLI 与评测会话")]
+        PG[("PostgreSQL<br/>Web 会话、授权与事件")]
+        Files["文件与 Git 工作区<br/>本机目录、线程 worktree 或逐题目录"]
+        Sandbox["命令执行<br/>CLI 宿主或配置的 Docker<br/>Web 由专用执行服务运行容器"]
+    end
+
+    CLI --> Direct
+    Web <-->|REST 与 SSE| API
+    Eval --> Batch
+    API -->|入队| Queue
+    Queue -->|领取| Worker
+    Direct --> Agent
+    Worker --> Agent
+    Batch --> Agent
+    Journal -->|CLI 与评测| Local
     Journal -->|Web| PG
-    API -->|SSE| UI
-    Tools --> Workspace[工作区文件与 Git]
-    Tools -->|Web 验证命令| RunnerClient[执行器客户端]
-    RunnerClient -->|文件快照与命令索引| Executor[专用执行服务]
-    Executor --> Runner[一次性验证容器]
+    Tools -->|文件与 Git 操作| Files
+    Tools -->|验证或命令| Sandbox
+    Batch -->|生成候选补丁| Grade["独立官方评分与结果汇总"]
+
+    classDef main fill:#e8f1ff,stroke:#38639b,color:#172a47,stroke-width:2px
+    classDef data fill:#edf4f1,stroke:#527a69,color:#16382e
+    class Web,Agent main
+    class Local,PG,Queue data
 ```
+
+装配层为每种入口选择模型、权限、上下文配置和 Journal。共享 Harness 通过这些接口完成回合，实际使用的数据库、文件目录和命令执行器由入口配置决定。图中的 Web 任务队列和会话事件由同一个 PostgreSQL 实例保存。评测入口生成候选后进行独立评分，日常工作台交付以选定的验证命令和补丁审阅为主。
 
 ## React 工作台调用链
 
-本机 Compose 部署中，浏览器从 React 工作台发起项目任务和普通对话。两类运行共用队列与流式返回链路，项目任务还会准备独立的 Git worktree。
+本机 Compose 中，React 通过 REST 提交任务、回传审批或请求取消，通过 SSE 接收持久化事件。下图从接单走到界面回显。图中的队列、审批和运行记录对应同一 PostgreSQL 实例中的不同数据。实验看板通过独立的只读接口读取已发布报告。
 
 ```mermaid
 ---
 config:
   flowchart:
-    rankSpacing: 36
-    nodeSpacing: 30
-    wrappingWidth: 220
+    rankSpacing: 35
+    nodeSpacing: 24
+    wrappingWidth: 178
 ---
 flowchart TB
-    Workbench["React 工作台<br/>浏览器主入口"]
-    API["FastAPI<br/>身份、工作区与任务接口"]
-    Store[("PostgreSQL<br/>任务队列与运行记录")]
-    Worker["应用 worker"]
-    Harness["StellarWeaver Harness<br/>Agent 循环 · 上下文 · 权限 · 预算"]
+    Workbench["React 工作台<br/>项目任务或普通对话"]
+    API["FastAPI<br/>校验身份、工作区与请求"]
+    Queue[("PostgreSQL<br/>运行与队列")]
+    Worker["Worker 领取<br/>准备线程 worktree 或对话目录"]
+    Agent["Agent 回合<br/>上下文、技能与工具结果"]
     Model["DeepSeek / FakeModel"]
-    Worktree["Git worktree<br/>线程专属工作区"]
-    Executor["专用执行服务"]
-    Runner["一次性验证容器"]
-    Experiments[("已发布的实验报告<br/>只读挂载")]
+    Guard["工具注册与授权<br/>只读 · auto · 修改"]
+    Approval[("PostgreSQL 审批<br/>由浏览器提交决定")]
+    Worktree["线程 worktree<br/>项目文件和 Git 操作"]
+    Sandbox["专用执行器<br/>一次性断网验证容器"]
+    Journal["PgJournal 与 Delivery<br/>消息、验证证据与补丁"]
+    Records[("PostgreSQL<br/>事件、报告与终态")]
+    Display["React 工作台<br/>回复、进度、审批与交付"]
 
-    Workbench -->|"REST · 提交、追问、审批"| API
-    API -.->|"SSE · 流式回复与运行事件"| Workbench
-    API -->|"读取历史轨迹、批量和安全报告"| Experiments
-    API -->|"事务入队与查询"| Store
-    Store -->|"排队任务"| Worker
-    Worker -.->|"PgJournal · 保存事件和结果"| Store
-    Worker -->|"准备会话并装配 Agent"| Harness
-    Harness -->|"ModelProvider"| Model
-    Harness -->|"文件与 Git 工具"| Worktree
-    Harness -->|"固定命令或受控开发操作 · 工作区快照"| Executor
-    Executor -->|"隔离执行测试或构建"| Runner
+    Workbench -->|REST 提交或追问| API
+    API -->|事务入队| Queue
+    Queue -->|持久领取| Worker
+    Worker --> Agent
+    Agent <-->|请求与回复| Model
+    Agent <-->|调用与结果| Guard
+    Guard <-->|按需申请并消费批准| Approval
+    Guard -->|项目工具| Worktree
+    Guard <-->|快照、操作与结果| Sandbox
+    Agent -->|逐步记录| Journal
+    Journal --> Records
+    Records -->|FastAPI REST 快照与 SSE 事件| Display
 
     classDef entry fill:#dbeafe,stroke:#1d4ed8,color:#0f172a,stroke-width:3px
-    class Workbench entry
+    classDef data fill:#edf4f1,stroke:#527a69,color:#16382e
+    class Workbench,Display entry
+    class Queue,Approval,Records data
 ```
+
+1. **提交。** React 提交提示词、工作区、模式、技能引用和请求 ID。已有线程会带上会话 ID。API 返回的新运行 ID 用于查快照、订阅事件和之后的交付操作。
+2. **领取。** worker 从数据库领取任务，根据工作区种类选择私有 Git worktree 或普通对话目录。该轮保存的窗口配置随领取结果传入运行时。
+3. **循环。** 模型回复触发工具调用。注册表核对实际工具参数和权限；需要批准时，worker 等待数据库中的决定。执行结果写入 Journal，并按工具调用 ID 回给模型。
+4. **回传。** FastAPI 从数据库读取已提交的事件。React 通过 REST 获取运行快照，按事件序号拼接 SSE 进度，完成后按需读取验证及改动报告。 [任务提交](../frontend/src/main.tsx) · [工作台 API](../src/stellarweaver/web/app.py) · [Worker](../src/stellarweaver/web/worker.py)
 
 ## 模块职责
 
@@ -81,9 +133,9 @@ flowchart TB
 
 ### CLI 和配置
 
-`cli.py` 以 Typer 接收命令。`exec` 处理一个任务，`chat` 保持交互式会话并处理多次输入，`resume` 打开已有 SQLite 会话。`sessions list`、`replay` 和 `export` 通过存储读取历史。终端展示在 `ui/` 中实现，Agent 以事件和文本回调交付界面数据。
+`cli.py` 以 Typer 接收命令。`exec` 为一次任务装配运行时，`chat` 将多次输入接到同一交互会话，`resume` 打开并协调已有 SQLite 会话。`sessions list`、`replay` 和 `export` 走存储的只读查询。`ui/` 负责输入、格式化和终端确认，Agent 通过事件与文本回调返回执行进度。
 
-配置分三步进入运行。`load_config` 读取显式路径或工作区中的 `stellarweaver.toml`，缺省时使用 `AppConfig`。Pydantic 拒绝未知字段，并核对诸如输出上限与窗口大小、默认超时与最大超时之间的关系。`effective_config` 再覆盖用户显式传入的 provider、策略和流式设置。最终的可序列化配置快照随 CLI 会话保存，供恢复加载。
+配置分三步进入运行。`load_config` 读取显式路径或工作区中的 `stellarweaver.toml`，缺省时使用 `AppConfig`。Pydantic 检查未知字段、窗口与输出上限、命令超时等字段关系。`effective_config` 应用用户传入的 provider、策略和流式覆盖项。`SessionStore.set_config` 保存公开配置供核对。执行 `resume` 时，CLI 先从原会话取得工作区，再按当次参数和该工作区配置重新装配。
 
 凭据采用独立读取路径。`get_api_key` 优先取已配置的进程环境变量，其次读取指定 dotenv 文件，缺省时从启动目录、再按规则从工作区选择 `.env`。配置快照记录环境变量名称，Provider 则单独接收密钥值。`execute_task` 建立 Journal、模型和终端回调后调用 `build_agent`，运行结束后把 `RunOutcome` 转换为终端状态与退出码。例如 `blocked` 返回 `3`，`budget_exceeded` 返回 `4`。开启验证失败退出选项后，流程正常结束但检查失败时返回 `5`。 [配置实现](../src/stellarweaver/config.py) · [CLI 入口与退出码](../src/stellarweaver/cli.py) · [终端 UI](../src/stellarweaver/ui)
 
@@ -93,7 +145,10 @@ flowchart TB
 
 | 数据或标识 | 用途 |
 | --- | --- |
-| `session_id`、`run_id` | 标识一个持续会话和该会话内的一次运行。一次 Web 追问保留前者并创建新的后者。 |
+| `workspace_id` | Web 的项目或普通对话工作区标识。项目路径与访问范围由 API 和 worker 各自核对。 |
+| `session_id` | 标识一条会话线程。Web 项目线程的私有 worktree 由租户和该 ID 定位。 |
+| `run_id` | 标识线程内的一次运行。提交新任务、追问或撤销时创建新运行，刷新页面仍查询原 ID。 |
+| `request_id` | 浏览器生成的重试标识。服务端在成员范围内去重，客户端可重试相同任务而复用运行。 |
 | `ToolCall.call_id`、`Message.tool_call_id` | 将模型发出的某个工具调用与返回给模型的工具消息配对。 |
 | `ToolResult.operation_id` | 定位本机记录中的一次操作，用于查找授权、写入前状态、结果和制品。 |
 | `AgentEvent.seq` | 按事件顺序定位会话记录。Web 用它作为 SSE 补读游标。 |
@@ -101,7 +156,9 @@ flowchart TB
 
 `build_agent` 是公共装配点。它用 Journal 的工作区创建 `PolicyEngine` 和 `ToolRegistry`，再把模型、边界配置、审批回调、可选的命令执行器和通知回调交给 `Agent`。CLI 将审批连接到终端，Web 用 `ApprovalGate` 处理策略判定需要审批的操作。开发工具、导航、补丁暂存、修复反馈、任务证据和预算提示分别受配置控制。普通对话用 `chat_only` 关闭仓库工具与仓库上下文。 [公共装配点](../src/stellarweaver/runtime/service.py) · [Web 配置映射](../src/stellarweaver/web/execution.py)
 
-主循环 `_drive` 收集工具 schema，准备模型请求并获取回复。它先核验工具调用 ID，然后由 Journal 把 assistant 消息和计划操作落库。`_tools` 按回复里的顺序调用工具。每个结果接入消息序列后，下一次模型请求才能从这些结果继续。测试退出码非零会作为工具错误交给模型，便于继续修复；连续三次相同的工具失败、权限阻断、预算耗尽或无法确认的执行状态会提前结束。本轮已经声明但尚未执行的调用会补上对应结果，保持消息配对完整。 [领域类型](../src/stellarweaver/domain/__init__.py) · [公共装配点](../src/stellarweaver/runtime/service.py) · [主循环](../src/stellarweaver/runtime/loop.py)
+主循环 `_drive` 用当前工具清单和上下文发起模型请求。取得完整回复后，先检查工具调用 ID，再通过 Journal 保存助手消息及计划操作。`_tools` 按回复顺序分派工具，把每个结果以对应的 `tool_call_id` 加回消息序列。模型下一轮可依据真实结果补读、再次编辑、复验或结束。遇到取消、预算耗尽或无法确认的执行状态时，已声明但未执行的调用记录相应的跳过或取消结果。完成所有工具关联后，运行时才组装下一次请求。 [领域类型](../src/stellarweaver/domain/__init__.py) · [主循环](../src/stellarweaver/runtime/loop.py)
+
+例如，模型为修复 `calc.py` 请求读取文件，获取源码和当前 SHA-256 后再提交精确替换。编辑完成后，它可以请求登记的测试。若退出码为 1，带退出码的工具结果交给模型，模型可根据失败位置修改后执行同一项检查。最终回答由模型生成，代码和测试证据来自实际执行工具。
 
 运行结束与验证通过是两项状态。`_finish` 按命令和工作目录保留最新检查；一次成功的内置写入会清除前一版本的有效检查。模型发出结束回复可以让运行达到 `completed`，验证字段仍取决于真实工具结果。Web 交付层另按快照细化检查的新鲜度。
 
@@ -115,7 +172,7 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 
 流式响应经过 `ChatCompletionAccumulator`。文本片段可在到达时以 `text.delta` 通知界面。工具片段按索引合并 ID、函数名和参数，聚合器核对完成标记、工具 ID 与资源上限，随后提交完整的 `AssistantReply`。工具执行位于聚合之后。部分流中断时，事件可记录已经显示的片段，当前不完整回复不会进入工具执行阶段。Provider 能力或用户配置关闭流式时，Agent 使用一次非流式请求。
 
-重试由 Agent 统一管理。一次 HTTP 尝试计入一次模型请求，暂时网络故障、限流等可重试错误根据退避、`Retry-After` 和剩余预算再次请求。遇到服务端上下文长度错误时，运行时另尝试一次更小的投影。历史工具由 Journal 保留，继续请求复用已有结果。用量优先取服务端返回值，缺失或未完整返回时记录估算和不完整标记。`FakeModel` 通过固定回复或脚本复用相同协议，用于离线验证真实工具和状态流转。 [Provider 接口](../src/stellarweaver/providers/base.py) · [协议适配](../src/stellarweaver/providers/openai_compatible.py) · [流式聚合](../src/stellarweaver/providers/streaming.py) · [离线模型](../src/stellarweaver/providers/fake.py)
+重试由 Agent 管理。一次 HTTP 尝试计入一次模型请求，可重试的网络故障或限流使用退避和 `Retry-After`，入口已配置累计预算时还检查剩余量。遇到服务端上下文长度错误时，运行时尝试以约 70% 的有效窗口重新投影，投影缩小后可再次请求一次。重试复用原有工具结果。用量优先取服务端返回值，缺失或未完整返回时记录估算和不完整标记。`FakeModel` 使用固定回复、JSON 脚本或回调生成同样形状的回复，用于离线验证工具和状态流转。 [Provider 接口](../src/stellarweaver/providers/base.py) · [协议适配](../src/stellarweaver/providers/openai_compatible.py) · [流式聚合](../src/stellarweaver/providers/streaming.py) · [离线模型](../src/stellarweaver/providers/fake.py)
 
 ### 上下文与指令
 
@@ -125,7 +182,7 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 - **仓库索引。** `RepoMap` 在工作区文件约束下枚举候选路径，以 Python AST 提取函数、类、签名和行号。显式路径、曾访问位置和关键词影响排序。索引按预算截取，提供下一步搜索和读文件的线索。实际文件内容由工具读取，编辑依据最新文件哈希执行。
 - **问题驱动导航。** 启用后，`IssueSignals` 从任务提取路径、符号、异常和测试线索，辅助 Repo Map 排序。`find_symbol`、`find_references` 和 `find_related_tests` 通过 Python AST 查找定义、静态引用和相关测试，返回路径、行号、SHA-256、耗时和覆盖状态。索引按内容哈希复用，文件变更后重新解析。动态绑定和扫描范围之外的关系仍存在不确定性。 [Python 导航](../src/stellarweaver/context/navigation.py)
 - **窗口计算。** DeepSeek Thinking 默认从 200,000 token 窗口中预留 8,192 token 输出和 2,048 token 安全余量，估算输入额度为 189,760 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。工作台在提交时保存该轮窗口，worker 领取时读取；模型事件还记录每次请求的窗口。计量采用保守的 UTF-8 JSON 字节估算，实际服务端用量进入独立字段。
-- **历史压缩。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。分组保留最新用户任务、系统消息、最近的完整 assistant 回合和最近的完整工具组。过长工具输出以有界摘要进入请求，并保留路径、哈希、操作 ID 和关键结果。工作台在普通压缩后仍超窗时允许再归纳较早的完整回合，保留所有仍传给 DeepSeek 的工具调用与对应结果。过程记录检查点，原始消息保存在 Journal。系统指令、工具 schema 和当前任务本身仍须能放入窗口。
+- **历史压缩。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。系统消息和最新用户任务优先保留。常规压缩保护最近六个完整助手回合，并单独保护最近六个完整工具回合，以免纯文本回复挤掉近期工具证据。过长工具输出可投影为有长度上限的摘要，携带路径、哈希、操作 ID 和关键结果。若仍超窗，Web 可以继续归纳较早的完整回合。用于下一次模型请求的工具调用和对应结果始终成组处理。压缩结果可写入检查点，原始消息仍由 Journal 保存。 [压缩配置](../src/stellarweaver/config.py) · [上下文投影](../src/stellarweaver/context/manager.py)
 - **任务证据。** 运行内可选投影从工具结果提取路径、文件哈希、测试状态和暂存补丁引用。每条保留事件序号和操作 ID，准备请求时重新核对文件状态。Web 的跨轮证据由 PostgreSQL Journal 另行投影，按当前 worktree 标注文件及检查是否仍适用。 [运行内证据](../src/stellarweaver/runtime/task_evidence.py) · [跨轮证据](../src/stellarweaver/web/continuation.py)
 
 窗口约束单次模型请求。CLI 的 `LimitsConfig` 默认约束每次运行的模型调用、工具调用和总时长，分别为 30 次、100 次和 900 秒，累计输入和输出分别为 1,000,000 与 30,000 token。独立评测用冻结的运行配置。启用总预算约束的运行可生成阶段余量提示。Web 用单次模型窗口、操作自身超时和账户 UTC 周额度控制运行，累计调用和用量仍写入 Journal。 [历史投影](../src/stellarweaver/context/manager.py) · [运行预算](../src/stellarweaver/runtime/loop.py) · [Web 装配](../src/stellarweaver/web/execution.py)
@@ -167,11 +224,11 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 `ExtensionManager` 将技能和已配置的扩展接入共享工具注册表。CLI 在任务或交互会话内装配，Web 在每次模型运行前装配服务端配置的技能目录。调用仍使用同一套授权、执行和 Journal 事件。
 
 - **Skills。** `SkillCatalog` 从可信工作区和用户显式指定的目录发现技能。模型先看到目录中的元数据，通过 `load_skill` 请求某个技能的正文。目录记录来源和内容身份，加载结果进入模型工具回合。技能正文用于补充任务方法和指令，任何后续访问仍通过原工具授权路径。
-- **Web Skills 库。** API 和 worker 从同一组服务端只读挂载发现技能。授权项目技能时，扫描原项目的 `.stellarweaver/skills`，授权标志存于成员的工作区授权行。API 按来源和相对路径生成条目标识，用户可保存特定版本到会话下一轮，worker 再按哈希核对正文。模型也可从目录按名称调用 `load_skill`。Journal 记录名称、来源和已加载版本的哈希。 [Web 技能目录](../src/stellarweaver/web/skills.py) · [Web Agent 装配](../src/stellarweaver/web/execution.py)
+- **Web Skills 库。** API 和 worker 从同一组服务端只读挂载发现技能。成员授权后，项目技能从原项目的 `.stellarweaver/skills` 发现，授权状态记录在该成员的项目授权行。API 由来源和相对路径生成技能标识。用户从输入框选定版本时，提交请求带标识和哈希，运行记录保存该引用。worker 按相同目录找到技能，校验哈希后将正文放入当轮上下文，并记录 `skill.selected`。未指定技能时，模型仍可根据当前可见目录按需调用 `load_skill`。 [Web 技能目录](../src/stellarweaver/web/skills.py) · [Web Agent 装配](../src/stellarweaver/web/execution.py)
 - **MCP。** 启动本地 stdio server 前，管理器检查工作区信任，并将 `server_id`、argv、cwd 及 `allow_env` 交给策略判断。匹配凭据规则的环境变量会被拒绝。启动后，连接完成协议初始化和 `tools/list`，为远程工具注册本地名称与参数 schema。显式的只读配置决定哪些工具可在只读模式中暴露。实际交接需要匹配服务、工具、参数的授权或交互批准。调用经 `tools/call` 返回统一工具结果，连接在退出时关闭。
 - **动态清单。** 当 server 发出工具列表变化通知时，管理器在下一次请求的上下文组装边界刷新注册表，使发送给模型的 schema 与实际可执行项对应。扩展生命周期中的启动失败、连接中断和结果截断也写入 Journal。
 
-Web 的共享技能从服务端配置的只读目录发现，项目技能由成员授权后从源项目读取。工作台提供 Skills 的浏览、会话选用和模型自主加载，本地 stdio MCP 由 CLI 装配。 [扩展管理](../src/stellarweaver/extensions/__init__.py) · [技能目录](../src/stellarweaver/extensions/skills.py) · [MCP 连接](../src/stellarweaver/extensions/mcp.py)
+工作台的 Skills 库负责浏览、信任和本轮选用，模型加载由共享工具注册表处理。本地 stdio MCP 由 CLI 装配。 [扩展管理](../src/stellarweaver/extensions/__init__.py) · [技能目录](../src/stellarweaver/extensions/skills.py) · [MCP 连接](../src/stellarweaver/extensions/mcp.py)
 
 ### 会话持久化
 
@@ -186,7 +243,15 @@ Web 的共享技能从服务端配置的只读目录发现，项目技能由成�
 
 ### Web 前端与 API
 
-React 分别管理工作区和线程列表、当前 `runId`、运行快照、事件列表及审阅报告。`projects.tsx` 提供目录选择、分组与归档。`conversation.tsx` 按轮组织回复和工具活动，运行结束后折叠过程，并显示审批及可下载的暂存补丁。`inspector.tsx` 展示改动、检查和日志。`main.tsx` 创建运行、提交审批、取消并打开报告。切换运行时，旧订阅由 `AbortController` 结束，视图按新运行加载。实验看板通过独立的只读报告接口取得数据。
+React 的 `main.tsx` 管理当前工作区、线程和 `runId`，同时装配任务提交、订阅、审批和取消。各视图从运行快照与事件流读取状态。切换运行时，`AbortController` 终止旧连接，随后按新 ID 加载快照。
+
+| 前端模块 | 职责 |
+| --- | --- |
+| [`projects.tsx`](../frontend/src/projects.tsx) | 浏览已授权项目目录、登记工作区、修改别名，按项目分组和归档线程。 |
+| [`conversation.tsx`](../frontend/src/conversation.tsx) | 按轮组织回复与执行活动。结束后折叠过程，显示审批、暂存补丁和上下文用量，保留底部追问入口。 |
+| [`skills.tsx`](../frontend/src/skills.tsx) | 浏览技能库、管理项目技能信任、为输入框选择技能版本。 |
+| [`inspector.tsx`](../frontend/src/inspector.tsx) | 展示改动、检查和日志，支持逐块选择与审阅。 |
+| [`admin.tsx`](../frontend/src/admin.tsx)、[`experiment.tsx`](../frontend/src/experiment.tsx) | 前者查看审计与用量，后者读取已发布的实验报告、单题证据和对照结果。 |
 
 FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改。当前本机账号用 Cookie 恢复身份，项目访问来自 `local_projects`。静态团队配置使用已登记的项目集合，可选 OIDC 登录。服务端的租户与项目查询决定记录是否可见。归档会标记线程并影响续接，新建工作区时服务端将项目路径限制在配置的宿主根目录内。
 
@@ -198,6 +263,7 @@ FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改�
 | `workspaces`、`workspaces/folders`、`threads` | 提供工作区、可选择目录和线程列表。`PATCH /workspaces/{workspace_id}` 更新本机项目别名，`PATCH /threads/{session_id}` 更新线程归档状态。 |
 | `POST /runs`、`GET /runs/{run_id}` | 提交任务并取得运行标识，读取运行快照、历史窗口和待审批状态。排队部署返回 `202` 表示请求已受理。 |
 | `GET /runs/{run_id}/events` | 逐段接收可见文本与状态事件。断线可按最后处理的事件 `seq` 补读。 |
+| `POST /runs/{run_id}/approvals/{approval_id}`、`POST /runs/{run_id}/cancel` | 对单项操作提交决定，或请求停止该次运行。 |
 | `report`、`patch`、`review` | 读取交付报告、下载补丁或发起所选改动的复验。复验资格由 API 判断。 |
 | `GET /runs/{run_id}/export` | 下载本轮的脱敏 JSON 或离线回放 HTML。 |
 | `GET /runs/{run_id}/undo`、`POST /runs/{run_id}/undo` | 查看或提交最近一次可撤销的文件操作，提交后在原线程新建一轮。 |
@@ -205,15 +271,17 @@ FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改�
 | `GET /experiment`、`GET /experiments` | 旧接口读取单题报告。新接口列出只读目录中可加载的实验及不可用项。 |
 | `GET /experiments/{name}`、`GET /experiments/compare` | 按权限查看报告详情、核对两个 SWE-bench 清单的配对条件、统计共同评分样本及排除原因。 |
 
-SSE 在服务端查询已提交的事件页，按 `seq` 递增发送。浏览器丢弃旧游标范围内的重复事件，连接中断后继续从上次已处理的序号获取。刷新时，可以先用 REST 恢复当前运行，再从持久事件重建过程。同一运行的页面重连和创建新运行是两个独立请求。 [前端连接与状态](../frontend/src/main.tsx) · [SSE 解码](../frontend/src/api.ts) · [API 与访问控制](../src/stellarweaver/web/app.py)
+运行快照包含当前状态、可见消息、用量和待审批记录。SSE 查询已提交的事件页，`public_event` 按允许公开的字段投影，然后按 `seq` 递增发送。浏览器丢弃已处理的重复事件，断线后携最后游标补读。页面刷新可从快照与保留的事件重建过程，worker 的执行进度仍由数据库记录决定。 [前端连接与状态](../frontend/src/main.tsx) · [SSE 解码](../frontend/src/api.ts) · [API 与访问控制](../src/stellarweaver/web/app.py)
 
 ### Web 调度与交付
 
-**从提交到领取。** `db.submit` 按租户和成员约束请求标识。同一请求重试返回原有运行，不同内容复用标识返回冲突。原线程续接会核对项目、归档状态和活动运行。事务提交运行的上下文窗口、技能版本、队列行和审计。`db.claim` 使用 `FOR UPDATE SKIP LOCKED` 领取待执行项，记录拥有者、尝试号和领取时间，worker 使用该运行已保存的窗口。`run_team_worker` 按槽位轮转租户，每个成员同一时间只能领取一个运行。提交层检查活跃和近期运行，DeepSeek 每次请求在 UTC 周额度中预留并结算用量。
+**从提交到领取。** `db.submit` 按租户和成员校验请求标识。同一请求重试返回原有运行。不同内容复用标识会触发冲突。续接时还会核对线程的项目归属、归档状态及活动运行。写入运行的上下文窗口、技能版本、队列行和审计处于同一事务。`db.claim` 使用 `FOR UPDATE SKIP LOCKED` 领取待执行项，并更新领取者和尝试号。`run_team_worker` 按槽位轮转租户，每个成员同一时间只能领取一个运行。执行过程通过 Journal 核对领取者和尝试号。 [入队与领取](../src/stellarweaver/web/db.py) · [Worker](../src/stellarweaver/web/worker.py)
 
-`runs.status` 表示用户看到的运行状态，`run_jobs.state` 表示调度状态。新任务可以同时为 `active` 和 `queued`，被领取后调度状态变为 `running`，运行结束时配套队列行变为 `done`。模型预算还有独立的计量点：`PgJournal` 处理模型开始事件时按估算输入与输出上限预留额度，收到用量时按实际或估算结果结算。某次请求中断且没有可靠用量时，账本保留相应预留或估算状态。 [队列与用量事务](../src/stellarweaver/web/db.py) · [PostgreSQL Journal](../src/stellarweaver/web/journal.py)
+`runs.status` 表示用户看到的运行状态，`run_jobs.state` 表示调度状态。新任务可同时处于 `active` 和 `queued`，领取后队列行变为 `running`。结果、报告与终态入库时，队列行一并变为 `done`。
 
-**审批、取消与恢复。** Web 修复装配 `ApprovalGate`。拟执行的文件、补丁或验证 argv 生成待审批记录，worker 等待浏览器决定。批准需匹配当前运行、操作、指纹和有效期，消费后才继续复检。取消由 API 经数据库写入，worker 的运行监控观察到取消请求后中止当前协程，结果由执行层返回。重启恢复将已开始而未落终态的工作交给中断处理，原审批和操作记录作为用户核查依据。
+**窗口与用量。** 默认 200,000 token 窗口约束一次模型请求。Web 关闭 Agent 的单次运行累计预算，仍按成员周额度管理 DeepSeek 用量，默认每周 1,000 万 token，按 UTC 周一划界。每次请求开始时按估算输入与输出上限预留，收到用量后按服务端用量或估算结算。请求中断且缺少可靠用量时，账本保留对应预留或估算状态。 [额度默认值](../src/stellarweaver/web/identity.py) · [用量事务](../src/stellarweaver/web/db.py) · [PostgreSQL Journal](../src/stellarweaver/web/journal.py)
+
+**审批、取消与恢复。** 策略要求审批时，`ApprovalGate` 将操作及指纹登记为待审，worker 等待用户决定。批准需匹配当前运行、操作、指纹和有效期，消费后再复检文件、指令或命令边界。取消排队任务可直接保存终态。任务已领取时，API 写入取消标志，worker 的监控据此中止当前执行，并由执行层报告清理结果。Worker 重启会将遗留的已领取运行标记为中断，保留原操作记录和未确认状态供用户核查。 [审批与取消](../src/stellarweaver/web/approval.py) · [中断恢复](../src/stellarweaver/web/worker.py)
 
 **验证证据与补丁。** `Delivery` 在运行开始时观察基线，命令启动时记录文件快照摘要，结果到达后记录退出码、输出和清理状态。运行结束时，它将检查前快照与当前快照比较，失效的证据标为 `stale`。在隔离修复中，`candidate` 将改动生成相对于 Git 基线的文本 diff，按文件和 hunk 拆分，hunk ID 基于基线、路径及文本计算。后端以报告中已保存的 hunk 为输入重新组装补丁。`verify_selection` 校对基线、检查补丁能否应用，再跑完配置的检查。这里的检查由确定性代码执行，无需模型重新决定改法。
 
@@ -229,6 +297,15 @@ Web 验证命令收到的是工作区的一次文件快照。`snapshot_paths` �
 
 `DockerRunner` 为单次命令创建临时容器，任务命令以非 root 身份运行。容器根文件系统只读，关闭网络，并约束进程数、内存、CPU 和执行时间。`sandbox-workspace` 允许修改临时快照，写入随容器结束丢弃。`sandbox-read-only` 在执行前封存项目快照，再以受限身份运行，临时目录仍可写。执行器服务持有 Docker socket，应用 worker 负责模型和数据库，任务容器只接收所需快照和命令。
 
+| 本机 Compose 服务 | 运行责任与持久边界 |
+| --- | --- |
+| `db`、`migrate` | PostgreSQL 保存身份、项目、队列和 Journal。迁移服务以独立迁移角色更新表结构，完成后退出。 |
+| `api` | 提供 React 页面和 REST、SSE，检查身份与权限，并查询 PostgreSQL。读取配置挂载的项目、技能和实验报告。 |
+| `worker` | 领取任务，维护状态卷中的线程 worktree 和制品，调用模型并持久化结果。命令通过私有网络交给执行服务。 |
+| `executor` | 接收经过验证的快照和操作，使用 Docker socket 创建和回收单次验证容器。 |
+
+本机入口以基础 PostgreSQL、工作台服务、隔离执行和本机目录覆盖四份 Compose 配置组合启动。会话与用量随 PostgreSQL 数据卷保留，项目线程的文件和运行制品随工作台状态卷保留。 [工作台服务](../deploy/compose.workbench.yaml) · [执行服务](../deploy/compose.g5.yaml) · [本机挂载](../deploy/compose.g5-local.yaml)
+
 结果保留镜像标识、快照哈希、命令退出码、输出和清理状态。取消由执行器撤销当前验证，连接中断或无法确认清理时，报告保留未确认结果。执行器启动时按本部署的容器标签回收残留验证容器。项目验证镜像可锁定 pytest、pytest-asyncio 和 Ruff，pytest 启动时显式加载异步插件。 [项目验证镜像](HARNESS_ACCEPTANCE.md#m6-项目验证镜像补验)
 
 CLI 可以通过 `[execution]` 选用 Docker，Docker 执行不可用时返回错误。CLI 默认的 `host` 路径仍由同一命令工具进入。Windows 用 Job Object 管理受控的子进程树，POSIX 用独立进程组与信号执行清理。各执行路径通过统一结果字段向 Agent 和 Journal 报告退出及清理状态。 [工作区和容器](../src/stellarweaver/web/isolation.py) · [执行器客户端](../src/stellarweaver/web/remote_runner.py) · [执行服务](../src/stellarweaver/web/broker.py) · [宿主命令](../src/stellarweaver/tools/commands.py)
@@ -243,7 +320,7 @@ CLI 可以通过 `[execution]` 选用 Docker，Docker 执行不可用时返回�
 
 ## Web 修复与补丁复验
 
-下面的时序对应一次需要用户批准的 Web 修复。同一轮中可有多次审批和检查，图中以一次测试为例。
+下面的时序对应一次 Web 修复。图中展示需要批准的验证和后续工具反馈。启用 `auto` 时，满足自动放行条件的操作直接进入执行。
 
 ```mermaid
 sequenceDiagram
@@ -251,23 +328,33 @@ sequenceDiagram
     participant API as FastAPI
     participant DB as PostgreSQL
     participant W as Worker 与 Agent
+    participant M as ModelProvider
     participant E as 专用执行器
+    autonumber
     UI->>API: 提交修复任务
     API->>DB: 同一事务保存运行和队列
     API-->>UI: 202 与运行 ID
-    W->>DB: 领取任务并准备私有 worktree
-    W->>DB: 写入待审批操作
-    API->>DB: 按游标查询已提交的事件
-    DB-->>API: 返回审批事件
-    API-->>UI: SSE 推送审批卡
-    UI->>API: 批准指定操作
-    API->>DB: 持久保存批准
-    W->>DB: 校验并消费审批
-    W->>E: 发送当前快照与命令索引
-    E-->>W: 退出码、输出与清理结果
-    W->>DB: 保存结果、报告和终态事件
-    API->>DB: 查询后续事件和运行状态
-    DB-->>API: 返回终态事件
+    W->>DB: 领取任务
+    Note over W: 准备线程的私有 worktree
+    loop 模型与工具回合
+        W->>M: 发送上下文与工具定义
+        M-->>W: 返回文本及可选工具调用
+        opt 命令需要人工批准
+            W->>DB: 写入待审批操作
+            API->>DB: 按游标读取已提交的审批事件
+            API-->>UI: SSE 推送审批卡
+            UI->>API: 批准指定操作
+            API->>DB: 保存批准
+            W->>DB: 校验并消费批准
+        end
+        opt 执行已授权的验证
+            W->>E: 发送当前快照与命令索引或验证参数
+            E-->>W: 返回退出码、输出与清理结果
+            W->>DB: 保存工具结果以供重查和下一轮使用
+        end
+    end
+    W->>DB: 保存报告和终态，结束队列任务
+    API->>DB: 读取后续已提交的事件
     API-->>UI: SSE 推送完成状态
 ```
 
@@ -280,7 +367,7 @@ sequenceDiagram
 
 普通对话在本机账号注册时取得独立工作区标识。该工作区的项目相对路径为空。用户从侧栏顶部创建普通对话，API 据此按 `read-only` 接收入队。worker 为会话准备独立状态目录，执行层以 `chat_only` 选项装配 Agent。该路径沿用可见消息、预算和流式输出，关闭仓库索引、`AGENTS.md`、仓库工具和验证执行器。已配置的共享技能可通过 `load_skill` 按需读取。DeepSeek Flash 可使用 `ds_search`，独立搜索请求只包含本次公开查询。新回复、工具证据和用量按相同的 Web Journal 与 SSE 协议返回。 [本机账号与工作区](../src/stellarweaver/web/local_accounts.py) · [任务准备](../src/stellarweaver/web/worker.py) · [Agent 装配](../src/stellarweaver/runtime/service.py)
 
-Web 追问沿用已有 `session_id`，服务端为本轮生成新的 `run_id`。`history` 从最近最多八轮已完成的普通对话抽取可见问答，并将文件观察、验证退出码和技能版本整理为结构化证据。文件和验证结果分别按当前文件哈希和工作树快照标记有效性。`fresh` 从当前提示开始。两种方式均复用项目线程的 worktree，已选技能可跨轮保留，工具请求及授权在本轮重新记录。 [证据续接](../src/stellarweaver/web/continuation.py) · [Web 执行](../src/stellarweaver/web/execution.py)
+Web 追问沿用已有 `session_id`，为本轮生成新的 `run_id`。`history` 从最近最多八轮已完成的常规运行中抽取可见问答，并把文件观察、验证退出码和技能版本整理为结构化证据。文件和验证结果分别按当前文件哈希和 worktree 快照标记有效性。`fresh` 以当前提示开始，跳过旧问答和普通证据的投影。两种方式均复用项目线程的 worktree，并可保留用户选中的技能和须核对的中断记录。所需工具调用与授权仍由本轮产生。 [证据续接](../src/stellarweaver/web/continuation.py) · [历史选择](../src/stellarweaver/web/journal.py) · [Web 执行](../src/stellarweaver/web/execution.py)
 
 隔离线程的撤销请求以新运行排队，worker 获取原 worktree 和已确认的创建或编辑操作，通过 CLI 共用的文件恢复逻辑核对字节和权限后执行。撤销前写入意图，完成后记录确认事件并生成新候选。中断后未确认的撤销显示在恢复记录中。日志页的运行导出将可见对话、操作、事件和验证摘要投影成脱敏 JSON 或可离线阅读的 HTML。 [撤销](../src/stellarweaver/web/undo.py) · [导出](../src/stellarweaver/web/run_export.py)
 
@@ -294,7 +381,7 @@ CLI `resume` 打开原 SQLite 会话并协调未闭合操作。Web worker 重启
 
 ### SWE-bench Lite 评测调用链
 
-1. **冻结输入。** 批量适配器从固定数据集修订生成清单，分别保存公开任务与评分输入。Agent 在题目指定的 Git 基线运行，可见测试由配方绑定到断网容器。 [批量适配器](../src/stellarweaver/evals/swebench.py)
+1. **冻结输入。** 批量适配器从固定数据集修订生成清单，分开保存公开任务与评分输入。Agent 在题目指定的 Git 基线运行，可见测试由配方绑定到断网容器。评测入口使用专用的 100,000 token 默认窗口，以便按冻结的设置复跑和配对。 [批量适配器](../src/stellarweaver/evals/swebench.py) · [评测窗口](../src/stellarweaver/evals/swebench_pilot.py)
 2. **生成候选和独立评分。** Agent 复用模型与工具循环。候选补丁保存后，独立评分环境加载官方测试字段和候选，分别记录补丁应用与评分状态。评分身份与补丁、评分器及镜像绑定，旧收据可用于核对与复算。 [官方评分包装](../src/stellarweaver/evals/swebench_official.py) · [评分来源](../src/stellarweaver/evals/provenance.py)
 3. **离线汇总与配对。** `swebench_contract` 从已有制品生成 Manifest、Attempt、Score 和 Evidence，按计划题数保留所有终态。对照先检查冻结配置、模型、执行环境和评分条件，再配对双方同时有独立判定的题号，记录其余题目的排除原因。 [统一评测契约](../src/stellarweaver/evals/swebench_contract.py) · [验证与复现](EVAL.md#swe-bench-lite-批量评测)
 
