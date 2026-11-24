@@ -27,10 +27,11 @@ _SELECTOR_RE = re.compile(r"^[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*$")
 _KEYWORD_RE = re.compile(r"^[A-Za-z0-9_ ()]+$")
 
 _WORKER = """\
-import ast, importlib.util, json, os, pathlib, runpy, sys
+import ast, importlib.util, json, os, pathlib, runpy, site, sys
 
 action = sys.argv[1]
-sys.path.append("/deps")
+if os.path.isdir("/deps"):
+    site.addsitedir("/deps")
 path_entries = [str(pathlib.Path.cwd() / "src"), str(pathlib.Path.cwd())]
 if action == "run_python_snippet":
     code = sys.argv[2]

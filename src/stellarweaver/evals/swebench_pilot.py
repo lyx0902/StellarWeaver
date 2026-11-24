@@ -70,7 +70,16 @@ def write_json(path: Path, body: JSONDict) -> None:
 
 def git(root: Path, *argv: str) -> bytes:
     return subprocess.check_output(
-        ["git", "-C", str(root), "-c", f"core.hooksPath={os.devnull}", *argv],
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "core.longpaths=true",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            *argv,
+        ],
         env=controlled_environment(
             {
                 "GIT_CONFIG_GLOBAL": os.devnull,

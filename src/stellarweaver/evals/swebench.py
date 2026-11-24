@@ -139,8 +139,9 @@ site.addsitedir('/deps')
 runpy.run_module('pytest', run_name='__main__')
 """
 SANDBOX_PYTEST = """\
-import os, pathlib, sys
-sys.path.append('/deps')
+import os, pathlib, site, sys
+if os.path.isdir("/deps"):
+    site.addsitedir("/deps")
 os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 import pytest
 root = pathlib.Path.cwd()
