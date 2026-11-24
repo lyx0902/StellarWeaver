@@ -323,7 +323,7 @@ erDiagram
 
 当前 Compose 项目沿用既有 `stellarweaver-compose_postgres_data` 和 `stellarweaver-compose_workbench_state` 两个卷。数据库卷在容器内挂载到 `/var/lib/postgresql/data`，worker 的状态卷挂载到 `/state`。其他部署的卷名以 `SW_WORKBENCH_POSTGRES_VOLUME` 和 `SW_WORKBENCH_STATE_VOLUME` 为准。
 
-备份前排空写入任务并停止 API 与 worker，保留数据库服务。用 `pg_dump -Fc` 导出数据库，同一批备份保存工作区状态卷和部署配置。恢复演练使用独立目标数据库和独立状态卷，先检查 `pg_restore --exit-on-error`、迁移版本和历史计数，再核对登录、租户边界和历史线程续接。已完成的 PostgreSQL 单库恢复见[验收记录](EVALUATION.md#工作台与-harness-演进验收摘要)。
+备份前排空写入任务并停止 API 与 worker，保留数据库服务。用 `pg_dump -Fc` 导出数据库，同一批备份保存工作区状态卷和部署配置。恢复演练使用独立目标数据库和独立状态卷，先检查 `pg_restore --exit-on-error`、迁移版本和历史计数，再核对登录、租户边界和历史线程续接。已完成的阶段验收见[Harness 验收记录](HARNESS_ACCEPTANCE.md#当前实现进度核对)。
 
 下面的 PowerShell 示例使用[本机启动说明](USAGE.md#已部署实例)中的 `$dc`，将数据库转储文件复制到本地数据目录。每次备份使用单独文件名。
 

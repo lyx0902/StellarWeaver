@@ -200,4 +200,4 @@ OIDC 客户端需支持授权码、PKCE S256、`client_secret_basic` 和 RS256 I
 | `admin` | 查看获授权项目的线程、审计和用量，管理该项目的审批及取消，继续自己拥有的线程。 |
 | `viewer` | 读取获授权项目的运行、报告和补丁。 |
 
-成员默认最多 3 个活跃运行、每个成员同时领取一个任务、每分钟最多创建 20 个新运行。`active_limit`、`weekly_tokens` 可按成员设置。`SW_G5_EXECUTOR_SLOTS` 控制执行容量。管理面板展示 UTC 周配额和项目审计，历史明细仍按 UTC 日聚合。变更成员配置时先排空任务，再重启 API 与 worker。团队 OIDC 验证范围见[评测与验收记录](EVALUATION.md#已记录的阶段验收)。
+成员默认最多 3 个活跃运行、每个成员同时领取一个任务、每分钟最多创建 20 个新运行。`active_limit`、`weekly_tokens` 可按成员设置。`SW_G5_EXECUTOR_SLOTS` 控制执行容量。管理面板展示 UTC 周配额和项目审计，历史明细仍按 UTC 日聚合。变更成员配置时先排空任务，再重启 API 与 worker。团队 OIDC 验证范围见[实施与验收记录](HARNESS_ACCEPTANCE.md#当前实现进度核对)。

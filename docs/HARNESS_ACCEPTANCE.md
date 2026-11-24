@@ -47,7 +47,7 @@
 | 部分实现 | Web 有私有 worktree 和断网的一次性验证容器，主要执行预配置命令。CLI `run_command` 使用宿主进程，Windows Job 负责进程生命周期。通用沙箱 profile、统一命令隔离和开发服务器或浏览器验证仍待实现。 | [验证隔离](../src/stellarweaver/web/isolation.py) · [执行服务](../src/stellarweaver/web/broker.py) · [宿主命令](../src/stellarweaver/tools/commands.py) · [隔离回归](../tests/integration/test_web_g4.py) |
 | 部分实现 | 实验界面读取一份已发布报告，可查看事件和评分证据；多实验筛选、按样本轨迹对照、安全指标界面仍缺。M1 导出独立 JSON，未扩大此界面的读取契约。 | [实验视图](../frontend/src/experiment.tsx) · [实验 API](../src/stellarweaver/web/app.py) |
 | 缺失 | 到 M0 审计时，统一 Manifest/Attempt/Score/Evidence、哈希校验与配对汇总尚未接通。M1 补齐 SWE-bench 契约；安全夹具、独立效果 Oracle、外部安全套件及修复过程指标归后续里程碑。跨任务项目记忆、多 Agent 和多候选是可选目标。 | [统一评测协议](EVALUATION.md#统一评测协议) · [里程碑总表](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md#71-里程碑总表) |
-| 不能确定 | 完整 `dev`/`test` 的可执行性和正式成绩、DeepSeek API 别名对应的权重修订、外部安全套件的可比性、真实部署的隔离性质均需对应证据。已保存 `dev` 清单 23 条，本机配方 3 条。历史三题评分仅有 2 个已保存候选获 `resolved`、1 个未评分。 | [现有实验记录](EVALUATION.md#phase-2-三题试跑证据) · [历史内部评测](archive/00_Sample_Run.md) |
+| 不能确定 | 完整 `dev`/`test` 的可执行性和正式成绩、DeepSeek API 别名对应的权重修订、外部安全套件的可比性、真实部署的隔离性质均需对应证据。已保存 `dev` 清单 23 条，本机配方 3 条。 | [SWE-bench Lite 实测记录](EVALUATION.md#三题实测与官方评分记录) · [历史内部评测](archive/00_Sample_Run.md) |
 
 ### 离线验收与证据
 
@@ -131,7 +131,7 @@ python -B -m pytest -q -ra --tb=short -m 'not live_model' -p no:cacheprovider
 python -B -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_web_g5.py
 ```
 
-固定场景、判定口径、工具威胁模型和外部套件可行性见[工具安全与评测](SECURITY.md)。定位、编辑和冲突恢复指标见[修复过程离线夹具](EVALUATION.md#修复过程离线夹具与-20-题评测)。M5 对通用执行器、镜像、断网、资源约束和清理的验证见下节。
+固定场景、判定口径、工具威胁模型和外部套件可行性见[工具安全与评测](SECURITY.md)。M5 对通用执行器、镜像、断网、资源约束和清理的验证见下节。
 
 ## M5-M8 沙箱与修复工具
 
