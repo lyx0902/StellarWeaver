@@ -252,16 +252,20 @@ class OpenAICompatibleChatProvider:
     def _thinking_enabled(self) -> bool:
         return self.config.provider == "deepseek" and self.config.thinking == "enabled"
 
-    def _vendor_parameters(self) -> JSONDict | None:
+    def _vendor_parameters(self, *, disable_thinking: bool = False) -> JSONDict | None:
         if self.config.provider != "deepseek":
             return None
+        if disable_thinking:
+            return {"thinking": {"type": "disabled"}}
         body: JSONDict = {"thinking": {"type": self.config.thinking}}
         if self._thinking_enabled:
             body["reasoning_effort"] = self.config.reasoning_effort
         return body
 
     def _messages(self, request: ModelRequest) -> list[ChatCompletionMessageParam]:
-        include_reasoning = self._thinking_enabled and bool(request.tools)
+        include_reasoning = (
+            self._thinking_enabled and not request.disable_thinking and bool(request.tools)
+        )
         history = thinking_history(request.messages) if include_reasoning else request.messages
         return cast(
             list[ChatCompletionMessageParam],
@@ -275,7 +279,7 @@ class OpenAICompatibleChatProvider:
         if request.tools and not self.config.supports_tools:
             raise ProviderError("Configured provider does not support function tools")
         tools = list(request.tools)
-        extra_body = self._vendor_parameters()
+        extra_body = self._vendor_parameters(disable_thinking=request.disable_thinking)
         if request.web_search:
             if not self._web_search_available or tools:
                 raise ProviderError(
@@ -349,7 +353,9 @@ class OpenAICompatibleChatProvider:
             raise ProviderError("Configured provider does not support function tools")
         accumulator = ChatCompletionAccumulator(
             max_output_tokens=min(request.max_output_tokens, self.config.max_output_tokens),
-            capture_reasoning=self._thinking_enabled and bool(request.tools),
+            capture_reasoning=(
+                self._thinking_enabled and not request.disable_thinking and bool(request.tools)
+            ),
         )
         try:
             response = await self._client.chat.completions.create(
@@ -363,7 +369,7 @@ class OpenAICompatibleChatProvider:
                 max_tokens=min(request.max_output_tokens, self.config.max_output_tokens),
                 stream=True,
                 stream_options={"include_usage": True},
-                extra_body=self._vendor_parameters(),
+                extra_body=self._vendor_parameters(disable_thinking=request.disable_thinking),
             )
             async with response:
                 async for chunk in response:

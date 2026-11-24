@@ -1,6 +1,8 @@
 """Private G5 verification service. The worker supplies only a snapshot and a command index."""
 
 import asyncio
+import base64
+import binascii
 import os
 import re
 import secrets
@@ -19,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from stellarweaver.config import ExecutionConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.commands import _wait_cleanup
-from stellarweaver.tools.development import Action, DevelopmentArgs, development_argv
+from stellarweaver.tools.development import Action, DevelopmentArgs, SnippetArgs, development_argv
 from stellarweaver.tools.workspace import ToolError, Workspace
 from stellarweaver.web.isolation import _MAX_BYTES, _MAX_FILES, DockerRunner, Isolation
 from stellarweaver.web.snapshots import (
@@ -112,11 +114,14 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
         action: Action | None = None,
         target: str | None = None,
         framework: str | None = None,
+        selector: str | None = None,
+        keyword: str | None = None,
         metrics: bool = False,
         snapshot: Annotated[str | None, Query(pattern=r"^[a-f0-9]{64}$")] = None,
         base: Annotated[str | None, Query(pattern=r"^[a-f0-9]{64}$")] = None,
         scope: Annotated[str | None, Query(pattern=r"^[a-f0-9]{32}$")] = None,
         authorization: Annotated[str | None, Header()] = None,
+        snippet_header: Annotated[str | None, Header(alias="X-StellarWeaver-Snippet")] = None,
     ) -> JSONDict:
         authorize(authorization)
         if (snapshot is None) != (scope is None) or (base is not None and snapshot is None):
@@ -127,11 +132,32 @@ def create_broker(isolation: Isolation, token: str, slots: int = 2) -> FastAPI:
             and action is None
             and target is None
             and framework is None
+            and selector is None
+            and keyword is None
+            and snippet_header is None
         ):
             argv = list(isolation.commands[command])
+        elif command is None and action == "run_python_snippet" and isolation.development:
+            if not snippet_header:
+                raise HTTPException(422, "Missing snippet payload")
+            try:
+                decoded = base64.b64decode(snippet_header.encode("ascii"), validate=True).decode(
+                    "utf-8"
+                )
+                snippet = SnippetArgs.model_validate({"code": decoded})
+            except (ValueError, UnicodeError, binascii.Error) as exc:
+                raise HTTPException(422, "Invalid python snippet") from exc
+            argv = development_argv("run_python_snippet", snippet)
         elif command is None and action is not None and isolation.development:
             try:
-                args = DevelopmentArgs.model_validate({"target": target, "framework": framework})
+                args = DevelopmentArgs.model_validate(
+                    {
+                        "target": target,
+                        "framework": framework,
+                        "selector": selector,
+                        "keyword": keyword,
+                    }
+                )
             except ValueError as exc:
                 raise HTTPException(422, "Invalid development target") from exc
             argv = development_argv(action, args)

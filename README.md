@@ -12,17 +12,17 @@
 
 | 能力 | 实现方式 |
 | --- | --- |
-| 仓库导航与修复 | 搜索文本、定位 Python 定义与引用、查找相关测试，读取后按文件哈希和唯一匹配精确编辑。测试失败可反馈给 Agent 继续修复。 |
+| 仓库导航与修复 | 搜索文本、AST 定位 Python 定义与引用（含字节预过滤与源码缓存）、查找相关测试；支持多处精确编辑 `edit_file`、跨文件原子写回 `apply_patch`、只读工具并发、只读子 Agent 探索 `delegate_exploration` 与写后 Python 语法检查。 |
 | 工作台与 CLI | 工作台支持账号登录、多个项目、线程归档、无项目对话和原线程追问。CLI 提供交互、单次任务、JSONL 输出与会话回放。 |
-| 权限与隔离验证 | 工作台提供只读、`auto` 和「修改」。项目线程拥有独立 Git worktree，获准的测试和构建使用文件快照，在一次性断网 Linux 容器中运行。 |
-| 补丁审阅与交付 | 按文件或改动块审阅，针对候选发送反馈，选择改动独立复验，预检目标分支并下载补丁。也可撤销最近一次符合条件的内置编辑。 |
-| 上下文、模型与扩展 | CLI 和 Web 默认使用 200k 单请求窗口，按完整回合压缩历史。DeepSeek Flash 默认使用 Thinking High，支持按需网页搜索。工作台支持模型自主加载 Skills 和手动指定版本，CLI 可装配本地 stdio MCP。 |
+| 权限与隔离验证 | 工作台提供只读、`auto` 和「修改」，支持沙箱内测试命令作用域授权复用。项目线程拥有独立 Git worktree，验证通过增量快照在一次性断网 Linux 容器中运行。 |
+| 补丁审阅与交付 | 按文件或改动块审阅，针对候选发送反馈，选择改动独立复验，预检目标分支并下载补丁。支持单文件与 `apply_patch` 成组撤销。 |
+| 上下文、模型与扩展 | CLI 和 Web 默认使用 200k 单请求窗口，支持实测校准预算、固定前缀压缩、最近回合原文保护与导入加权 RepoMap。DeepSeek Flash 默认使用 Thinking High，支持按需网页搜索。工作台支持模型自主加载 Skills 和手动指定版本，CLI 可装配本地 stdio MCP。 |
 | 运行证据与恢复 | Web 用 PostgreSQL 保存任务队列、审批、事件和用量，通过 SSE 回显进度，可导出脱敏 JSON 或离线 HTML。CLI 用 SQLite 保存消息、操作及恢复记录。 |
 | SWE-bench Lite 评测 | 冻结题面、仓库基线和执行配置，按题生成候选补丁。官方评分在独立环境运行，工作台可读取已发布的结果与证据。 |
 
 ### 当前进展
 
-CLI M0–M5、工作台 G0–G5 和 Harness M0–M10 已有阶段验收记录。SWE-bench Lite 的三道历史开发题中，两道候选补丁通过独立官方评分，一道未生成可评分的补丁。已冻结 23 道开发题清单，完整开发集和 300 道测试题的正式基线待运行。 [当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测计划](docs/EVAL_PLAN.md)
+CLI M0–M5、工作台 G0–G11、Harness M0–M10，以及 N 阶段（Batch 1–3）与三项上下文优化均已完成源码实现与离线验收（586 项离线回归通过）。SWE-bench Lite 的三道历史开发题中，两道候选补丁通过独立官方评分，一道未生成可评分的补丁。已冻结 23 道开发题清单，完整开发集和 300 道测试题的正式基线待运行。 [当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系与计划](docs/EVALUATION.md)
 
 ## 工作原理
 
@@ -112,8 +112,8 @@ worker 领取时记录执行归属和尝试号。项目线程首次执行以源�
 
 - **先定位，再读取。** Python repo map 基于 AST 收集函数、类和行号。启用导航扩展后，`find_symbol`、`find_references` 和 `find_related_tests` 给出定义、静态引用和测试线索。Agent 用 `read_file` 取得具体内容和当前文件哈希，再提交编辑。
 - **按路径加载项目指令。** 运行时根据项目根目录和目标文件所在目录收集适用的 `AGENTS.md`。等待审批期间如指令变化，运行时重新核对指纹，并将变化反馈给下一轮模型。
-- **按完整回合压缩。** CLI 和 Web 默认窗口为 200,000 token。DeepSeek Thinking 默认预留 8,192 token 输出及 2,048 token 余量，估算输入额度为 189,760 token，工具定义也占用输入。达到输入额度的 80% 时可尝试向 55% 压缩，归纳过长工具输出及较早的完整回合，保留对应关系和近期证据。工作台按运行保存提交时使用的窗口。
-- **分开记录窗口和用量。** Journal 保留原始消息、工具证据与摘要检查点，模型服务返回的实际用量另行记录。CLI 仍受所配置的运行总预算约束。Web 关闭单次运行累计预算，DeepSeek 继续按成员周额度预留和结算，默认每周 1,000 万 token，按 UTC 周一划界。SWE-bench Lite 保留独立的 100k 默认窗口与冻结配置。
+- **按完整回合压缩。** CLI 和 Web 默认窗口为 200,000 token。DeepSeek Thinking 默认预留 16,384 token 输出及 2,048 token 余量，估算输入额度为 181,568 token，工具定义也占用输入。达到输入额度的 80% 时可尝试向 55% 压缩，归纳过长工具输出及较早的完整回合，保留对应关系和近期证据。工作台按运行保存提交时使用的窗口。
+- **分开记录窗口和用量。** Journal 保留原始消息、工具证据与摘要检查点，模型服务返回的实际用量另行记录。CLI 仍受所配置的运行总预算约束。Web 关闭单次运行累计预算，DeepSeek 继续按成员周额度预留和结算，默认每周 1 亿 token，按 UTC 周一划界。SWE-bench Lite 默认 200k 窗口（兼容旧清单 100k）并支持在 `prepare` 冻结自定义预算与 `--harness-profile baseline|full` 对照。
 
 [上下文管理](src/stellarweaver/context/) · [项目指令](src/stellarweaver/instructions/) · [Web 额度与续接](docs/USAGE.md#上下文续接与额度)
 
@@ -252,7 +252,7 @@ uv run --locked --offline python -m stellarweaver.evals.swebench --help
 | 完整开发集 | 已冻结 23 道 `dev` 的清单，已有三道题的执行配方。其余环境及完整实跑待验收。 |
 | 正式对照 | 300 道 `test` 基线及仓库导航、失败反馈、上下文等消融已列入实验计划。 |
 
-[评测命令与试跑记录](docs/EVAL.md#swe-bench-lite-批量评测) · [实验设计](docs/EVAL_PLAN.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
+[评测命令与试跑记录](docs/EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [实验设计](docs/EVALUATION.md#swe-bench-lite-实验设计与对照规划) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ### 回归测试与效果验证
 
@@ -263,7 +263,7 @@ uv run --locked --extra web ruff check .
 uv run --locked --extra web mypy src/stellarweaver
 ```
 
-回归覆盖工具权限、真实临时仓库、流式协议、恢复与评分链路。PostgreSQL、Docker 和浏览器集成测试按测试配置提供独立资源。 [复现入口与已有结果](docs/EVAL.md#复现入口)
+回归覆盖工具权限、真实临时仓库、流式协议、恢复与评分链路。PostgreSQL、Docker 和浏览器集成测试按测试配置提供独立资源。 [复现入口与已有结果](docs/EVALUATION.md#复现入口)
 
 ### 项目结构
 
@@ -289,9 +289,11 @@ StellarWeaver/
 
 | 文档 | 内容 |
 | --- | --- |
+| [项目文档导航](docs/README.md) | 能力总览、修复流程演示与文档阅读顺序。 |
+| [使用与部署](docs/USAGE.md) | CLI 操作、Harness 增强开关速查、Web 工作台、Compose 与团队身份配置。 |
 | [架构与调用链](docs/ARCHITECTURE.md) | 工作台架构、共享运行时、模型、工具、隔离与交付流程。 |
-| [使用与部署](docs/USAGE.md) | CLI 操作、Web 工作台、Compose 与团队身份配置。 |
 | [数据库与持久化](docs/DATABASE.md) | PostgreSQL 与 SQLite 的结构、职责、迁移和恢复。 |
-| [验证记录](docs/EVAL.md) · [评测计划](docs/EVAL_PLAN.md) | 功能验收、SWE-bench Lite 命令、实验设计和结果口径。 |
-| [当前实现与验收](docs/HARNESS_ACCEPTANCE.md) · [后续路线图](docs/ROADMAP.md) | 当前能力边界、M0–M10 验收和待开展的实验。 |
-| [工具授权](docs/SECURITY.md) · [归档索引](docs/archive/README.md) | 风险分流、历史阶段记录、原始方案及外部工作流对照。 |
+| [工具授权与安全](docs/SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与本地安全夹具。 |
+| [评测体系与实验计划](docs/EVALUATION.md) | 复现入口、统一评测协议、SWE-bench Lite 命令、实验设计与阶段验收。 |
+| [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [后续路线图](docs/ROADMAP.md) | M0–M10 与 N 阶段（Batch 1–3）及上下文优化的验收核对和后续计划。 |
+| [历史归档索引](docs/archive/README.md) | 已完成规划方案（含 M0–M10 总方案与 N 阶段方案）、历史阶段进度与外部工作流对照。 |

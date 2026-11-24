@@ -22,7 +22,7 @@ uv run stellarweaver exec --workspace . --provider deepseek --env-file .env --po
 
 CLI 和 Web 的 DeepSeek 默认启用 Thinking，强度为 `high`。CLI 通过 `[model]` 的 `thinking` 和 `reasoning_effort` 调整。设置 `thinking = "disabled"` 可运行 Non-thinking，启用时强度可选 `low`、`high`、`max`。原始推理只在当前进程的工具对话中回传，界面、持久化会话和导出记录保存可见回复与工具证据。
 
-DeepSeek Thinking 默认单次输出上限为 8,192 token，包含推理和可见文本。CLI 保留配置中显式设置的 `max_output_tokens`。模型输出仍受整轮运行预算限制。
+DeepSeek Thinking 默认单次输出上限为 16,384 token，包含推理和可见文本。CLI 保留配置中显式设置的 `max_output_tokens`。模型输出仍受整轮运行预算限制。
 
 ### 会话、策略和改动
 
@@ -86,7 +86,7 @@ Enter 提交，Shift+Enter 换行。运行中的线程可以编辑追问草稿�
 
 | 限制 | 实际作用 |
 | --- | --- |
-| 单次模型请求窗口 | 默认 200,000 token。DeepSeek Thinking 预留 8,192 输出和 2,048 安全余量，可用输入为 189,760。超窗时尝试归纳较早的完整工具回合，仍放不下必需内容时显示 `CONTEXT_WINDOW_EXCEEDED`。 |
+| 单次模型请求窗口 | 默认 200,000 token。DeepSeek Thinking 预留 16,384 输出和 2,048 安全余量，可用输入为 181,568。超窗时尝试归纳较早的完整工具回合，仍放不下必需内容时显示 `CONTEXT_WINDOW_EXCEEDED`。 |
 | 账户周额度 | 关联账户默认每 UTC 周 10,000,000 token。每次 DeepSeek 请求先预留，完成后按输入和输出结算。周一 00:00 UTC 即北京时间周一 08:00 重置，超额可显示 `WEEKLY_MODEL_QUOTA`。 |
 | 单次操作超时 | 模型请求、命令和审批按各自的超时或有效期处理。Web 运行内累计 token、模型及工具调用次数和整轮时长无额外上限。 |
 
@@ -130,15 +130,38 @@ Docker Desktop 使用 Linux 容器。先拉取验证镜像 `docker pull python:3
 | `SW_WORKBENCH_PROVIDER`、`SW_WORKBENCH_REPAIR` | `fake` 用于离线演示，`deepseek` 使用 `.env` 中的模型密钥。修复开关设为 `1` 时，可写项目提供 `auto` 和「修改」。 |
 | `SW_WEB_DEEPSEEK_THINKING`、`SW_WEB_DEEPSEEK_REASONING_EFFORT` | 默认为 `enabled`、`high`。在 Compose 的环境配置中修改后重新创建 API 和 worker，直接启动 Web 时可使用同名进程环境变量。 |
 | `SW_WEB_CONTEXT_WINDOW_TOKENS` | Web 新运行的上下文窗口，默认 `200000`。API 在提交时保存该值，已入队的运行按保存值执行。 |
-| `SW_WEB_CALIBRATED_CONTEXT_BUDGET`、`SW_WEB_STICKY_CONTEXT_CHECKPOINT`、`SW_WEB_PROTECT_FRESH_TOOL_OUTPUT` | 分别设为 `1` 开启实测校准、固定压缩投影、保留最新工具回合全文。三项默认关闭。 |
-| `SW_WEB_FRESH_TOOL_ROUNDS` | 开启全文保护时保留的最近完整工具回合数，默认 `2`。 |
 | `SW_G5_LOCAL_OWNER_ID`、`SW_G5_MEMBERS_FILE` | 为初始本机管理员选一个固定 UUID。成员文件使用绝对路径，示例见下方。已有实例保留原 UUID。 |
 | `SW_G5_EXECUTOR_TOKEN` | 生成一个至少 32 字符的随机执行服务凭据，供 worker 和执行器内部通信。浏览器使用账号密码。 |
 | `SW_WORKBENCH_PORT`、`SW_PG_PORT` | 本机覆盖层默认分别为 `8787`、`55434`。配置中的显式端口优先生效。 |
 | `SW_WORKBENCH_EXTERNAL_VOLUMES`、`SW_WORKBENCH_POSTGRES_VOLUME`、`SW_WORKBENCH_STATE_VOLUME` | 首次启动使用默认新卷。复用迁移自旧项目的卷时设置 `true` 和两个实际卷名。 |
 | `SW_WORKBENCH_HTTPS_PROXY` | worker 需要通过宿主代理访问模型时设置，例如 `http://host.docker.internal:7890`。 |
 
-CLI 和内置离线评测通过 TOML 的 `[harness]` 独立设置 `calibrated_context_budget`、`sticky_context_checkpoint`、`protect_fresh_tool_output`。`[context].fresh_tool_rounds` 控制全文保护轮数。SWE-bench 的 `run` 子命令使用对应的连字符参数，例如 `--sticky-context-checkpoint`，并可用 `--fresh-tool-rounds 2` 指定轮数。
+### Harness 增强开关速查
+
+所有 Harness 增强开关默认关闭以保证评测基线可复现。Web 工作台在 `.stellarweaver/workbench.compose.env` 中设为 `1`（或指定值）并重启 `api` / `worker` / `executor` 生效；CLI 在 `stellarweaver.toml` 的 `[harness]` 与 `[context]` 中配置；SWE-bench 批量入口通过对应连字符参数（如 `--multi-edit-tools`、`--sticky-context-checkpoint`）启用。
+
+| Web 环境变量 | CLI `[harness]` 字段 | 作用与依赖说明 |
+| --- | --- | --- |
+| `SW_WEB_DEVELOPMENT_TOOLS` | `development_tools` | 开放隔离沙箱内的 `run_tests`（支持 `selector`/`keyword` 细粒度过滤）、`run_python_snippet`（断网一次性复现脚本）、`discover_tests`、`check_syntax`、`run_linter`（要求固定摘要的验证镜像）。 |
+| `SW_WEB_ISSUE_NAVIGATION` | `issue_navigation` | 启用题面信号提取与 `find_symbol`、`find_references`、`find_related_tests`。 |
+| `SW_WEB_REPAIR_CONTROLLER` | `repair_controller` | 设为 `feedback`（提供错误分类与建议）或 `enforce`（同候选连续 3 次同签名失败停机），默认 `off`。 |
+| `SW_WEB_PATCH_STAGING` | `patch_staging` | 开放只读暂存多文件补丁工具 `stage_patch`（仅导出审阅，不改工作区）。 |
+| `SW_WEB_TASK_EVIDENCE` | `task_evidence` | 在上下文中维护运行内已核验的文件哈希、测试状态与暂存补丁证据。 |
+| `SW_WEB_BUDGET_GUIDANCE` | `budget_guidance` | 在启用运行总预算时输出阶段与余量提示。 |
+| `SW_WEB_PIPELINE_METRICS` | `pipeline_metrics` | 记录本地输入估算与服务端真实 token 的误差比，以及沙箱打包、校验、创建、执行与清理分段耗时。 |
+| `SW_WEB_MULTI_EDIT_TOOLS` | `multi_edit_tools` | 扩展 `edit_file` 支持单文件一次最多 64 处非重叠精确替换，一次原子落盘。 |
+| `SW_WEB_POST_EDIT_SYNTAX_HOOK` | `post_edit_syntax_hook` | 写入 `.py` 文件后执行内存 `ast.parse`，语法错误随当次工具结果返回并在压缩时保留。 |
+| `SW_WEB_SMART_TOOL_TRUNCATION` | `smart_tool_truncation` | 上下文压缩时对超长工具输出按 35% 头 + 65% 尾保留，并为 `stdout`/`stderr` 双流分配配额。 |
+| `SW_WEB_NAVIGATION_PREFILTER` | `navigation_prefilter` | 超过 100 个 `.py` 文件时先按符号名全仓库预筛并缓存源文件元数据，再做 AST 解析（依赖 `issue_navigation`）。 |
+| `SW_WEB_MULTI_FILE_APPLY` | `multi_file_apply` | 开放跨文件事务写回工具 `apply_patch`（最多 12 文件，支持修改/新建/删除、I/O 补偿回滚与成组撤销）。 |
+| `SW_WEB_PARALLEL_READ_TOOLS` | `parallel_read_tools` | 对连续的内置只读工具启用最多 4 路并发执行，同时保持 Journal 事件顺序与串行完全一致。 |
+| `SW_WEB_SCOPED_TEST_GRANTS` | `scoped_test_grants` | 沙箱开发工具授予会话权限后，同工作区、沙箱边界与框架内可切换目标路径复用授权（依赖 `development_tools`）。 |
+| `SW_WEB_INCREMENTAL_SANDBOX_SNAPSHOTS` | `incremental_sandbox_snapshots` | Worker→Broker 之间复用内容寻址基线缓存，仅上传变更文件与删除清单，摘要不符自动回退全量。 |
+| `SW_WEB_IMPORT_AWARE_REPOMAP` | `import_aware_repomap` | RepoMap 对当前相关文件的直接导入方与被导入方加权，提高邻居模块进入预算窗口的召回。 |
+| `SW_WEB_SUBAGENT_EXPLORATION` | `subagent_exploration` | 开放只读探索委派工具 `delegate_exploration`（Web 下最多 3 路滑动并发、支持静默流式与无 Thinking 收尾总结、最多 32 份文件哈希；可通过 `SW_WEB_EXPLORATION_MAX_MODEL_CALLS=20`、`SW_WEB_EXPLORATION_MAX_TOOL_CALLS=60`、`SW_WEB_EXPLORATION_TIMEOUT_SECONDS=300`、`SW_WEB_EXPLORATION_STALL_ROUNDS=3` 调整安全熔断）。 |
+| `SW_WEB_CALIBRATED_CONTEXT_BUDGET` | `calibrated_context_budget` | 按最近 6 个服务端真实 `prompt_tokens` 样本动态校准本地估算系数，避免 200k 窗口过早压缩。 |
+| `SW_WEB_STICKY_CONTEXT_CHECKPOINT` | `sticky_context_checkpoint` | 压缩后固定历史前缀检查点，可变证据置于末尾，减少重复压缩并提升前缀缓存稳定性。 |
+| `SW_WEB_PROTECT_FRESH_TOOL_OUTPUT` | `protect_fresh_tool_output` | 压缩时逐字节保留最近 `SW_WEB_FRESH_TOOL_ROUNDS`（CLI `[context].fresh_tool_rounds`，默认 `2`）轮完整工具输出。 |
 
 本机 `.stellarweaver/workbench.members.json` 的最小示例。`id` 与 `SW_G5_LOCAL_OWNER_ID` 相同，初始租户使用源码定义的本机租户 UUID。准备好文件后按上面的 `$dc` 命令执行 `up -d --build --wait`。
 
@@ -177,4 +200,4 @@ OIDC 客户端需支持授权码、PKCE S256、`client_secret_basic` 和 RS256 I
 | `admin` | 查看获授权项目的线程、审计和用量，管理该项目的审批及取消，继续自己拥有的线程。 |
 | `viewer` | 读取获授权项目的运行、报告和补丁。 |
 
-成员默认最多 3 个活跃运行、每个成员同时领取一个任务、每分钟最多创建 20 个新运行。`active_limit`、`weekly_tokens` 可按成员设置。`SW_G5_EXECUTOR_SLOTS` 控制执行容量。管理面板展示 UTC 周配额和项目审计，历史明细仍按 UTC 日聚合。变更成员配置时先排空任务，再重启 API 与 worker。团队 OIDC 验证范围见[验收记录](EVAL.md)。
+成员默认最多 3 个活跃运行、每个成员同时领取一个任务、每分钟最多创建 20 个新运行。`active_limit`、`weekly_tokens` 可按成员设置。`SW_G5_EXECUTOR_SLOTS` 控制执行容量。管理面板展示 UTC 周配额和项目审计，历史明细仍按 UTC 日聚合。变更成员配置时先排空任务，再重启 API 与 worker。团队 OIDC 验证范围见[评测与验收记录](EVALUATION.md#已记录的阶段验收)。

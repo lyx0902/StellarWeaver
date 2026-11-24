@@ -26,10 +26,13 @@ flowchart TB
         Context["上下文与指令<br/>历史证据、技能目录、仓库导航"]
         Provider["ModelProvider<br/>DeepSeek、兼容端点或 FakeModel"]
         Tools["ToolRegistry 与 PolicyEngine<br/>参数、路径、版本、授权和复检"]
+        Subagent["ExplorationAgent（可选）<br/>只读子 Agent · 私密上下文 · Web 最多 3 路并发"]
         Journal["RunJournal<br/>消息、操作、检查点与终态"]
         Agent --> Context
         Agent <-->|模型请求与回复| Provider
         Agent <-->|工具调用与结果| Tools
+        Tools <-->|delegate_exploration| Subagent
+        Subagent -.->|经父级独立记账| Provider
         Agent --> Journal
     end
 
@@ -52,6 +55,7 @@ flowchart TB
     Journal -->|CLI 与评测| Local
     Journal -->|Web| PG
     Tools -->|文件与 Git 操作| Files
+    Subagent -->|只读检索与导航| Files
     Tools -->|验证或命令| Sandbox
     Batch -->|生成候选补丁| Grade["独立官方评分与结果汇总"]
 
@@ -83,6 +87,7 @@ flowchart TB
     Agent["Agent 回合<br/>上下文、技能与工具结果"]
     Model["DeepSeek / FakeModel"]
     Guard["工具注册与授权<br/>只读 · auto · 修改"]
+    Explore["ExplorationAgent（只读子 Agent）<br/>私密上下文 · 最多 3 路滑动并发"]
     Approval[("PostgreSQL 审批<br/>由浏览器提交决定")]
     Worktree["线程 worktree<br/>项目文件和 Git 操作"]
     Sandbox["专用执行器<br/>一次性断网验证容器"]
@@ -96,6 +101,9 @@ flowchart TB
     Worker --> Agent
     Agent <-->|请求与回复| Model
     Agent <-->|调用与结果| Guard
+    Guard <-->|delegate_exploration| Explore
+    Explore -->|只读检索与导航| Worktree
+    Explore -.->|经父级静默流式与周额度| Model
     Guard <-->|按需申请并消费批准| Approval
     Guard -->|项目工具| Worktree
     Guard <-->|快照、操作与结果| Sandbox
@@ -111,7 +119,7 @@ flowchart TB
 
 1. **提交。** React 提交提示词、工作区、模式、技能引用和请求 ID。已有线程会带上会话 ID。API 返回的新运行 ID 用于查快照、订阅事件和之后的交付操作。
 2. **领取。** worker 从数据库领取任务，根据工作区种类选择私有 Git worktree 或普通对话目录。该轮保存的窗口配置随领取结果传入运行时。
-3. **循环。** 模型回复触发工具调用。注册表核对实际工具参数和权限；需要批准时，worker 等待数据库中的决定。执行结果写入 Journal，并按工具调用 ID 回给模型。
+3. **循环。** 模型回复触发工具调用。注册表核对实际工具参数和权限；需要批准时，worker 等待数据库中的决定。启用只读探索时，`delegate_exploration` 可由最多 3 路并发的 `ExplorationAgent` 在线程 worktree 内完成只读检索，经父级独立记账并产生 `exploration.*` 事件。执行结果写入 Journal，并按工具调用 ID 回给模型。
 4. **回传。** FastAPI 从数据库读取已提交的事件。React 通过 REST 获取运行快照，按事件序号拼接 SSE 进度，完成后按需读取验证及改动报告。 [任务提交](../frontend/src/main.tsx) · [工作台 API](../src/stellarweaver/web/app.py) · [Worker](../src/stellarweaver/web/worker.py)
 
 ## 模块职责
@@ -120,6 +128,7 @@ flowchart TB
 | --- | --- | --- |
 | [CLI 和配置](#cli-和配置) | 将终端参数、工作目录和配置装配为一次运行。 | [cli.py](../src/stellarweaver/cli.py)、[config.py](../src/stellarweaver/config.py) |
 | [领域与运行时](#领域与运行时) | 推进模型与工具回合，管理硬预算、修复反馈和终态。 | [domain/](../src/stellarweaver/domain)、[runtime/](../src/stellarweaver/runtime) |
+| [只读子 Agent 探索](#只读子-agent-探索) | 私密只读上下文、3 路滑动并发、独立计账、停滞收敛与无 Thinking 收尾抢救。 | [exploration.py](../src/stellarweaver/runtime/exploration.py)、[loop.py](../src/stellarweaver/runtime/loop.py) |
 | [模型](#模型) | 转换 Chat Completions 请求，聚合流式回复，提供离线响应。 | [providers/](../src/stellarweaver/providers) |
 | [上下文与指令](#上下文与指令) | 组装历史、项目指令、Python 仓库导航与本轮证据。 | [instructions/](../src/stellarweaver/instructions)、[context/](../src/stellarweaver/context) |
 | [工具与权限](#工具与权限) | 解析参数，核对路径、版本和授权，执行并返回可审计结果。 | [tools/](../src/stellarweaver/tools)、[policy/](../src/stellarweaver/policy) |
@@ -156,13 +165,36 @@ flowchart TB
 
 `build_agent` 是公共装配点。它用 Journal 的工作区创建 `PolicyEngine` 和 `ToolRegistry`，再把模型、边界配置、审批回调、可选的命令执行器和通知回调交给 `Agent`。CLI 将审批连接到终端，Web 用 `ApprovalGate` 处理策略判定需要审批的操作。开发工具、导航、补丁暂存、修复反馈、任务证据和预算提示分别受配置控制。普通对话用 `chat_only` 关闭仓库工具与仓库上下文。 [公共装配点](../src/stellarweaver/runtime/service.py) · [Web 配置映射](../src/stellarweaver/web/execution.py)
 
-主循环 `_drive` 用当前工具清单和上下文发起模型请求。取得完整回复后，先检查工具调用 ID，再通过 Journal 保存助手消息及计划操作。`_tools` 按回复顺序分派工具，把每个结果以对应的 `tool_call_id` 加回消息序列。模型下一轮可依据真实结果补读、再次编辑、复验或结束。遇到取消、预算耗尽或无法确认的执行状态时，已声明但未执行的调用记录相应的跳过或取消结果。完成所有工具关联后，运行时才组装下一次请求。 [领域类型](../src/stellarweaver/domain/__init__.py) · [主循环](../src/stellarweaver/runtime/loop.py)
+主循环 `_drive` 用当前工具清单和上下文发起模型请求。取得完整回复后，先检查工具调用 ID，再通过 Journal 保存助手消息及计划操作。`_tools` 默认按回复顺序串行分派工具；启用 `parallel_read_tools` 时，对连续的内置只读工具（`list_files`、`read_file`、`search_text`、`find_symbol`、`find_references`、`find_related_tests`、`git_status`、`git_diff`、`git_log`、`git_show`）以 `ReadDispatch` 三阶段栅栏最多 4 路并发执行——先按原顺序完成准备、授权与 `tool.started` 入库，再并发执行 I/O，最后严格按原顺序运行 `PostToolUse`、持久化结果并追加 `tool` 消息；遇到写操作、命令、远程 MCP 或需交互审批时立即回退串行。启用 `subagent_exploration` 时，主循环开放只读工具 `delegate_exploration`，由独立的 `ExplorationAgent` 在私密上下文内完成只读检索（Web 模式下配合 `parallel_read_tools` 最多 3 路滑动并发，默认安全熔断 20 次模型调用 / 60 次工具调用 / 300 秒 / 连续 3 轮停滞；CLI 与评测严格受父级剩余预算约束），子请求采用静默流式与单次重试、按 `ExplorationRequestScope` 独立记账并共用父任务及 Web 周额度，触及边界或截断时通过关闭 Thinking 的收尾轮（保留截断草稿与宽观察窗口）回传结构化结论与最多 32 份 `{path, sha256}` 证据。遇到取消、预算耗尽或无法确认的执行状态时，已声明但未执行的调用记录相应的跳过或取消结果。完成所有工具关联后，运行时才组装下一次请求。 [领域类型](../src/stellarweaver/domain/__init__.py) · [主循环](../src/stellarweaver/runtime/loop.py) · [只读探索委派](../src/stellarweaver/runtime/exploration.py)
 
 例如，模型为修复 `calc.py` 请求读取文件，获取源码和当前 SHA-256 后再提交精确替换。编辑完成后，它可以请求登记的测试。若退出码为 1，带退出码的工具结果交给模型，模型可根据失败位置修改后执行同一项检查。最终回答由模型生成，代码和测试证据来自实际执行工具。
 
 运行结束与验证通过是两项状态。`_finish` 按命令和工作目录保留最新检查；一次成功的内置写入会清除前一版本的有效检查。模型发出结束回复可以让运行达到 `completed`，验证字段仍取决于真实工具结果。Web 交付层另按快照细化检查的新鲜度。
 
 启用修复控制器后，工具失败按断言、依赖、语法或运行时错误、补丁冲突、权限、超时和基础环境等类别归纳。控制器结合当前候选指纹、操作和失败签名统计重复失败，把诊断和建议写入 Journal，并提供给下一轮模型请求。`feedback` 仅提供建议。`enforce` 对同一候选和操作的重复错误实行三次停机规则，适用于命令失败与补丁冲突。后续工具调用由主循环按原权限和预算执行。 [修复控制器](../src/stellarweaver/runtime/repair.py) · [运行时接入](../src/stellarweaver/runtime/loop.py)
+
+### 只读子 Agent 探索
+
+启用 `subagent_exploration` 后，主循环向父 Agent 注册 `delegate_exploration` 工具，用于将大范围代码检索和跨模块架构调研委派给独立的 `ExplorationAgent`，避免海量中间读取撑爆父上下文，同时保证所有写入、审批和撤销仍由唯一父 Agent 统一收口。
+
+```mermaid
+flowchart LR
+    Parent["父 Agent (_tools)<br/>一次派发 1..N 个 delegate_exploration"] --> Barrier["ReadDispatch 栅栏<br/>阶段 1: 顺序授权与入库"]
+    Barrier --> Sem["Web: Semaphore(3) 滑动并发<br/>CLI / 评测: 严格串行"]
+    Sem --> Child1["ExplorationAgent #1<br/>只读策略 · 私密上下文"]
+    Sem --> Child2["ExplorationAgent #2<br/>只读策略 · 私密上下文"]
+    Sem --> Child3["ExplorationAgent #3<br/>只读策略 · 私密上下文"]
+    Child1 & Child2 & Child3 <-->|ExplorationRequestScope 独立计账<br/>静默流式 + 1 次重试| Model["父 _request_model<br/>唯一 request_index · 共用周额度"]
+    Child1 & Child2 & Child3 -->|触及上限/停滞/截断| Finalize["无 Thinking 收尾轮<br/>保留草稿 + 宽观察窗口"]
+    Finalize --> Collect["ReadDispatch 阶段 3<br/>按原调用顺序回填结论与 32 份 SHA-256"]
+    Collect --> Parent
+```
+
+1. **三层只读隔离。** 子 Agent 强制绑定 `PolicyEngine("read-only")`、独立的内存 `ExplorationJournal`，并且 `builtins=False` 仅注册 `list_files`、`read_file`、`search_text` 与 Python 导航工具（`find_symbol`、`find_references`、`find_related_tests`），不暴露任何写文件、命令执行、MCP 或嵌套委派工具。子 Agent 内部继承父级的 `parallel_read_tools`、`navigation_prefilter`、`import_aware_repomap` 与上下文校准/压缩配置。
+2. **3 路滑动并发与保序回填。** 当 `parallel_read_tools=True` 且 `enforce_run_budget=False`（Web 模式）时，同一轮内连续的 `delegate_exploration` 调用进入专用并发组（不与 `read_file` 等本地快工具混用屏障），通过 `asyncio.Semaphore(3)` 滑动并发执行——任意子任务结束后下一个排队任务立即补位，且排队等待不扣除其 `timeout`；全部完成后按原调用顺序写入 `tool.completed` 并回填父上下文。CLI 与 SWE-bench 评测（`enforce_run_budget=True`）保持串行以保证冻结预算零竞态。
+3. **独立计账与预算继承。** 父循环用单调 `_request_sequence` 在 `model.started` 前原子分配 `request_index`，每次子请求通过专属 `ExplorationRequestScope` 精确记录自身的 `model_calls`、`input_tokens`、`output_tokens`，彻底避免并发串账，同时所有消耗实时计入父任务与 Web 成员周额度账本。Web 模式受可配安全熔断约束（默认 `20` 次模型调用、`60` 次工具调用、`300s`、连续 `3` 轮停滞，见 `SW_WEB_EXPLORATION_*`）；CLI 与评测同时受父级冻结剩余预算与子级熔断较小值约束。
+4. **静默流式、停滞检测与无 Thinking 收尾抢救。** 子请求复用流式消费但 `emit_deltas=False`（不污染父级流式输出），并允许 1 次可重试错误的退避重试。停滞检测按 `(tool_name, 规范化完整参数)` 判重（同一大文件的不同行范围分页读取视为推进），连续达到阈值或全返回 `error`/`denied` 时转入收尾。无论触及熔断、停滞、输出 `length` 截断，还是已有有效观察后的 `exploration_failed`，子 Agent 都会执行一次 `disable_thinking=True` 的无工具收尾轮，带入已写出的截断草稿与最高 `(48, 4000, 4096)` 宽度的观察记录，快速输出约 1500–2500 字结构化结论与最多 32 份文件 SHA-256。
+5. **全链路事件与工作台透明展示。** `exploration.started` 携带 `goal` 与 `paths`，`exploration.tool` 携带具体 `tool_name` 与状态，`exploration.completed` 携带 `completion_status`（`completed`/`partial`/`cancelled`）、`stop_reason` 与用量；三类事件均经 `public_event()` 投影至 SSE，前端在执行过程直接展示启动任务描述、结果路径标签，并将连续 `>= 3` 次模型请求自动折进可实时刷新计数的小折叠栏。 [子 Agent 实现](../src/stellarweaver/runtime/exploration.py) · [并发与计账](../src/stellarweaver/runtime/loop.py) · [工作台展示](../frontend/src/conversation.tsx)
 
 ### 模型
 
@@ -179,10 +211,10 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 `Agent._prepare_context` 在每次请求前组合系统提示、用户任务、历史、工具 schema、适用的 `AGENTS.md`、扩展目录和 repo map。历史记录是持久数据，发送给 Provider 的上下文由 `ContextManager` 按当前预算重新生成。
 
 - **指令加载。** `InstructionLoader` 按工作区根和已操作路径的祖先目录加载 `AGENTS.md`，记录来源、范围和文件哈希。准备修改时，`_before_execute` 根据目标路径判定模型是否已看到适用指令。用户批准后，`_after_authorize` 再检查一次指令指纹。等待期间指令变动会以 `INSTRUCTIONS_UPDATED` 返回，让下一轮先看到新增要求，再决定操作。
-- **仓库索引。** `RepoMap` 在工作区文件约束下枚举候选路径，以 Python AST 提取函数、类、签名和行号。显式路径、曾访问位置和关键词影响排序。索引按预算截取，提供下一步搜索和读文件的线索。实际文件内容由工具读取，编辑依据最新文件哈希执行。
-- **问题驱动导航。** 启用后，`IssueSignals` 从任务提取路径、符号、异常和测试线索，辅助 Repo Map 排序。`find_symbol`、`find_references` 和 `find_related_tests` 通过 Python AST 查找定义、静态引用和相关测试，返回路径、行号、SHA-256、耗时和覆盖状态。索引按内容哈希复用，文件变更后重新解析。动态绑定和扫描范围之外的关系仍存在不确定性。 [Python 导航](../src/stellarweaver/context/navigation.py)
-- **窗口计算。** DeepSeek Thinking 默认从 200,000 token 窗口中预留 8,192 token 输出和 2,048 token 安全余量，估算输入额度为 189,760 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。工作台在提交时保存该轮窗口，worker 领取时读取；模型事件还记录每次请求的窗口。计量采用保守的 UTF-8 JSON 字节估算，实际服务端用量进入独立字段。
-- **历史压缩。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。系统消息和最新用户任务优先保留。常规压缩保护最近六个完整助手回合，并单独保护最近六个完整工具回合，以免纯文本回复挤掉近期工具证据。过长工具输出可投影为有长度上限的摘要，携带路径、哈希、操作 ID 和关键结果。若仍超窗，Web 可以继续归纳较早的完整回合。用于下一次模型请求的工具调用和对应结果始终成组处理。压缩结果可写入检查点，原始消息仍由 Journal 保存。 [压缩配置](../src/stellarweaver/config.py) · [上下文投影](../src/stellarweaver/context/manager.py)
+- **仓库索引。** `RepoMap` 在工作区文件约束下枚举候选路径，以 Python AST 提取函数、类、签名和行号。显式路径、曾访问位置和关键词影响排序；启用 `import_aware_repomap` 后，还会对当前相关文件的直接导入方与被导入方加权，提高邻居模块进入预算窗口的召回。索引按预算截取，提供下一步搜索和读文件的线索。实际文件内容由工具读取，编辑依据最新文件哈希执行。
+- **问题驱动导航。** 启用后，`IssueSignals` 从任务提取路径、符号、异常和测试线索，辅助 Repo Map 排序。`find_symbol`、`find_references` 和 `find_related_tests` 通过 Python AST 查找定义、静态引用和相关测试，返回路径、行号、SHA-256、耗时和覆盖状态。启用 `navigation_prefilter` 后，超过 100 个 `.py` 文件的仓库先按目标符号名全仓库字节预筛（并通过 `NavigationSources` 按文件元数据指纹做有界缓存复用），再对命中文件执行 AST 解析。动态绑定和扫描范围之外的关系仍存在不确定性。 [Python 导航](../src/stellarweaver/context/navigation.py)
+- **窗口计算与动态校准。** DeepSeek Thinking 默认从 200,000 token 窗口中预留 16,384 token 输出和 2,048 token 安全余量，估算输入额度为 181,568 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。基础计量采用保守的 UTF-8 JSON 字节估算；启用 `calibrated_context_budget` 后，运行时取最近 6 个有效服务端 `prompt_tokens` 样本的最大换算率乘 1.05（钳位到 `[0.30, 1.0]`）动态校准估算系数，显著降低过早压缩。启用 `pipeline_metrics` 时，`model.completed` 额外记录估算误差比。
+- **历史压缩与粘性前缀。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。系统消息和最新用户任务优先保留。常规压缩保护最近六个完整助手回合及最近六个完整工具回合。启用 `smart_tool_truncation` 后，超长工具输出按 35% 头部 + 65% 尾部保留（并为 `stdout`/`stderr` 各自留额），避免丢失末尾的 `FAILED` 与断言堆栈；启用 `protect_fresh_tool_output` 时，最近 `fresh_tool_rounds`（默认 2）轮工具输出全文逐字节保留；启用 `sticky_context_checkpoint` 后，压缩后的历史前缀检查点保持固定，可变证据作为请求后缀更新，减少重复压缩并提升前缀缓存稳定性。用于下一次模型请求的工具调用和对应结果始终成组处理，原始消息仍由 Journal 完整保存。 [压缩配置](../src/stellarweaver/config.py) · [上下文投影](../src/stellarweaver/context/manager.py)
 - **任务证据。** 运行内可选投影从工具结果提取路径、文件哈希、测试状态和暂存补丁引用。每条保留事件序号和操作 ID，准备请求时重新核对文件状态。Web 的跨轮证据由 PostgreSQL Journal 另行投影，按当前 worktree 标注文件及检查是否仍适用。 [运行内证据](../src/stellarweaver/runtime/task_evidence.py) · [跨轮证据](../src/stellarweaver/web/continuation.py)
 
 窗口约束单次模型请求。CLI 的 `LimitsConfig` 默认约束每次运行的模型调用、工具调用和总时长，分别为 30 次、100 次和 900 秒，累计输入和输出分别为 1,000,000 与 30,000 token。独立评测用冻结的运行配置。启用总预算约束的运行可生成阶段余量提示。Web 用单次模型窗口、操作自身超时和账户 UTC 周额度控制运行，累计调用和用量仍写入 Journal。 [历史投影](../src/stellarweaver/context/manager.py) · [运行预算](../src/stellarweaver/runtime/loop.py) · [Web 装配](../src/stellarweaver/web/execution.py)
@@ -199,11 +231,13 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 | `read_file` | 读取指定行范围，返回内容、行号和文件字节的 SHA-256，供后续读写核对。 |
 | `search_text` | 按工作区范围执行搜索。优先使用 `rg`，缺少时由 Python 实现搜索。 |
 | `create_file` | 预先检查目标路径，再以排他方式创建，防止覆盖已存在的文件。 |
-| `edit_file` | 要求 `expected_sha256` 和唯一匹配的旧文本，生成差异供预览。授权后复检，将修改前快照和差异保存为制品，再写同目录临时文件并替换。 |
+| `edit_file` | 要求 `expected_sha256` 和唯一匹配的旧文本（启用 `multi_edit_tools` 时支持单文件一次最多 64 处非重叠替换），生成合并差异供预览。授权后复检，将修改前快照和差异保存为制品，再写同目录临时文件并替换。启用 `post_edit_syntax_hook` 时，写入 `.py` 文件后执行内存 `ast.parse` 并将语法诊断附在结果中。 |
+| `apply_patch` | 启用 `multi_file_apply` 后注册。接受带 `expected_sha256` 的最多 12 个文件修改/新建/删除清单，经双临时目录 `git apply --check` 校验后，先保存全部 `.before` 备份再逐文件原子替换；普通 I/O 异常自动补偿回滚，崩溃混合态由恢复逻辑标记为 `RECOVERY_PATCH_MIXED`，支持 CLI 与 Web 成组撤销。 |
+| `delegate_exploration` | 启用 `subagent_exploration` 后注册。在私密上下文中启动强制 `read-only` 的子 Agent 检索源码与导航符号，共享父运行预算与 Web 周额度，仅回传精简结论与文件 SHA-256 证据。 |
 | `run_command` | 参数采用 argv 和工作目录，返回退出码、输出、超时、取消与清理状态。Web 可注入验证执行器，CLI 默认使用宿主后端。 |
-| `git_status`、`git_diff` | 调用 workspace 范围内的 Git 查询，返回版本控制证据。 |
+| `git_status`、`git_diff`、`git_log`、`git_show` | 调用 workspace 范围内的只读 Git 查询（含历史提交与受保护路径过滤），返回版本控制证据。 |
 | `find_symbol`、`find_references`、`find_related_tests` | 按配置启用 Python 静态查询，返回可回读的路径、行号和哈希。 |
-| `run_tests`、`discover_tests`、`check_syntax`、`run_linter` | 将受控的操作、目标和框架交给配置的执行器，返回结构化诊断、退出码和清理状态。 |
+| `run_tests`、`run_python_snippet`、`discover_tests`、`check_syntax`、`run_linter` | 将受控的操作、目标、单测过滤（`selector`/`keyword`）或断网复现脚本交给配置的执行器，返回结构化诊断、退出码和清理状态。 |
 | `stage_patch` | 接受带预期哈希的多文件文本变更。用临时 Git 目录生成和复核 diff，批准后保存待审制品。目标工作区不会由此调用写入。 |
 | `ds_search` | CLI 和 Web 选用支持搜索的 DeepSeek provider 时注册。公开查询通过风险检查后按 L0 自动放行，由独立的 Chat Completions 请求执行服务端搜索。工具返回来源，模型用量沿当前入口记账。 |
 
@@ -279,7 +313,7 @@ FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改�
 
 `runs.status` 表示用户看到的运行状态，`run_jobs.state` 表示调度状态。新任务可同时处于 `active` 和 `queued`，领取后队列行变为 `running`。结果、报告与终态入库时，队列行一并变为 `done`。
 
-**窗口与用量。** 默认 200,000 token 窗口约束一次模型请求。Web 关闭 Agent 的单次运行累计预算，仍按成员周额度管理 DeepSeek 用量，默认每周 1,000 万 token，按 UTC 周一划界。每次请求开始时按估算输入与输出上限预留，收到用量后按服务端用量或估算结算。请求中断且缺少可靠用量时，账本保留对应预留或估算状态。 [额度默认值](../src/stellarweaver/web/identity.py) · [用量事务](../src/stellarweaver/web/db.py) · [PostgreSQL Journal](../src/stellarweaver/web/journal.py)
+**窗口与用量。** 默认 200,000 token 窗口约束一次模型请求。Web 关闭 Agent 的单次运行累计预算，仍按成员周额度管理 DeepSeek 用量，默认每周 1 亿 token，按 UTC 周一划界。每次请求开始时按估算输入与输出上限预留，收到用量后按服务端用量或估算结算。请求中断且缺少可靠用量时，账本保留对应预留或估算状态。 [额度默认值](../src/stellarweaver/web/identity.py) · [用量事务](../src/stellarweaver/web/db.py) · [PostgreSQL Journal](../src/stellarweaver/web/journal.py)
 
 **审批、取消与恢复。** 策略要求审批时，`ApprovalGate` 将操作及指纹登记为待审，worker 等待用户决定。批准需匹配当前运行、操作、指纹和有效期，消费后再复检文件、指令或命令边界。取消排队任务可直接保存终态。任务已领取时，API 写入取消标志，worker 的监控据此中止当前执行，并由执行层报告清理结果。Worker 重启会将遗留的已领取运行标记为中断，保留原操作记录和未确认状态供用户核查。 [审批与取消](../src/stellarweaver/web/approval.py) · [中断恢复](../src/stellarweaver/web/worker.py)
 
@@ -293,7 +327,7 @@ FastAPI 使用 `Principal` 确定租户、成员、访问范围及能否修改�
 
 项目源目录、任务 worktree 和验证容器承担不同职责。源目录提供已提交的 Git 基线。`task_worktree` 以租户和会话标识定位持久状态目录，在该目录创建独立的裸 Git 仓库，获取源仓库当前 `HEAD`，检查树中的文件数、总大小、路径和对象类型，然后建立 detached worktree 并写入 `ready` 标记。基线的上限为 6,000 个文件和 32 MiB。项目追问使用 `saved_worktree` 复用该目录。源目录在 Compose 中只读，任务修改保存在状态卷里。
 
-Web 验证命令收到的是工作区的一次文件快照。`snapshot_paths` 基于 Git 记录枚举已跟踪文件和符合规则的未跟踪文件，过滤保护路径并检查文件类型与大小。`RemoteRunner` 将快照打包为 tar，通过私有网络发送给执行服务，同时提交允许列表中的命令索引或受控开发操作。执行服务核对内部凭据、请求容量、归档内容及操作参数。开发工具使用固定的本地验证镜像，框架和目标路径经过白名单或参数检查。
+Web 验证命令收到的是工作区的一次文件快照。`snapshot_paths` 基于 Git 记录枚举已跟踪文件和符合规则的未跟踪文件，过滤保护路径并检查文件类型与大小。`RemoteRunner` 将快照打包为 tar，通过私有网络发送给执行服务，同时提交允许列表中的命令索引或受控开发操作。启用 `incremental_sandbox_snapshots` 后，Worker 与执行服务之间按内容摘要缓存基线（`SnapshotCache` 有界 LRU），后续命令仅传输变更文件与删除清单，执行服务在内存中合并并校验全量 manifest 哈希及 `0o755`/`0o644` 权限，未命中或不一致时自动回退全量上传。执行服务核对内部凭据、请求容量、归档内容及操作参数。开发工具使用固定的本地验证镜像，框架和目标路径经过白名单或参数检查。 [增量快照](../src/stellarweaver/web/snapshots.py)
 
 `DockerRunner` 为单次命令创建临时容器，任务命令以非 root 身份运行。容器根文件系统只读，关闭网络，并约束进程数、内存、CPU 和执行时间。`sandbox-workspace` 允许修改临时快照，写入随容器结束丢弃。`sandbox-read-only` 在执行前封存项目快照，再以受限身份运行，临时目录仍可写。执行器服务持有 Docker socket，应用 worker 负责模型和数据库，任务容器只接收所需快照和命令。
 
@@ -381,11 +415,11 @@ CLI `resume` 打开原 SQLite 会话并协调未闭合操作。Web worker 重启
 
 ### SWE-bench Lite 评测调用链
 
-1. **冻结输入。** 批量适配器从固定数据集修订生成清单，分开保存公开任务与评分输入。Agent 在题目指定的 Git 基线运行，可见测试由配方绑定到断网容器。评测入口使用专用的 100,000 token 默认窗口，以便按冻结的设置复跑和配对。 [批量适配器](../src/stellarweaver/evals/swebench.py) · [评测窗口](../src/stellarweaver/evals/swebench_pilot.py)
+1. **冻结输入。** 批量适配器从固定数据集修订生成清单，分开保存公开任务与评分输入。Agent 在题目指定的 Git 基线运行，可见测试由配方绑定到断网容器。批量 `prepare` 默认冻结 200,000 token 窗口与任务预算（均可通过参数配置；兼容缺少窗口字段的旧清单回退 100,000），`run` 支持 `--harness-profile baseline|full` 预设及单项开关覆盖。 [批量适配器](../src/stellarweaver/evals/swebench.py) · [评测窗口](../src/stellarweaver/evals/swebench_pilot.py)
 2. **生成候选和独立评分。** Agent 复用模型与工具循环。候选补丁保存后，独立评分环境加载官方测试字段和候选，分别记录补丁应用与评分状态。评分身份与补丁、评分器及镜像绑定，旧收据可用于核对与复算。 [官方评分包装](../src/stellarweaver/evals/swebench_official.py) · [评分来源](../src/stellarweaver/evals/provenance.py)
-3. **离线汇总与配对。** `swebench_contract` 从已有制品生成 Manifest、Attempt、Score 和 Evidence，按计划题数保留所有终态。对照先检查冻结配置、模型、执行环境和评分条件，再配对双方同时有独立判定的题号，记录其余题目的排除原因。 [统一评测契约](../src/stellarweaver/evals/swebench_contract.py) · [验证与复现](EVAL.md#swe-bench-lite-批量评测)
+3. **离线汇总与配对。** `swebench_contract` 从已有制品生成 Manifest、Attempt、Score 和 Evidence，按计划题数保留所有终态。对照先检查冻结配置、模型、执行环境和评分条件，再配对双方同时有独立判定的题号，记录其余题目的排除原因。 [统一评测契约](../src/stellarweaver/evals/swebench_contract.py) · [验证与复现](EVALUATION.md#swe-bench-lite-批量评测与单题试跑)
 
-本地安全与修复夹具沿用 ToolRegistry、FakeModel 与 SQLite Journal，使用文件哈希、最终内容和模拟接收器进行独立判定，输出单独的夹具报告。SWE-bench Lite 与固定夹具各自拥有运行入口和报告格式。 [安全边界夹具](SECURITY.md#本地工具边界评测) · [修复过程夹具](EVAL.md#修复过程的离线夹具)
+本地安全与修复夹具沿用 ToolRegistry、FakeModel 与 SQLite Journal，使用文件哈希、最终内容和模拟接收器进行独立判定，输出单独的夹具报告。SWE-bench Lite 与固定夹具各自拥有运行入口和报告格式。 [安全边界夹具](SECURITY.md#本地工具边界评测) · [修复过程夹具](EVALUATION.md#修复过程与安全边界离线夹具)
 
 ### 实验记录发布链路
 

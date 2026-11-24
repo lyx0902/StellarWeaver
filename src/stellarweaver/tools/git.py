@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from stellarweaver.tools.commands import execute_command
 from stellarweaver.tools.workspace import ToolError
@@ -24,6 +25,31 @@ class GitDiffArgs(BaseModel):
 
     paths: list[str] = Field(default_factory=list, max_length=256)
     staged: bool = False
+
+
+_REV_RE = re.compile(r"^[A-Za-z0-9_./~^@{}-]{1,120}$")
+
+
+class GitLogArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    limit: int = Field(default=10, ge=1, le=50)
+    paths: list[str] = Field(default_factory=list, max_length=64)
+
+
+class GitShowArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    rev: str = Field(default="HEAD", min_length=1, max_length=120)
+    paths: list[str] = Field(default_factory=list, max_length=64)
+    stat_only: bool = False
+
+    @field_validator("rev")
+    @classmethod
+    def safe_rev(cls, value: str) -> str:
+        if value.startswith("-") or ".." in value or not _REV_RE.fullmatch(value):
+            raise ValueError("Provide a single safe Git revision such as HEAD or a commit SHA")
+        return value
 
 
 def _git_prefix() -> list[str]:
@@ -228,6 +254,91 @@ async def prepare_git_diff(args: GitDiffArgs, context: ToolContext) -> PreparedT
     return PreparedTool({"paths": paths, "staged": args.staged}, execute, recheck)
 
 
+async def prepare_git_log(args: GitLogArgs, context: ToolContext) -> PreparedTool:
+    from stellarweaver.tools.registry import PreparedTool
+
+    paths = [
+        context.workspace.relative(
+            context.workspace.resolve(path, allow_directory=True, must_exist=False)
+        )
+        for path in args.paths
+    ]
+
+    async def execute() -> JSONDict:
+        argv = [
+            "log",
+            "--no-color",
+            "--date=short",
+            "--pretty=format:%h %ad %an | %s",
+            "-n",
+            str(args.limit),
+        ]
+        if paths:
+            argv += ["--", *paths]
+        result = await _git(argv, context)
+        result["data"]["limit"] = args.limit
+        result["data"]["paths"] = paths
+        if result["status"] == "ok":
+            result["content"] = result["data"]["stdout"] or "No commits."
+        return result
+
+    return PreparedTool({"limit": args.limit, "paths": paths}, execute)
+
+
+async def prepare_git_show(args: GitShowArgs, context: ToolContext) -> PreparedTool:
+    from stellarweaver.tools.registry import PreparedTool
+
+    paths = [
+        context.workspace.relative(
+            context.workspace.resolve(path, allow_directory=True, must_exist=False)
+        )
+        for path in args.paths
+    ]
+
+    async def execute() -> JSONDict:
+        base = [
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--ignore-submodules=all",
+            args.rev,
+        ]
+        listing = await _git(
+            [*base, "--pretty=format:", "--name-only", "-z", "--", *paths], context
+        )
+        if listing["status"] != "ok":
+            return listing
+        selected: list[str] = []
+        omitted: list[str] = []
+        for path in listing["data"]["stdout"].split("\x00"):
+            if not path:
+                continue
+            try:
+                context.workspace.resolve(path, must_exist=False)
+            except ToolError:
+                omitted.append(path)
+            else:
+                selected.append(path)
+        argv = [*base, "--stat"] if args.stat_only else list(base)
+        if selected:
+            result = await _git([*argv, "--", *selected], context)
+        else:
+            header = await _git([*base, "--no-patch"], context)
+            result = header
+        result["data"]["rev"] = args.rev
+        result["data"]["paths"] = paths
+        result["data"]["stat_only"] = args.stat_only
+        result["data"]["omitted_protected_paths"] = omitted
+        if result["status"] == "ok":
+            result["content"] = result["data"]["stdout"] or "Empty commit."
+        return result
+
+    return PreparedTool(
+        {"rev": args.rev, "paths": paths, "stat_only": args.stat_only}, execute
+    )
+
+
 def register_tools(registry: ToolRegistry) -> None:
     registry.register(
         "git_status",
@@ -240,4 +351,16 @@ def register_tools(registry: ToolRegistry) -> None:
         "Read Git diff without external diff drivers or text conversion.",
         GitDiffArgs,
         prepare_git_diff,
+    )
+    registry.register(
+        "git_log",
+        "Read recent commit history (hash, date, author, subject), optionally filtered by paths.",
+        GitLogArgs,
+        prepare_git_log,
+    )
+    registry.register(
+        "git_show",
+        "Inspect one commit's metadata and diff without external drivers or protected paths.",
+        GitShowArgs,
+        prepare_git_show,
     )

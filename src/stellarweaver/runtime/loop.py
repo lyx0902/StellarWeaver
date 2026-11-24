@@ -83,6 +83,17 @@ class BudgetExceeded(Exception):
     pass
 
 
+@dataclass
+class ExplorationRequestScope:
+    identity: str
+    deadline: float
+    context_rates: deque[float]
+    finalizing: bool
+    model_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
 def stable_arguments(raw: str) -> Any:
     try:
         return json.loads(raw)
@@ -104,6 +115,9 @@ def stable_failure(value: Any) -> Any:
 
 
 class Agent:
+    _stop_on_denied_tool = True
+    _stop_on_repeated_tool_failure = True
+
     def __init__(
         self,
         provider: ModelProvider,
@@ -127,6 +141,7 @@ class Agent:
         harness_config: HarnessConfig | None = None,
         enforce_run_budget: bool = True,
         adaptive_round_retention: bool = False,
+        enforce_exploration_caps: bool = False,
     ) -> None:
         if not 0 <= max_retries <= 2:
             raise ValueError("max_retries must be between 0 and 2")
@@ -141,6 +156,9 @@ class Agent:
         self.set_provider(provider)
         self.limits = limits or LimitsConfig()
         self.enforce_run_budget = enforce_run_budget
+        self.enforce_exploration_caps = enforce_exploration_caps
+        self._exploration_semaphore: asyncio.Semaphore | None = None
+        self._request_sequence = 0
         self.store = store or SessionStore(registry.workspace.root)
         self._owns_store = store is None
         if not isinstance(self.store, SessionStore) and registry.policy.preset != "read-only":
@@ -193,6 +211,10 @@ class Agent:
 
             register_exploration(self)
         self._reset_run()
+
+    @property
+    def adaptive_round_retention(self) -> bool:
+        return self._context.adaptive_round_retention
 
     def _reset_run(self) -> None:
         self.results = []
@@ -423,15 +445,32 @@ class Agent:
         index = 0
         while index < len(reply.tool_calls):
             if stop is None and self.harness_config.parallel_read_tools:
-                group = []
-                for candidate in reply.tool_calls[index : index + 4]:
-                    if not self.registry.can_parallel_read(candidate.name):
-                        break
-                    group.append(candidate)
-                if len(group) > 1:
-                    consumed, stop = await self._read_group(group)
-                    index += consumed
-                    continue
+                if not self.enforce_run_budget and self.registry.can_parallel_exploration(
+                    reply.tool_calls[index].name
+                ):
+                    group = []
+                    for candidate in reply.tool_calls[index:]:
+                        if not self.registry.can_parallel_exploration(candidate.name):
+                            break
+                        group.append(candidate)
+                    if len(group) > 1:
+                        self._exploration_semaphore = asyncio.Semaphore(3)
+                        try:
+                            consumed, stop = await self._read_group(group)
+                        finally:
+                            self._exploration_semaphore = None
+                        index += consumed
+                        continue
+                else:
+                    group = []
+                    for candidate in reply.tool_calls[index : index + 4]:
+                        if not self.registry.can_parallel_read(candidate.name):
+                            break
+                        group.append(candidate)
+                    if len(group) > 1:
+                        consumed, stop = await self._read_group(group)
+                        index += consumed
+                        continue
             call = reply.tool_calls[index]
             index += 1
             if stop is not None:
@@ -565,13 +604,15 @@ class Agent:
                 stop = ("failed", "repair controller: repeated failure without a changed candidate")
         if self._cancel_requested and stop is None:
             stop = ("cancelled", "user cancelled")
-        if result.status in {"denied", "blocked"} and stop is None:
+        if stop is None and (
+            result.status == "blocked" or (result.status == "denied" and self._stop_on_denied_tool)
+        ):
             stop = ("blocked", result.content)
         elif result.status == "cancelled" and stop is None:
             stop = ("cancelled", result.content)
         elif result.status == "unknown" and stop is None:
             stop = ("failed", "execution state unknown; do not rerun automatically")
-        elif result.status == "error":
+        elif result.status == "error" and self._stop_on_repeated_tool_failure:
             fingerprint = json.dumps(
                 [call.name, stable_arguments(call.arguments_json), stable_failure(result.data)],
                 sort_keys=True,
@@ -613,6 +654,7 @@ class Agent:
         output_estimate: int,
         *,
         incomplete: bool = False,
+        exploration: ExplorationRequestScope | None = None,
     ) -> JSONDict:
         data = usage or {}
         prompt = data.get("prompt_tokens", data.get("input_tokens"))
@@ -627,6 +669,9 @@ class Agent:
             estimated = True
         self._input_tokens += prompt
         self._output_tokens += completion
+        if exploration is not None:
+            exploration.input_tokens += prompt
+            exploration.output_tokens += completion
         self._estimated |= estimated
         self._usage_incomplete |= incomplete and estimated
         breakdown = {
@@ -643,7 +688,9 @@ class Agent:
             **breakdown,
         }
 
-    async def _consume_stream(self, request: ModelRequest) -> AssistantReply:
+    async def _consume_stream(
+        self, request: ModelRequest, *, emit_deltas: bool = True
+    ) -> AssistantReply:
         response: AssistantReply | None = None
         stream = self.provider.stream(request)
         try:
@@ -651,7 +698,8 @@ class Agent:
                 if response is not None:
                     raise ProviderError("Stream emitted content after the final response")
                 if event.type == "text.delta":
-                    await self._delta(event.text)
+                    if emit_deltas:
+                        await self._delta(event.text)
                 elif event.type == "response.completed":
                     if event.reply is None:
                         raise ProviderError("Stream completed without a reply")
@@ -701,15 +749,11 @@ class Agent:
         initial_request: ModelRequest,
         input_size: ContextSize,
         *,
-        exploration_id: str | None = None,
+        exploration: ExplorationRequestScope | None = None,
     ) -> AssistantReply:
         request = initial_request
         input_estimate = input_size.tokens
-        calibrate = (
-            self.harness_config.calibrated_context_budget
-            and not request.web_search
-            and exploration_id is None
-        )
+        calibrate = self.harness_config.calibrated_context_budget and not request.web_search
         context_metrics = (
             {
                 "calibration_factor": input_size.factor,
@@ -720,23 +764,30 @@ class Agent:
             else {}
         )
         capabilities = self.provider.capabilities()
-        stream_requested = self.stream and not request.web_search and exploration_id is None
+        stream_requested = self.stream and not request.web_search
         streaming = stream_requested and capabilities.streaming
         settings = dict(capabilities.request_settings)
         trace = (
-            {"purpose": "delegate_exploration", "exploration_id": exploration_id}
-            if exploration_id is not None
+            {
+                "purpose": "delegate_exploration",
+                "exploration_id": exploration.identity,
+                "exploration_phase": "finalize" if exploration.finalizing else "gather",
+            }
+            if exploration is not None
             else {}
         )
-        if request.web_search:
+        if request.web_search or request.disable_thinking:
             settings["thinking"] = "disabled"
             settings.pop("reasoning_effort", None)
+        if request.web_search:
             settings["purpose"] = DS_SEARCH
-        retries = 0 if exploration_id is not None else self.max_retries
+        retries = min(1, self.max_retries) if exploration is not None else self.max_retries
         for retry_index in range(retries + 1):
             request = self._checked_request(request, input_estimate)
-            request_index = self._model_calls + 1
-            self._chunk_index = 0
+            self._request_sequence += 1
+            request_index = self._request_sequence
+            if exploration is None:
+                self._chunk_index = 0
             await self._emit(
                 "model.started",
                 {
@@ -753,23 +804,34 @@ class Agent:
                     **context_metrics,
                 },
             )
-            self._model_calls = request_index
+            self._model_calls += 1
+            if exploration is not None:
+                exploration.model_calls += 1
+            remaining = self._remaining()
+            if exploration is not None:
+                child_remaining = max(0.0, exploration.deadline - time.monotonic())
+                remaining = child_remaining if remaining is None else min(remaining, child_remaining)
+            request_timeout = asyncio.timeout(remaining)
             try:
-                async with asyncio.timeout(self._remaining()):
+                async with request_timeout:
                     reply = (
-                        await self._consume_stream(request)
+                        await self._consume_stream(request, emit_deltas=exploration is None)
                         if streaming
                         else await self.provider.complete(request)
                     )
             except asyncio.CancelledError:
                 self._account_usage(
-                    None, input_estimate, request.max_output_tokens, incomplete=True
+                    None,
+                    input_estimate,
+                    request.max_output_tokens,
+                    incomplete=True,
+                    exploration=exploration,
                 )
-                if streaming:
+                if streaming and exploration is None:
                     await self._emit(
                         "model.interrupted",
                         {
-                            "request_index": self._model_calls,
+                            "request_index": request_index,
                             "discarded": True,
                             "chunk_count": self._chunk_index,
                             "reason": "cancelled",
@@ -777,31 +839,36 @@ class Agent:
                     )
                 raise
             except TimeoutError as exc:
+                child_deadline = exploration is not None and request_timeout.expired()
+                bounded_timeout = child_deadline or self.enforce_run_budget
+                reason = "total deadline" if bounded_timeout else "model timeout"
                 accounting = self._account_usage(
-                    None, input_estimate, request.max_output_tokens, incomplete=True
+                    None,
+                    input_estimate,
+                    request.max_output_tokens,
+                    incomplete=True,
+                    exploration=exploration,
                 )
                 await self._emit(
                     "model.failed",
                     {
-                        "request_index": self._model_calls,
-                        "reason": "total deadline" if self.enforce_run_budget else "model timeout",
+                        "request_index": request_index,
+                        "reason": reason,
                         **accounting,
                         **trace,
                     },
                 )
-                if streaming:
+                if streaming and exploration is None:
                     await self._emit(
                         "model.interrupted",
                         {
-                            "request_index": self._model_calls,
+                            "request_index": request_index,
                             "discarded": True,
                             "chunk_count": self._chunk_index,
-                            "reason": "total deadline"
-                            if self.enforce_run_budget
-                            else "model timeout",
+                            "reason": reason,
                         },
                     )
-                if self.enforce_run_budget:
+                if bounded_timeout:
                     raise BudgetExceeded("max_wall_seconds during model request") from exc
                 raise ProviderError("Model request timed out") from exc
             except Exception as exc:
@@ -815,26 +882,25 @@ class Agent:
                     input_estimate,
                     request.max_output_tokens,
                     incomplete=True,
+                    exploration=exploration,
                 )
                 await self._emit(
                     "model.failed",
                     {
-                        "request_index": self._model_calls,
+                        "request_index": request_index,
                         "error_type": type(exc).__name__,
-                        "message": str(error)
-                        if exploration_id is None
-                        else "Exploration model request failed",
+                        "message": str(error),
                         "retryable": error.retryable,
                         "status_code": error.status_code,
                         **accounting,
                         **trace,
                     },
                 )
-                if streaming and (self._chunk_index or error.partial_stream):
+                if streaming and exploration is None and (self._chunk_index or error.partial_stream):
                     await self._emit(
                         "model.interrupted",
                         {
-                            "request_index": self._model_calls,
+                            "request_index": request_index,
                             "discarded": True,
                             "chunk_count": self._chunk_index,
                             "reason": "provider failure",
@@ -854,24 +920,33 @@ class Agent:
                     if not math.isnan(header_delay):
                         delay = max(delay, header_delay)
                 remaining = self._remaining()
+                if exploration is not None:
+                    child_remaining = max(0.0, exploration.deadline - time.monotonic())
+                    remaining = (
+                        child_remaining if remaining is None else min(remaining, child_remaining)
+                    )
                 if remaining is not None and delay >= remaining:
                     raise BudgetExceeded("max_wall_seconds during Retry-After/backoff") from None
                 await self._emit(
                     "model.retry_scheduled",
                     {
-                        "after_request_index": self._model_calls,
+                        "after_request_index": request_index,
                         "delay_seconds": delay,
                         "next_retry_index": retry_index + 1,
+                        **trace,
                     },
                 )
                 try:
-                    async with asyncio.timeout(self._remaining()):
+                    async with asyncio.timeout(remaining):
                         await asyncio.sleep(delay)
                 except TimeoutError as timeout_exc:
                     raise BudgetExceeded("max_wall_seconds during retry backoff") from timeout_exc
                 continue
             accounting = self._account_usage(
-                reply.usage, input_estimate, estimate_tokens(asdict(reply))
+                reply.usage,
+                input_estimate,
+                estimate_tokens(asdict(reply)),
+                exploration=exploration,
             )
             if self.harness_config.pipeline_metrics or calibrate:
                 accounting.update(context_metrics)
@@ -880,7 +955,8 @@ class Agent:
                     actual = accounting["input_tokens"]
                     accounting["input_estimate_error_ratio"] = (input_estimate - actual) / actual
                     if calibrate:
-                        self._context_rates.append(actual / input_size.raw_utf8_bytes)
+                        rates = self._context_rates if exploration is None else exploration.context_rates
+                        rates.append(actual / input_size.raw_utf8_bytes)
             response_identity = {}
             if reply.provider_model is not None:
                 response_identity["response_model"] = reply.provider_model
@@ -889,7 +965,7 @@ class Agent:
             await self._emit(
                 "model.completed",
                 {
-                    "request_index": self._model_calls,
+                    "request_index": request_index,
                     "stop_reason": reply.stop_reason,
                     "usage": reply.usage,
                     **accounting,

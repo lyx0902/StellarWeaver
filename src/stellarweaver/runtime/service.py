@@ -75,6 +75,8 @@ def build_agent(
     sandbox_commands: tuple[tuple[str, ...], ...] | None = None,
     enforce_run_budget: bool = True,
     adaptive_round_retention: bool = False,
+    allow_benchmark_staging: bool = False,
+    enforce_exploration_caps: bool = False,
 ) -> Agent:
     engine = PolicyEngine(
         config.policy.preset,
@@ -84,6 +86,7 @@ def build_agent(
         policy_file=policy_file,
         allow_sandbox_development=allow_sandbox_development,
         scoped_test_grants=config.harness.scoped_test_grants,
+        allow_benchmark_staging=allow_benchmark_staging and config.policy.preset == "benchmark",
     )
     registry = ToolRegistry(
         store.workspace,
@@ -124,4 +127,5 @@ def build_agent(
         enable_web_search=enable_web_search,
         enforce_run_budget=enforce_run_budget,
         adaptive_round_retention=adaptive_round_retention,
+        enforce_exploration_caps=enforce_exploration_caps,
     )

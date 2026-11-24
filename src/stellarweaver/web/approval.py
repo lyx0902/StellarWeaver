@@ -11,7 +11,7 @@ from sqlalchemy.engine import Connection
 from stellarweaver.domain import JSONDict
 from stellarweaver.policy import DS_SEARCH
 from stellarweaver.policy.risk import fingerprint
-from stellarweaver.tools.development import decode_development
+from stellarweaver.tools.development import SnippetArgs, decode_development
 from stellarweaver.web.db import audit, scoped
 from stellarweaver.web.journal import PgJournal, pack
 
@@ -153,9 +153,19 @@ class ApprovalGate:
                 or (check is not None and invocation.get("development_action") != check[0])
             ):
                 return "deny"
+            if check is None:
+                preview_argv: list[str] = argv
+            elif isinstance(check[1], SnippetArgs):
+                preview_argv = ["python", "-c", check[1].code]
+            else:
+                preview_argv = [check[1].framework, check[1].target]
+                if check[1].selector:
+                    preview_argv.append(check[1].selector)
+                if check[1].keyword:
+                    preview_argv.extend(["-k", check[1].keyword])
             preview = {
                 "tool": check[0] if check else tool,
-                "argv": [check[1].framework, check[1].target] if check else argv,
+                "argv": preview_argv,
                 "cwd": ".",
                 "timeout_seconds": invocation["timeout_seconds"],
             }

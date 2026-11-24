@@ -38,10 +38,72 @@ const eventNames: Record<string, string> = {
   'task.evidence': '任务证据', 'budget.guidance': '预算提示',
   'skill.selected': '指定技能', 'context.prior_evidence': '复核续接证据',
   'changes.undo.started': '开始撤销文件修改', 'changes.undo.completed': '已撤销文件修改',
+  'exploration.started': '开始子 Agent 探索', 'exploration.completed': '子 Agent 探索',
 }
 
 export function eventLabel(event: RunEvent) {
+  if (event.type === 'exploration.tool') {
+    return event.payload.tool_name ? '子 Agent · ' + event.payload.tool_name : '子 Agent 工具'
+  }
+  if (event.payload.tool_name === 'delegate_exploration') return '子 Agent 探索结果'
   return event.payload.tool_name ?? eventNames[event.type] ?? event.type
+}
+
+const explorationStates = { completed: '完成', partial: '部分完成', cancelled: '已取消' }
+const explorationReasons: Record<string, string> = {
+  stalled: '连续多轮检索重复或失败', safety_cap: '触及子任务安全上限',
+  parent_budget: '触及父任务剩余预算', weekly_quota: '工作台本周模型额度不足',
+  context_window: '超出可用上下文窗口', exploration_failed: '探索未能完成',
+  cancelled: '用户取消',
+}
+
+export function eventStatus(event: RunEvent) {
+  if (event.type === 'exploration.tool') {
+    if (event.payload.status) return event.payload.status
+    return event.payload.event === 'tool.started' ? '开始' : undefined
+  }
+  const { completion_status, stop_reason, status } = event.payload
+  if (!completion_status) return status
+  const reason = stop_reason ? explorationReasons[stop_reason] : undefined
+  return reason ? explorationStates[completion_status] + ' · ' + reason
+    : explorationStates[completion_status]
+}
+
+type ProcessEntry = { kind: 'single'; event: RunEvent } | { kind: 'model-group'; events: RunEvent[] }
+
+function groupProcessEvents(events: RunEvent[]): ProcessEntry[] {
+  const entries: ProcessEntry[] = []
+  let run: RunEvent[] = []
+  const flush = () => {
+    if (run.length >= 3) {
+      entries.push({ kind: 'model-group', events: run })
+    } else {
+      for (const event of run) entries.push({ kind: 'single', event })
+    }
+    run = []
+  }
+  for (const event of events) {
+    if (event.type === 'model.started') {
+      run.push(event)
+    } else {
+      if (run.length) flush()
+      entries.push({ kind: 'single', event })
+    }
+  }
+  if (run.length) flush()
+  return entries
+}
+
+function modelRequestDetail(event: RunEvent) {
+  const parts: string[] = []
+  if (typeof event.payload.request_index === 'number') parts.push('#' + event.payload.request_index)
+  if (event.payload.purpose === 'delegate_exploration') {
+    parts.push(event.payload.exploration_phase === 'finalize' ? '子 Agent 总结' : '子 Agent 检索')
+  }
+  if (typeof event.payload.input_tokens === 'number') {
+    parts.push('估算输入 ' + event.payload.input_tokens.toLocaleString() + ' token')
+  }
+  return parts.join(' · ')
 }
 
 function Process({ events, settled, onLogs }: {
@@ -51,6 +113,7 @@ function Process({ events, settled, onLogs }: {
   const open = choice?.settled === settled ? choice.open : !settled
   if (!events.length) return null
   const tools = events.filter(event => event.type === 'tool.completed').length
+  const entries = groupProcessEvents(events)
   return <section className="process" aria-label="执行过程">
     <button className="process-toggle" type="button" aria-expanded={open}
       onClick={() => setChoice({ settled, open: !open })}>
@@ -60,10 +123,35 @@ function Process({ events, settled, onLogs }: {
     </button>
     {open && <div className="process-body">
       <ul>
-        {events.map(event => <li key={event.seq}>
+        {entries.map(entry => entry.kind === 'model-group' ? (
+          <li key={'model-group-' + entry.events[0].seq}>
+            <details>
+              <summary>
+                <strong>请求模型</strong>
+                <span> · 连续 {entry.events.length} 次</span>
+                {entry.events.some(item => item.payload.purpose === 'delegate_exploration') && (
+                  <span className="muted">
+                    （含 {entry.events.filter(item => item.payload.purpose === 'delegate_exploration').length} 次子 Agent）
+                  </span>
+                )}
+              </summary>
+              <ul>
+                {entry.events.map(item => <li key={item.seq}>
+                  <strong>{eventLabel(item)}</strong>
+                  {modelRequestDetail(item) && <span className="muted">{modelRequestDetail(item)}</span>}
+                </li>)}
+              </ul>
+            </details>
+          </li>
+        ) : (() => {
+          const event = entry.event
+          return <li key={event.seq}>
           {event.type === 'assistant.completed'
             ? <Answer text={event.payload.content ?? ''} />
-            : <><strong>{eventLabel(event)}</strong>{event.payload.status && <span>{event.payload.status}</span>}
+            : <><strong>{eventLabel(event)}</strong>{eventStatus(event) && <span>{eventStatus(event)}</span>}
+              {event.type === 'model.started' && modelRequestDetail(event) && (
+                <span className="muted">{modelRequestDetail(event)}</span>
+              )}
               {event.payload.skill_name && <span title={event.payload.skill_source}>{event.payload.skill_name}</span>}
               {event.type === 'context.prior_evidence' && <span>
                 {event.payload.files ?? 0} 个文件 · {event.payload.checks ?? 0} 项检查 · {event.payload.skills ?? 0} 个技能版本
@@ -72,6 +160,20 @@ function Process({ events, settled, onLogs }: {
                 {event.payload.strategy === 'adaptive_complete_rounds' && '自适应压缩 · '}
                 {event.payload.before_tokens_estimated?.toLocaleString()} → {event.payload.after_tokens_estimated.toLocaleString()} token（估算）
               </span>}
+              {(event.type === 'exploration.started' || event.type === 'exploration.completed' || event.payload.tool_name === 'delegate_exploration')
+                && event.payload.paths?.length ? (
+                <span>{event.payload.paths.map(path => <code key={path}>{path}</code>)}</span>
+              ) : null}
+              {event.type === 'exploration.started' && event.payload.goal && (
+                event.payload.goal.length > 160 ? <details>
+                  <summary>任务说明：{event.payload.goal.slice(0, 160)}…</summary>
+                  <pre>{event.payload.goal}</pre>
+                </details> : <div className="muted">任务说明：{event.payload.goal}</div>
+              )}
+              {(event.type === 'exploration.completed' || event.payload.tool_name === 'delegate_exploration')
+                && !event.payload.paths?.length && event.payload.goal && (
+                <span className="muted">{event.payload.goal.length > 80 ? event.payload.goal.slice(0, 80) + '…' : event.payload.goal}</span>
+              )}
               {event.type.startsWith('changes.undo.') && event.payload.path && <code>{event.payload.path}</code>}
               {event.payload.code && <code>{event.payload.code}</code>}
               {event.payload.staged_patch && <button type="button" onClick={() => {
@@ -88,7 +190,8 @@ function Process({ events, settled, onLogs }: {
                   <a key={source.url} href={source.url} target="_blank" rel="noreferrer">{source.title || source.url}</a>
                 )}</div>
               </details> : event.payload.content && <details><summary>查看工具输出</summary><pre>{event.payload.content}</pre></details>}</>}
-        </li>)}
+        </li>
+        })())}
       </ul>
       <button className="quiet" type="button" onClick={onLogs}>查看完整日志</button>
     </div>}
@@ -126,12 +229,16 @@ export function Turn({ run, events, focused, approval, hasReport, onOpen, onLogs
 }) {
   const final = events?.filter(event =>
     event.type === 'assistant.completed' && !event.payload.has_tools && Boolean(event.payload.content)).at(-1)
+  const explorationResults = new Set(events?.filter(event =>
+    event.type === 'tool.completed' && event.payload.tool_name === 'delegate_exploration'
+      && event.payload.completion_status).map(event => event.payload.operation_id))
   const interim = events?.filter(event => {
     if (event.type === 'assistant.completed') return event !== final && Boolean(event.payload.content)
+    if (event.type === 'exploration.completed') return !explorationResults.has(event.payload.exploration_id)
     return ['tool.completed', 'model.started', 'model.failed', 'context.compacted',
       'approval.requested', 'approval.decided', 'approval.expired', 'review.applied',
       'verification.started', 'verification.completed', 'skill.selected', 'context.prior_evidence',
-      'changes.undo.started', 'changes.undo.completed'].includes(event.type)
+      'changes.undo.started', 'changes.undo.completed', 'exploration.started'].includes(event.type)
   }) ?? []
   const result = final?.payload.content ?? run.final_text
   let live = ''

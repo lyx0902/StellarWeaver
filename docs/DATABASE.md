@@ -2,7 +2,7 @@
 
 StellarWeaver 的 Web 与 CLI 各有一套会话持久化路径。Web 工作台使用 PostgreSQL 管理账号、工作区、会话、任务队列和运行证据。CLI 按会话使用 SQLite，并将大输出和编辑前快照保存为同目录下的制品。两种入口共用 Journal 契约，各自维护独立的会话数据。
 
-SWE-bench Lite 批量评测独立保存清单、各次尝试、候选补丁和评分制品，Agent 尝试的会话也保存在实验输出目录。Web「实验记录」从部署配置指定的本地 `report.json` 读取已发布证据。工作台的 PostgreSQL 用于日常项目任务和普通对话，实验元数据的结构化存储仍在 Phase 3 计划中。 [批量评测](EVAL.md#swe-bench-lite-批量评测) · [实验数据契约](EVAL_PLAN.md#phase-3-数据契约)
+SWE-bench Lite 批量评测独立保存清单、各次尝试、候选补丁和评分制品，Agent 尝试的会话也保存在实验输出目录。Web「实验记录」从部署配置指定的本地 `report.json` 读取已发布证据。工作台的 PostgreSQL 用于日常项目任务和普通对话，实验元数据的结构化存储仍在后续计划中。 [批量评测](EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [数据契约与身份绑定](EVALUATION.md#数据契约与身份绑定)
 
 ## 本机 PostgreSQL 连接
 
@@ -323,7 +323,7 @@ erDiagram
 
 当前 Compose 项目沿用既有 `stellarweaver-compose_postgres_data` 和 `stellarweaver-compose_workbench_state` 两个卷。数据库卷在容器内挂载到 `/var/lib/postgresql/data`，worker 的状态卷挂载到 `/state`。其他部署的卷名以 `SW_WORKBENCH_POSTGRES_VOLUME` 和 `SW_WORKBENCH_STATE_VOLUME` 为准。
 
-备份前排空写入任务并停止 API 与 worker，保留数据库服务。用 `pg_dump -Fc` 导出数据库，同一批备份保存工作区状态卷和部署配置。恢复演练使用独立目标数据库和独立状态卷，先检查 `pg_restore --exit-on-error`、迁移版本和历史计数，再核对登录、租户边界和历史线程续接。已完成的 PostgreSQL 单库恢复见[验收记录](EVAL.md#工作台与部署验证)。
+备份前排空写入任务并停止 API 与 worker，保留数据库服务。用 `pg_dump -Fc` 导出数据库，同一批备份保存工作区状态卷和部署配置。恢复演练使用独立目标数据库和独立状态卷，先检查 `pg_restore --exit-on-error`、迁移版本和历史计数，再核对登录、租户边界和历史线程续接。已完成的 PostgreSQL 单库恢复见[验收记录](EVALUATION.md#工作台与-harness-演进验收摘要)。
 
 下面的 PowerShell 示例使用[本机启动说明](USAGE.md#已部署实例)中的 `$dc`，将数据库转储文件复制到本地数据目录。每次备份使用单独文件名。
 

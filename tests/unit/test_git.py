@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from stellarweaver.tools.git import GitDiffArgs, GitStatusArgs, prepare_git_diff, prepare_git_status
+from stellarweaver.tools.git import (
+    GitDiffArgs,
+    GitLogArgs,
+    GitShowArgs,
+    GitStatusArgs,
+    prepare_git_diff,
+    prepare_git_log,
+    prepare_git_show,
+    prepare_git_status,
+)
 from stellarweaver.tools.registry import ToolContext
 from stellarweaver.tools.workspace import ToolError, Workspace
 
@@ -158,3 +167,32 @@ async def test_non_git_workspace_returns_structured_error(tmp_path: Path) -> Non
 async def test_diff_rejects_unsafe_paths(repository: Path, path: str) -> None:
     with pytest.raises(ToolError):
         await prepare_git_diff(GitDiffArgs(paths=[path]), context(repository))
+
+
+async def test_git_log_and_show_omit_protected_paths(repository: Path) -> None:
+    (repository / "tracked.txt").write_text("second version\n", encoding="utf-8")
+    (repository / ".env").write_text("SECRET=should-never-leak\n", encoding="utf-8")
+    git(repository, "add", "tracked.txt", ".env")
+    git(repository, "commit", "-m", "second commit")
+
+    log = await (await prepare_git_log(GitLogArgs(limit=5), context(repository))).execute()
+    assert log["status"] == "ok"
+    assert "second commit" in log["content"]
+
+    shown = await (await prepare_git_show(GitShowArgs(rev="HEAD"), context(repository))).execute()
+    assert shown["status"] == "ok"
+    assert "+second version" in shown["content"]
+    assert "should-never-leak" not in shown["content"]
+    assert ".env" in shown["data"]["omitted_protected_paths"]
+
+    stat = await (
+        await prepare_git_show(GitShowArgs(rev="HEAD", stat_only=True), context(repository))
+    ).execute()
+    assert stat["status"] == "ok"
+    assert "tracked.txt" in stat["content"]
+
+
+@pytest.mark.parametrize("rev", ["--all", "HEAD..main", "bad rev; rm -rf /"])
+def test_git_show_rejects_unsafe_rev(rev: str) -> None:
+    with pytest.raises(ValueError):
+        GitShowArgs(rev=rev)

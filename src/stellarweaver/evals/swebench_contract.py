@@ -17,10 +17,13 @@ from stellarweaver.evals.provenance import canonical_json, digest
 from stellarweaver.evals.swebench import (
     ID_PATTERN,
     IMAGE_PATTERN,
+    LEGACY_CONTEXT_WINDOW_TOKENS,
     SHA_PATTERN,
     Prediction,
     Recipe,
     Task,
+    frozen_context_window,
+    run_config_sha256,
 )
 
 _ATTEMPT = re.compile(r"(?:agent|import)-[a-zA-Z0-9_-]+")
@@ -52,6 +55,7 @@ class Manifest(Record):
     source_sha256: dict[str, Digest]
     grader_version: str
     limits: JSONDict
+    context_window_tokens: Annotated[int, Field(ge=2048)] = LEGACY_CONTEXT_WINDOW_TOKENS
     frozen_config_sha256: Digest
     hints: bool
     web_search: bool
@@ -339,7 +343,9 @@ def _score(
     )
 
 
-def _task(src: Source, key: str, manifest: JSONDict, fixture: str | None) -> TaskRecord:
+def _task(
+    src: Source, key: str, manifest: JSONDict, fixture: str | None, config_sha256: str | None
+) -> TaskRecord:
     case = src.path(src.root / "cases" / key)
     task_path = case / "task.json"
     task = Task.model_validate_json(src.read(task_path))
@@ -364,6 +370,10 @@ def _task(src: Source, key: str, manifest: JSONDict, fixture: str | None) -> Tas
         _attempt(src, entry, current_attempt if entry.name == active else {}, fixture, key)
         for entry in src.children(case, _ATTEMPT)
     ]
+    if config_sha256 is not None and any(
+        item.provider is not None and item.config_sha256 != config_sha256 for item in attempts
+    ):
+        raise ValueError(f"Attempt configuration differs from the frozen run settings for {key}")
     if active is not None and active not in {item.attempt_id for item in attempts}:
         raise ValueError("Current attempt pointer has no receipt directory")
 
@@ -467,6 +477,13 @@ def read_report(root: Path) -> Report:
     settings = src.optional(settings_path)
     if settings and settings["limits"] != raw["limits"]:
         raise ValueError("Recorded running limits differ from the frozen plan")
+    context_window = frozen_context_window(raw)
+    if settings and frozen_context_window(settings) != context_window:
+        raise ValueError("Recorded context window differs from the frozen plan")
+    config_sha256 = settings.get("config_sha256")
+    if "harness_profile" in settings or config_sha256 is not None:
+        if config_sha256 != run_config_sha256(settings):
+            raise ValueError("Frozen run configuration hash mismatch")
     manifest_hash = src.evidence(path).sha256
     manifest = Manifest(
         experiment_id=f"swebench-lite-{manifest_hash}",
@@ -481,6 +498,7 @@ def read_report(root: Path) -> Report:
         ),
         grader_version=raw["official_grader_version"],
         limits=raw["limits"],
+        context_window_tokens=context_window,
         hints=raw["hints"],
         web_search=raw["web_search"],
         completion_gate=raw["completion_gate"],
@@ -494,7 +512,9 @@ def read_report(root: Path) -> Report:
         ),
         evidence=[src.evidence(file) for file in (path, settings_path) if file in src.files],
     )
-    tasks = [_task(src, key, raw, settings.get("fixtures", {}).get(key)) for key in ids]
+    tasks = [
+        _task(src, key, raw, settings.get("fixtures", {}).get(key), config_sha256) for key in ids
+    ]
     src.verify()
     return Report(manifest=manifest, tasks=tasks, aggregate=aggregate_tasks(tasks))
 
@@ -556,6 +576,7 @@ def compare(left: Report, right: Report, *, varied: frozenset[str] = frozenset()
             "split",
             "grader_version",
             "limits",
+            "context_window_tokens",
             "source_sha256",
             "hints",
             "web_search",

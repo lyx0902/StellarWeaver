@@ -31,7 +31,7 @@ def test_deepseek_thinking_output_default_and_explicit_cli_override() -> None:
     assert (selected.thinking, selected.reasoning_effort, selected.max_output_tokens) == (
         "enabled",
         "high",
-        8192,
+        16384,
     )
     assert ModelConfig(provider="deepseek", thinking="disabled").max_output_tokens == 4096
     assert ModelConfig(provider="openai-compatible-chat").max_output_tokens == 4096

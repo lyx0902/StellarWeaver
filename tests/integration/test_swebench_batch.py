@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from stellarweaver.config import HarnessConfig
 from stellarweaver.evals import swebench as bench
 from stellarweaver.evals import swebench_contract as contract
 from stellarweaver.evals.provenance import canonical_json
@@ -45,6 +46,7 @@ def prepare(
     *,
     instance_ids: tuple[str, ...] = (FIRST, SECOND),
     image: str = IMAGE,
+    prepare_options: tuple[str, ...] = (),
 ) -> Path:
     tmp_path.mkdir(exist_ok=True)
     rows = [
@@ -77,21 +79,316 @@ def prepare(
     )
     root = tmp_path / "run"
     root.mkdir()
-    bench.prepare(
-        argparse.Namespace(
-            output=root,
-            dataset=dataset,
-            dataset_sha256=bench.digest(dataset.read_bytes()),
-            split="dev",
-            legacy_dev=True,
-            grader_python=Path(sys.executable),
-            recipes=recipes,
-            instance_id=list(instance_ids),
-            limit=None,
-            max_model_calls=max_model_calls,
-        )
-    )
+    argv = [
+        "prepare",
+        "--output",
+        str(root),
+        "--dataset",
+        str(dataset),
+        "--dataset-sha256",
+        bench.digest(dataset.read_bytes()),
+        "--legacy-dev",
+        "--grader-python",
+        sys.executable,
+        "--recipes",
+        str(recipes),
+    ]
+    for key in instance_ids:
+        argv.extend(("--instance-id", key))
+    if max_model_calls is not None:
+        argv.extend(("--max-model-calls", str(max_model_calls)))
+    bench.prepare(bench.parser().parse_args([*argv, *prepare_options]))
     return root
+
+
+def run_args(root: Path, assets: Path, fixtures: Path, *options: str) -> argparse.Namespace:
+    return bench.parser().parse_args(
+        [
+            "run",
+            "--output",
+            str(root),
+            "--assets",
+            str(assets),
+            "--fake-scripts",
+            str(fixtures),
+            *options,
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "full", "delegation", "repair"),
+    [
+        ((), False, False, "off"),
+        (("--harness-profile", "baseline"), False, False, "off"),
+        (("--harness-profile", "full"), True, True, "feedback"),
+        (
+            (
+                "--harness-profile",
+                "full",
+                "--no-subagent-exploration",
+                "--repair-controller",
+                "enforce",
+            ),
+            True,
+            False,
+            "enforce",
+        ),
+    ],
+)
+async def test_profiles_reach_runtime_and_record_effective_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    options: tuple[str, ...],
+    full: bool,
+    delegation: bool,
+    repair: str,
+) -> None:
+    assets = tmp_path / "assets"
+    root = prepare(tmp_path, source_repo(assets / FIRST), instance_ids=(FIRST,))
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    stage = {
+        "tool_calls": [
+            {
+                "call_id": "stage",
+                "name": "stage_patch",
+                "arguments_json": json.dumps(
+                    {
+                        "changes": [
+                            {
+                                "path": "module.py",
+                                "expected_sha256": hashlib.sha256(b"value = 0\n").hexdigest(),
+                                "content": "value = 1\n",
+                            }
+                        ],
+                    }
+                ),
+            }
+        ],
+        "stop_reason": "tool_calls",
+    }
+    bench.save(fixtures / f"{FIRST}.json", ([stage] if full else []) + [{"text": "Done."}])
+    monkeypatch.setattr(bench, "local_image", lambda image: None)
+    original_build_agent = bench.build_agent
+
+    def build(config, model, store, **kwargs):
+        assert config.harness.repair_controller == repair
+        for name in bench._HARNESS_SWITCHES:
+            assert getattr(config.harness, name) is (
+                delegation if name == "subagent_exploration" else full
+            )
+        assert kwargs["allow_benchmark_staging"] is full
+        assert kwargs["adaptive_round_retention"] is full
+        assert kwargs["enforce_exploration_caps"]
+        assert (kwargs["command_runner"] is not None) is full
+        assert (
+            model.capabilities().context_window_tokens
+            == config.model.context_window_tokens
+            == 200_000
+        )
+        return original_build_agent(config, model, store, **kwargs)
+
+    monkeypatch.setattr(bench, "build_agent", build)
+    args = run_args(root, assets, fixtures, *options)
+    await bench.solve(root, args)
+    settings_path = root / "run-settings.json"
+    settings = bench.read_json(settings_path)
+    assert settings["harness_profile"] == ("full" if full else "baseline")
+    assert settings["sandbox_commands"] is settings["adaptive_round_retention"] is full
+    assert settings["subagent_exploration"] is delegation
+    assert settings["repair_controller"] == repair
+    assert settings["config_sha256"] == bench.run_config_sha256(settings)
+    for name in bench._EXPLORATION_OPTIONS:
+        assert settings[name] == getattr(HarnessConfig(), name)
+    case = root / "cases" / FIRST
+    record = bench.read_json(case / bench.state(case)["attempt"] / "agent-report.json")
+    assert record["config_sha256"] == settings["config_sha256"]
+    assert record["outcome"]["run_status"] == "completed"
+    if full:
+        assert record["tools"][0]["status"] == "ok"
+        assert record["candidate_status"] == "empty_patch"
+    with sqlite3.connect(record["outcome"]["state_path"]) as journal:
+        [task] = [
+            body["content"]
+            for (raw,) in journal.execute("SELECT body_json FROM messages")
+            if (body := json.loads(raw))["role"] == "user"
+        ]
+    if full:
+        prompt_line = next(
+            line for line in task.splitlines() if line.startswith("Available additional tools")
+        )
+        assert "stage_patch" in prompt_line and "apply_patch" in prompt_line
+        assert (
+            "check_syntax" in prompt_line and ("delegate_exploration" in prompt_line) is delegation
+        )
+    else:
+        assert "Available additional tools" not in task
+    assert not any(secret in task for secret in ("ORACLE-ONLY", "HIDDEN-TEST", "HINT-ONLY"))
+    await bench.solve(root, args)
+    args.fresh_tool_rounds += 1
+    with pytest.raises(ValueError, match="Run settings changed"):
+        await bench.solve(root, args)
+    assert bench.read_json(settings_path) == settings
+    contract.read_report(root)
+    bench.save(settings_path, {**settings, "adaptive_round_retention": not full})
+    with pytest.raises(ValueError, match="configuration hash mismatch"):
+        contract.read_report(root)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_prepare_and_solve_share_frozen_budget_and_context(tmp_path, monkeypatch, legacy):
+    assets = tmp_path / "assets"
+    root = prepare(
+        tmp_path,
+        source_repo(assets / FIRST),
+        instance_ids=(FIRST,),
+        prepare_options=(
+            "--context-window-tokens",
+            "180000",
+            "--max-tool-calls",
+            "7",
+            "--max-wall-seconds",
+            "80",
+            "--max-input-tokens-total",
+            "380000",
+            "--max-output-tokens-total",
+            "64000",
+        ),
+    )
+    manifest_path = root / "manifest.json"
+    manifest = bench.read_json(manifest_path)
+    assert manifest["context_window_tokens"] == 180_000
+    assert manifest["limits"] == {
+        "max_model_calls": None,
+        "max_tool_calls": 7,
+        "max_wall_seconds": 80,
+        "max_input_tokens_total": 380_000,
+        "max_output_tokens_total": 64_000,
+    }
+    if legacy:
+        del manifest["context_window_tokens"]
+        bench.save(manifest_path, manifest)
+    window = 100_000 if legacy else 180_000
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    bench.save(fixtures / f"{FIRST}.json", [{"text": "Done."}])
+    monkeypatch.setattr(bench, "local_image", lambda image: None)
+    original_build_agent = bench.build_agent
+
+    def build(config, model, store, **kwargs):
+        assert config.limits.model_dump() == manifest["limits"]
+        assert (
+            config.model.context_window_tokens
+            == model.capabilities().context_window_tokens
+            == window
+        )
+        return original_build_agent(config, model, store, **kwargs)
+
+    monkeypatch.setattr(bench, "build_agent", build)
+    await bench.solve(root, run_args(root, assets, fixtures))
+    settings = bench.read_json(root / "run-settings.json")
+    assert settings["limits"] == manifest["limits"]
+    assert settings["context_window_tokens"] == window
+    report = contract.read_report(root)
+    assert report.manifest.context_window_tokens == window
+    different = report.model_copy(
+        update={
+            "manifest": report.manifest.model_copy(update={"context_window_tokens": window + 1})
+        }
+    )
+    comparison = contract.compare(report, different, varied=frozenset({"config_sha256"}))
+    assert comparison["control_differences"] == ["context_window_tokens"]
+    assert comparison["excluded"] == {FIRST: "different_manifest_controls"}
+
+
+@pytest.mark.parametrize(
+    ("model_limit", "tool_limit", "cap", "reason"),
+    [
+        (None, 50, 2, "safety_cap"),
+        (2, 50, 8, "parent_budget"),
+        (None, 1, 8, "parent_budget"),
+    ],
+)
+async def test_batch_exploration_uses_local_caps_and_frozen_parent_budget(
+    tmp_path,
+    monkeypatch,
+    model_limit,
+    tool_limit,
+    cap,
+    reason,
+):
+    assets = tmp_path / "assets"
+    root = prepare(
+        tmp_path,
+        source_repo(assets / FIRST),
+        model_limit,
+        instance_ids=(FIRST,),
+        prepare_options=("--max-tool-calls", str(tool_limit)),
+    )
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+
+    def call(name, arguments):
+        return {
+            "stop_reason": "tool_calls",
+            "tool_calls": [
+                {
+                    "call_id": name,
+                    "name": name,
+                    "arguments_json": json.dumps(arguments),
+                }
+            ],
+        }
+
+    gather = [call("read_file", {"path": "module.py"})] if reason == "safety_cap" else []
+    bench.save(
+        fixtures / f"{FIRST}.json",
+        [
+            call("delegate_exploration", {"goal": "Inspect the module."}),
+            *gather,
+            {"text": "Partial findings."},
+            {"text": "Done."},
+        ],
+    )
+    monkeypatch.setattr(bench, "local_image", lambda image: None)
+    await bench.solve(
+        root,
+        run_args(
+            root,
+            assets,
+            fixtures,
+            "--harness-profile",
+            "full",
+            "--exploration-max-model-calls",
+            str(cap),
+            "--exploration-max-tool-calls",
+            "9",
+            "--exploration-timeout-seconds",
+            "175",
+            "--exploration-stall-rounds",
+            "3",
+        ),
+    )
+    settings = bench.read_json(root / "run-settings.json")
+    assert tuple(settings[name] for name in bench._EXPLORATION_OPTIONS) == (cap, 9, 175, 3)
+    assert tuple(
+        settings["app_config"]["harness"][name] for name in bench._EXPLORATION_OPTIONS
+    ) == (
+        cap,
+        9,
+        175,
+        3,
+    )
+    case = root / "cases" / FIRST
+    record = bench.read_json(case / bench.state(case)["attempt"] / "agent-report.json")
+    [delegation] = record["tools"]
+    assert delegation["data"]["completion_status"] == "partial"
+    assert delegation["data"]["stop_reason"] == reason
+    assert "Partial findings." in delegation["content"]
+    assert record["outcome"]["tool_calls"] == len(gather) + 1
+    expected_models = 2 if model_limit is not None else len(gather) + 3
+    assert record["outcome"]["model_calls"] == expected_models
 
 
 async def test_batch_synthetic_case_uses_shared_development_sandbox(tmp_path: Path) -> None:
@@ -350,6 +647,57 @@ def fixture_score(monkeypatch: pytest.MonkeyPatch, *, resolved: bool = True) -> 
     monkeypatch.setattr(bench, "local_image", lambda *_: None)
     monkeypatch.setattr(bench.subprocess, "run", grade)
     return calls
+
+
+async def test_contract_pairs_declared_full_profile_ablation(tmp_path, monkeypatch):
+    assets = tmp_path / "assets"
+    base = source_repo(assets / FIRST)
+    fixtures = tmp_path / "fixtures"
+    fixtures.mkdir()
+    bench.save(
+        fixtures / f"{FIRST}.json",
+        [
+            {
+                "stop_reason": "tool_calls",
+                "tool_calls": [
+                    {
+                        "call_id": "edit",
+                        "name": "edit_file",
+                        "arguments_json": json.dumps(
+                            {
+                                "path": "module.py",
+                                "old_text": "value = 0",
+                                "new_text": "value = 1",
+                                "expected_sha256": hashlib.sha256(b"value = 0\n").hexdigest(),
+                            }
+                        ),
+                    }
+                ],
+            },
+            {"text": "Done."},
+        ],
+    )
+    monkeypatch.setattr(bench, "local_image", lambda image: None)
+    full, ablated = (prepare(tmp_path / name, base, instance_ids=(FIRST,)) for name in ("a", "b"))
+    await bench.solve(full, run_args(full, assets, fixtures, "--harness-profile", "full"))
+    await bench.solve(
+        ablated,
+        run_args(
+            ablated, assets, fixtures, "--harness-profile", "full", "--no-subagent-exploration"
+        ),
+    )
+    fixture_score(monkeypatch)
+    opts = argparse.Namespace(grader_python=sys.executable, timeout=5, rescore=False)
+    bench.evaluate(full, opts)
+    bench.evaluate(ablated, opts)
+    left, right = contract.read_report(full), contract.read_report(ablated)
+    assert contract.compare(left, right)["excluded"] == {
+        FIRST: "missing_or_different_config_sha256"
+    }
+    diff = frozenset({"config_sha256", "prompt_sha256", "tools_schema_sha256"})
+    paired = contract.compare(left, right, varied=diff)
+    assert paired["control_differences"] == []
+    assert paired["pairs"]["both_resolved"] == 1
 
 
 def test_contract_binding_reuses_cache_and_keeps_independent_rescores(

@@ -215,6 +215,28 @@ def public_event(event: JSONDict) -> JSONDict:
         }
     elif kind == "context.prior_evidence":
         visible = {key: len(payload[key]) for key in ("files", "checks", "skills")}
+    elif kind in {"exploration.started", "exploration.completed"}:
+        visible = {
+            key: payload[key]
+            for key in (
+                "exploration_id",
+                "goal",
+                "paths",
+                "completion_status",
+                "stop_reason",
+                "model_calls",
+                "tool_calls",
+                "input_tokens",
+                "output_tokens",
+            )
+            if key in payload
+        }
+    elif kind == "exploration.tool":
+        visible = {
+            key: payload[key]
+            for key in ("exploration_id", "event", "tool_name", "status", "operation_id")
+            if key in payload and payload[key] is not None
+        }
     elif kind == "context.compacted":
         visible = {
             key: payload[key]
@@ -236,8 +258,17 @@ def public_event(event: JSONDict) -> JSONDict:
         }
     elif kind == "tool.completed":
         visible = {k: payload[k] for k in ("tool_name", "status", "operation_id") if k in payload}
+        tool_name = payload.get("tool_name")
+        if tool_name == "delegate_exploration":
+            data = payload.get("data", {})
+            visible.update(
+                {
+                    key: data[key]
+                    for key in ("completion_status", "stop_reason", "goal", "paths")
+                    if key in data
+                }
+            )
         if payload.get("status") == "ok":
-            tool_name = payload.get("tool_name")
             if tool_name == "load_skill":
                 data = payload.get("data", {})
                 visible["skill_name"] = data.get("name")
@@ -267,6 +298,7 @@ def public_event(event: JSONDict) -> JSONDict:
                 "raw_input_utf8_bytes",
                 "purpose",
                 "exploration_id",
+                "exploration_phase",
             )
             if key in payload
         }

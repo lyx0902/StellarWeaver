@@ -255,7 +255,7 @@ def test_usage_days_and_read_only_skill_library(engine, tmp_path: Path) -> None:
         assert empty.status_code == 200, empty.text
         assert empty.json()["today"]["tokens"] == 0
         assert empty.json()["read_at"] and empty.json()["quota_resets_at"]
-        assert empty.json()["quota"]["limit_tokens"] == 10_000_000
+        assert empty.json()["quota"]["limit_tokens"] == 100_000_000
         ids, _ = db.submit(
             engine,
             str(tenant),

@@ -64,6 +64,7 @@ class ModelRequest:
     tools: tuple[JSONDict, ...] = ()
     max_output_tokens: int = 4096
     web_search: bool = False
+    disable_thinking: bool = False
 
 
 @dataclass(frozen=True)

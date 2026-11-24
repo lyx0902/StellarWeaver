@@ -22,6 +22,8 @@ READ_TOOLS = frozenset(
         "search_text",
         "git_status",
         "git_diff",
+        "git_log",
+        "git_show",
         "load_skill",
         "find_symbol",
         "find_references",
@@ -32,7 +34,9 @@ READ_TOOLS = frozenset(
 )
 EDIT_TOOLS = frozenset({"create_file", "edit_file", "apply_patch"})
 BENCHMARK_TOOLS = (READ_TOOLS - {DS_SEARCH}) | EDIT_TOOLS
-DEVELOPMENT_TOOLS = frozenset({"run_tests", "discover_tests", "check_syntax", "run_linter"})
+DEVELOPMENT_TOOLS = frozenset(
+    {"run_tests", "discover_tests", "check_syntax", "run_linter", "run_python_snippet"}
+)
 
 
 class Grant(BaseModel):
@@ -80,6 +84,7 @@ class PolicyEngine:
         policy_file: Path | None = None,
         allow_sandbox_development: bool = False,
         scoped_test_grants: bool = False,
+        allow_benchmark_staging: bool = False,
     ) -> None:
         if preset not in {"ask", "read-only", "workspace-edit", "auto", "benchmark"}:
             raise ValueError("Unknown policy preset")
@@ -89,6 +94,9 @@ class PolicyEngine:
         self.approval = approval
         self.allow_sandbox_development = allow_sandbox_development
         self.scoped_test_grants = scoped_test_grants
+        self.benchmark_tools = (
+            BENCHMARK_TOOLS | {"stage_patch"} if allow_benchmark_staging else BENCHMARK_TOOLS
+        )
         self._grants: tuple[FrozenGrant, ...] = ()
         self._session: set[str] = set()
         if policy_file is not None:
@@ -221,6 +229,7 @@ class PolicyEngine:
                     for grant in self._grants
                 ],
                 **({"scoped_test_grants": True} if self.scoped_test_grants else {}),
+                **({"benchmark_staging": True} if "stage_patch" in self.benchmark_tools else {}),
             }
         )
 
@@ -244,19 +253,24 @@ class PolicyEngine:
             or invocation.get("development_action") not in DEVELOPMENT_TOOLS
         ):
             return None
-        from stellarweaver.tools.development import decode_development
+        from stellarweaver.tools.development import DevelopmentArgs, SnippetArgs, decode_development
 
         argv = invocation.get("argv")
         decoded = decode_development(argv) if isinstance(argv, list) else None
         if decoded is None:
             return None
         action, args = decoded
-        if (
-            action != invocation["development_action"]
-            or args.target != invocation.get("path")
-            or args.framework != invocation.get("framework")
-        ):
+        if action != invocation["development_action"]:
             return None
+        if isinstance(args, SnippetArgs):
+            if invocation.get("path") != "." or invocation.get("framework") != "python":
+                return None
+        else:
+            assert isinstance(args, DevelopmentArgs)
+            if args.target != invocation.get("path") or args.framework != invocation.get(
+                "framework"
+            ):
+                return None
         # Only target is omitted. The transport, interpreter, action and framework remain bound.
         return "development:" + fingerprint(
             {
@@ -297,7 +311,7 @@ class PolicyEngine:
             return "Operation is prohibited by the capability boundary"
         if self.preset == "benchmark":
             permitted = not invocation.get("remote") and (
-                tool in BENCHMARK_TOOLS
+                tool in self.benchmark_tools
                 or (
                     tool == "run_command"
                     and invocation.get("executor") == "sandbox"

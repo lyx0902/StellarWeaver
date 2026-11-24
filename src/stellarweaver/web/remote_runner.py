@@ -1,6 +1,7 @@
 """Worker-side client for the private G5 executor."""
 
 import asyncio
+import base64
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ import httpx
 from stellarweaver.config import ExecutionConfig
 from stellarweaver.domain import JSONDict
 from stellarweaver.tools.commands import _wait_cleanup
-from stellarweaver.tools.development import decode_development
+from stellarweaver.tools.development import DevelopmentArgs, SnippetArgs, decode_development
 from stellarweaver.tools.workspace import ToolError
 from stellarweaver.web.isolation import Isolation, _archive, snapshot_paths
 from stellarweaver.web.snapshots import SnapshotState, Transfer, pack_transfer
@@ -46,9 +47,21 @@ class RemoteRunner:
         params: JSONDict = {"timeout": timeout}
         if self.pipeline_metrics:
             params["metrics"] = "true"
+        headers: dict[str, str] = {}
         if development is not None:
             action, args = development
-            params.update(action=action, target=args.target, framework=args.framework)
+            if isinstance(args, SnippetArgs):
+                params.update(action=action)
+                headers["X-StellarWeaver-Snippet"] = base64.b64encode(
+                    args.code.encode("utf-8")
+                ).decode("ascii")
+            else:
+                assert isinstance(args, DevelopmentArgs)
+                params.update(action=action, target=args.target, framework=args.framework)
+                if args.selector is not None:
+                    params["selector"] = args.selector
+                if args.keyword is not None:
+                    params["keyword"] = args.keyword
         else:
             params["command"] = self.isolation.commands.index(tuple(argv))
         with (
@@ -95,7 +108,7 @@ class RemoteRunner:
                             key,
                             params=query,
                             content=chunks(),
-                            headers={"Content-Type": "application/x-tar"},
+                            headers={"Content-Type": "application/x-tar", **headers},
                         )
 
                     response = await upload(transfer)

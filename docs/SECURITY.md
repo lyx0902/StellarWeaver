@@ -19,8 +19,8 @@ StellarWeaver 根据工具实际使用的路径、数据和执行器判断风险
 
 | 等级 | 概念定义 | 典型调用与当前处置 |
 | --- | --- | --- |
-| **L0 受限读取** | 工具读取已授权范围内的文件、索引或 Git 状态，或发送通过检查的公开网页查询。 | `read_file`、`search_text`、`git_diff`、Python 导航工具和公开的 `ds_search` 查询属于此类。默认直接放行，可信 `PreToolUse` 可要求额外审批。 |
-| **L1 工作区变更或受控执行** | 调用会改变工作区内容、准备待审改动，或将输入交给已配置且有自身约束的执行器。路径、文件版本、命令或执行环境可复核。 | `create_file`、`edit_file`、`stage_patch`，以及通过配置的执行器运行测试、Ruff 或语法检查，均处于此级。自动执行范围由下文运行模式决定。 |
+| **L0 受限读取** | 工具读取已授权范围内的文件、索引或 Git 状态，或发送通过检查的公开网页查询。 | `read_file`、`search_text`、`git_status`、`git_diff`、`git_log`、`git_show`（过滤受保护路径）、Python 导航工具、`delegate_exploration`（内部强制 `read-only` 且不暴露写/命令/外网）和公开的 `ds_search` 查询属于此类。默认直接放行，可信 `PreToolUse` 可要求额外审批。 |
+| **L1 工作区变更或受控执行** | 调用会改变工作区内容、准备待审改动，或将输入交给已配置且有自身约束的执行器。路径、文件版本、命令或执行环境可复核。 | `create_file`、`edit_file`、`apply_patch`、`stage_patch`，以及通过配置的沙箱执行器运行 `run_tests`、`run_python_snippet`、`discover_tests`、`run_linter` 或 `check_syntax`，均处于此级。自动执行范围由下文运行模式决定。 |
 | **L2 宿主执行或扩展交接** | 调用使用宿主进程能力，或把参数交给外部扩展组件。MCP 工具声明为只读时，参数交接仍属于这一类。 | 宿主 `run_command`、MCP 启动或调用属于此类。交互批准限单次。部分 CLI 命令和扩展可以匹配精确配置授权。 |
 | **L3 硬拒绝** | 准备完成的调用命中不可通过审批覆盖的保护规则。 | 例如搜索查询含明显的本地私有路径或凭据特征，或者 MCP 启动配置试图传入受保护的凭据环境变量。系统记录判定理由并直接拒绝。 |
 
@@ -35,7 +35,7 @@ StellarWeaver 根据工具实际使用的路径、数据和执行器判断风险
 | **auto** | 可写项目的新任务默认选择。L0 直接执行，普通创建、编辑和可信沙箱登记的固定验证或结构化开发操作自动执行。补丁暂存和需授权的 L2 操作进入单次审批。 |
 | **SWE-bench 无人值守** | 允许当前题工作区的读写、精确授权的固定容器检查及实验明确启用的结构化开发工具。宿主执行、网页搜索和 MCP 不在允许范围内。超范围调用返回拒绝，批次保留该题终态并继续。 |
 
-L3 硬拒绝对所有模式生效。自动执行的命令必须来自可信代码实际绑定的受限执行器。通用已注入命令接口或任意 argv 选项本身不构成自动授权；固定命令匹配完整 argv 与 cwd，结构化开发操作匹配实际注册项。CLI 可用 `ask`、`read-only` 或 `workspace-edit`，无交互入口时，仍需审批的调用会被阻止。 [使用与配置](USAGE.md#会话策略和改动)
+L3 硬拒绝对所有模式生效。自动执行的命令必须来自可信代码实际绑定的受限执行器。通用已注入命令接口或任意 argv 选项本身不构成自动授权；固定命令匹配完整 argv 与 cwd，结构化开发操作匹配实际注册项。启用 `scoped_test_grants` 时，在隔离沙箱执行器（`configured` / `sandbox`）下对 `run_tests`、`run_python_snippet`、`discover_tests`、`check_syntax`、`run_linter` 显式授予会话权限后，同一工作区、沙箱边界和测试框架内可切换工作区相对目标路径（或单测过滤/复现代码）复用授权（并支持从 Journal 跨轮恢复）；宿主执行器（`host`）仍严格要求完整 `argv` 匹配。CLI 可用 `ask`、`read-only` 或 `workspace-edit`，无交互入口时，仍需审批的调用会被阻止。 [使用与配置](USAGE.md#会话策略和改动)
 
 ## 授权与执行顺序
 
@@ -46,7 +46,7 @@ L3 硬拒绝对所有模式生效。自动执行的命令必须来自可信代�
 
 Hook 由受信程序在 `HookManager` 注册，只能加强限制。CLI 的宿主命令与 stdio MCP 以当前系统用户运行，Docker 隔离以配置的执行路径为准。搜索保护规则检测明显的凭据特征和本机路径，授权事件仍标记 `network:public-search-query`。正常模型请求遵循所选 Provider 的数据边界。 [可信 Hook](../src/stellarweaver/policy/hooks.py) · [Web 审批](../src/stellarweaver/web/approval.py) · [隔离环境](ARCHITECTURE.md#web-执行环境)
 
-撤销由用户确认后入队。worker 只处理最近一次符合条件的内置创建或编辑，先记录意图，再恢复文件并追加结果。哈希不匹配时保留当前文件，未确认的撤销在恢复记录中展示。导出 HTML 对内容进行转义并使用静态展示，运行记录不包含原始模型推理。 [Web 撤销](../src/stellarweaver/web/undo.py) · [导出实现](../src/stellarweaver/web/run_export.py)
+撤销由用户确认后入队。worker 只处理最近一次符合条件的内置创建、单文件编辑或跨文件 `apply_patch`，先记录意图，再核对全部目标文件哈希与备份后整组恢复并追加结果。任一文件哈希不匹配时保留当前文件并拒绝整组撤销，崩溃中断的混合态标记为 `RECOVERY_PATCH_MIXED`（`unknown`）留待人工核对。导出 HTML 对内容进行转义并使用静态展示，运行记录不包含原始模型推理。 [Web 撤销](../src/stellarweaver/web/undo.py) · [补丁写回与恢复](../src/stellarweaver/tools/patch_write.py) · [导出实现](../src/stellarweaver/web/run_export.py)
 
 ## 本地工具边界评测
 
@@ -70,4 +70,4 @@ uv run --locked --offline python -m stellarweaver.evals.local_fixtures
 - CodeIPI 的 Inspect Evals 配置定义了隔离环境、任务判定、分类规则与评审器。StellarWeaver 可将日志和制品映射到相应格式。要取得原生可比结果，需要固定源代码和数据版本，保留官方评分器与环境语义，并核对许可和外部调用。 [CodeIPI 官方说明](https://ukgovernmentbeis.github.io/inspect_evals/evals/ipi_coding_agent/)
 - RepoGuardBench 包含仓库场景和正常任务对照。可复用 StellarWeaver 的题号、操作事件、文件哈希和结果记录接口。适配前需核对样本版本、许可、隔离和官方判定，改动过的子集按适配结果报告。 [RepoGuardBench 官方仓库](https://github.com/DaoyuanLi2816/RepoGuardBench)
 
-外部套件目前处于方案核对阶段。评测代码、数据和镜像仍待准入登记，正式结果尚未生成。 [评测协议](EVAL_PROTOCOL.md)
+外部套件目前处于方案核对阶段。评测代码、数据和镜像仍待准入登记，正式结果尚未生成。 [统一评测协议](EVALUATION.md#统一评测协议)

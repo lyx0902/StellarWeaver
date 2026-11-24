@@ -72,6 +72,9 @@ export type RunEvent = {
   seq: number; session_id: string; run_id: string; type: string; schema_version: number
   payload: Partial<Approval> & {
     content?: string; status?: string; tool_name?: string; code?: string
+    operation_id?: string; exploration_id?: string; exploration_phase?: string; event?: string
+    goal?: string; paths?: string[]
+    completion_status?: 'completed' | 'partial' | 'cancelled'; stop_reason?: string
     staged_patch?: string
     skill_name?: string; skill_source?: string
     files?: number; checks?: number; skills?: number

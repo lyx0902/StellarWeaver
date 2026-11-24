@@ -18,7 +18,7 @@ class StrictConfig(BaseModel):
 
 def _default_output_tokens(data: dict[str, object]) -> int:
     if data.get("provider") == "deepseek" and data.get("thinking") == "enabled":
-        return 8192
+        return 16384
     return 4096
 
 
@@ -118,6 +118,10 @@ class HarnessConfig(StrictConfig):
     incremental_sandbox_snapshots: bool = False
     import_aware_repomap: bool = False
     subagent_exploration: bool = False
+    exploration_max_model_calls: int = Field(default=20, ge=1)
+    exploration_max_tool_calls: int = Field(default=60, ge=1)
+    exploration_timeout_seconds: int = Field(default=300, ge=1)
+    exploration_stall_rounds: int = Field(default=3, ge=2)
     calibrated_context_budget: bool = False
     sticky_context_checkpoint: bool = False
     protect_fresh_tool_output: bool = False

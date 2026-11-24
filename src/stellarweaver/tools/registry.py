@@ -20,7 +20,7 @@ from pydantic import BaseModel, ValidationError
 
 from stellarweaver.config import HarnessConfig
 from stellarweaver.domain import JSONDict, Message, ToolCall, ToolResult, ToolStatus
-from stellarweaver.policy import BENCHMARK_TOOLS, DS_SEARCH, READ_TOOLS, PolicyEngine
+from stellarweaver.policy import DS_SEARCH, READ_TOOLS, PolicyEngine
 from stellarweaver.policy.hooks import Decision, HookEvent, HookManager, Stage
 from stellarweaver.policy.risk import HARD_PATH_ERRORS, POLICY_VERSION, assess, fingerprint
 from stellarweaver.session.locking import SessionBusy, workspace_write_lock
@@ -74,6 +74,8 @@ _PARALLEL_READS = frozenset(
         "find_related_tests",
         "git_status",
         "git_diff",
+        "git_log",
+        "git_show",
     }
 )
 
@@ -190,6 +192,15 @@ class ToolRegistry:
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
 
+    def normalized_arguments(self, name: str, raw: Any) -> Any:
+        tool = self._tools.get(name)
+        if tool is not None:
+            try:
+                return tool.arguments.model_validate(raw).model_dump(mode="json")
+            except ValidationError:
+                pass
+        return raw
+
     def is_mutation(self, name: str) -> bool:
         tool = self._tools.get(name)
         return tool is None or not tool.read_only
@@ -218,7 +229,10 @@ class ToolRegistry:
                 self.policy.preset != "benchmark"
                 or (
                     not tool.remote
-                    and (tool.name in BENCHMARK_TOOLS or tool.authorization_tool == "run_command")
+                    and (
+                        tool.name in self.policy.benchmark_tools
+                        or tool.authorization_tool == "run_command"
+                    )
                 )
             )
         ]
@@ -233,6 +247,17 @@ class ToolRegistry:
         tool = self._tools.get(name)
         return bool(
             name in _PARALLEL_READS
+            and tool is not None
+            and tool.read_only
+            and not tool.remote
+            and tool.schema is None
+            and tool.authorization_tool is None
+        )
+
+    def can_parallel_exploration(self, name: str) -> bool:
+        tool = self._tools.get(name)
+        return bool(
+            name == "delegate_exploration"
             and tool is not None
             and tool.read_only
             and not tool.remote
@@ -297,7 +322,9 @@ class ToolRegistry:
             tool = self._tools.get(call.name)
             if tool is None:
                 raise ToolError("UNKNOWN_TOOL", f"Unknown tool: {call.name}")
-            if read is not None and not self.can_parallel_read(call.name):
+            if read is not None and not (
+                self.can_parallel_read(call.name) or self.can_parallel_exploration(call.name)
+            ):
                 raise ToolError("AUTHORIZATION_CHANGED", "The registered read tool changed.")
             try:
                 raw = json.loads(call.arguments_json)

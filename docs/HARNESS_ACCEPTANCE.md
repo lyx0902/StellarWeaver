@@ -1,6 +1,6 @@
-# Harness M0–M10 实施与验收
+# Harness 实施与验收记录
 
-本文汇总从源码审计、统一评测契约到工作台实验看板的实施和验收记录。各阶段的测试数据按执行批次保留，历史审计以当时的代码和部署为准。
+本文汇总从 M0–M10 源码审计、统一评测契约、安全沙箱与实验看板，到 **N 阶段（Batch 1–3）流水线演进与上下文优化** 的实施与验收记录。各阶段测试数据按执行批次保留，历史审计以当时的代码和部署为准。
 
 | 阶段 | 主要交付 |
 | --- | --- |
@@ -8,33 +8,27 @@
 | [M2–M4](#m2-m4-固定夹具与授权) | 固定边界夹具、工具风险与授权、可信 Hook 及审批复核。 |
 | [M5–M8](#m5-m8-沙箱与修复工具) | 容器沙箱、受控开发工具、Python 导航与修复控制。 |
 | [M9–M10](#m9-m10-补丁暂存与实验看板) | 补丁暂存、任务证据、预算提示、实验看板与正式评测预注册。 |
+| [N 阶段（Batch 1–3）与上下文优化](#n-阶段-batch-1-3-与上下文优化验收) | 流水线度量、多块编辑、跨文件补丁与成组撤销、保序只读并发、增量快照、缓存导航、只读探索 Sub-agent、实测 Token 校准与粘性前缀检查点。 |
 
 ## 当前实现进度核对
 
-2026-11-22 核对基于当前 HEAD `91b7164` 与工作树，包括 M0–M10 之后的工作台增量。下表反映本次核对，后续各里程碑章节保留原批次的验收结果。总方案开头的架构图描述目标状态，M11–M12 的正式实验待执行。 [目标架构图](StellarWeaver_Harness_Complete_Improvement_Plan_2026-11-21.md#理想完成态-harness-架构图目标架构不是当前已经实现的功能清单) · [当前架构](ARCHITECTURE.md)
+2026-11-24 核对基于当前工作树（已完成 M0–M10、N 阶段 Batch 1–3 及上下文三项优化，且均通过独立开关接入 CLI、Web 与评测入口）。早期目标架构与演进规划已归档，M11–M12 的 SWE-bench Lite 正式实验待执行。 [M0–M12 历史总方案](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md) · [N 阶段规划归档](archive/06_HARNESS_N_STAGE_PLAN.md) · [当前架构](ARCHITECTURE.md)
 
 | 架构层 | 已接入能力 | 实现范围与待验收项 |
 | --- | --- | --- |
-| 交互与任务入口 | React、CLI、FastAPI、账号与项目权限、PostgreSQL 队列及 worker。Web 支持普通对话、带证据续接、流式重连及脱敏 JSON／HTML 导出。 | 两种入口共用 Agent，Web 按线程保存独立 worktree。待验收项包括从指定轮次派生线程、数据库与 worktree 联合恢复。 |
-| Agent 决策与修复 | DeepSeek Thinking、Python Repo Map、符号与测试导航、错误分类、修复反馈及可选的重复失败终止。CLI 和 Web 默认 200k，Web 可自适应归纳较早的完整工具回合。 | 单次请求窗口按运行保存。超 100k 输入和长程压缩已有离线回归，真实模型下的 100k／200k 对照仍待运行。 |
-| 任务证据与预算 | 运行内证据关联操作 ID、事件序号和文件哈希。Web 跨轮从 Journal 提取文件、检查和技能版本，并复核当前快照。 | Web 使用单次请求窗口、操作超时和账户周额度。独立评测沿用冻结预算，阶段级预算调度及通用假设跟踪仍待实现。 |
-| 工具、权限与隔离 | 路径硬守卫、L0–L3、可信 Hook、审批及复核已接入。Git worktree 和断网验证容器支持测试、发现、语法检查和 Ruff。 | CLI 默认使用宿主执行器，Web 受当前运行模式及已登记容器配置约束。 |
-| 技能与扩展 | Web 提供共享库、按成员与项目的技能信任、按版本选用技能和模型自动加载。CLI 提供可信 Skills 和 stdio MCP。 | Web 模型自主加载已有离线链路验收，实际任务的选用效果及 Web MCP 集成待验收。 |
-| 多文件补丁 | `stage_patch` 支持校验、授权和导出暂存补丁。Web 的既有交付流程支持选择普通修复的改动块，并在独立 worktree 应用和复验。 | 暂存制品目前通过下载交接，尚未接入逐块复验与事务式写回。 |
-| 撤销 | Web 在隔离线程内对最近一次已记录的文件创建或编辑发起撤销，校验哈希及备份后生成新运行和候选。 | 离线真 worktree 回归覆盖恢复、哈希冲突和原报告保留。 |
-| 评测、统计与看板 | SWE-bench Lite 批量运行、独立评分、缓存、离线汇总和严格题号配对；看板读取历史轨迹、批量评测和固定边界夹具，支持筛选和脱敏导出。 | SWE-bench 与本地安全夹具仍分别运行。跨套件编排、外部安全适配、实际费用趋势和正式消融统计待交付。 |
+| 交互与任务入口 | React、CLI、FastAPI、账号与项目权限、PostgreSQL 队列及 worker。Web 支持普通对话、带证据续接、流式重连及脱敏 JSON／HTML 导出。 | 两种入口共用 Agent，Web 按线程保存独立 worktree。待验收项包括从指定历史轮次分叉线程（`N6-a`）、数据库与 worktree 联合恢复。 |
+| Agent 决策与并发探索 | DeepSeek Thinking、Python Repo Map（支持 `import_aware` 导入加权）、符号与测试导航（支持预筛与元数据缓存）、4 路保序只读并发（`ReadDispatch`）、错误分类与修复控制、共享预算只读探索 Sub-agent（`delegate_exploration`）。 | 离线夹具已验收 4 路并发耗时下降 ~52%、500 文件二次导航提速至 0.012s、父子预算精确对账。真实模型下的消融收益待在 `dev` 23 题检验。 |
+| 上下文、证据与预算 | CLI 和 Web 默认 200k；支持实测 Token 动态校准（误差中位数降至 +8%）、粘性压缩前缀检查点（3/3 前缀逐字节一致）、最新工具全文保护（默认 2 轮）、双流 Head/Tail 日志保真、运行内与跨轮证据投影。 | 离线 25 轮长读回归已验证压缩次数从 23 降至 4。线上 DeepSeek Prefix Cache 实际命中率与 100k/200k 对照待实测。 |
+| 编辑、补丁与撤销 | 单文件多块原子编辑（最多 64 处、防重叠）、`stage_patch` 暂存预览、`apply_patch` 跨文件事务写回（最多 12 文件、I/O 异常补偿回滚、崩溃混合态 `RECOVERY_PATCH_MIXED` 识别）、CLI 与 Web 单/多文件成组撤销。 | 离线与临时 PostgreSQL 已验收多文件修改/新建/删除的成组撤销与冲突零写入。 |
+| 工具、权限与隔离 | 路径硬守卫、L0–L3、可信 Hook、写后内存 Python 语法诊断、审批复核、沙箱开发工具跨目标会话级授权复用（`scoped_test_grants`）、Git worktree 与断网容器、Worker→Broker 增量快照传输（`SnapshotCache`，传输量减少 97.5%）。 | CLI 默认使用宿主执行器，宿主命令仍严格全量 `argv` 匹配；Web 受当前运行模式与固定容器镜像约束。 |
+| 技能与扩展 | Web 提供共享库、按成员与项目的技能信任、按版本选用技能和模型自动加载。CLI 提供可信 Skills 和 stdio MCP。 | Web 模型自主加载已有离线链路验收，实际任务选用效果及 Web MCP 集成待验收。 |
+| 评测、统计与看板 | SWE-bench Lite 批量运行、独立评分、缓存、离线汇总和严格题号配对；看板读取历史轨迹、批量评测和固定边界夹具，支持筛选和脱敏导出。 | SWE-bench 与本地安全夹具仍分别运行。正式 23/300 题、外部安全评测及消融统计属于 M11–M12。 |
 
-本机 Compose 更新至 G11，API 和 worker 均加载 200k 默认值。窗口迁移回填已有模型事件，核对旧 100k 任务的原始事件和终态。近期工作台增量的测试与部署证据汇总见验证文档。 [工作台与部署验证](EVAL.md#工作台与部署验证) · [当前部署配置](USAGE.md#本机-compose)
-
-工作台可写项目的新任务默认使用 `auto`。只读与修改仍可选择，既有运行保留自己的模式。SWE-bench 使用独立的无人值守策略。 [运行模式与分流](SECURITY.md#运行模式与分流)
-
-目标图中列为可选的版本化项目知识、跨会话项目记忆、面向被测项目的开发服务与浏览器验证，以及多 Agent、多候选均尚未实现。已有浏览器验收覆盖工作台本身。
-
-最新 M10 验收记录为 548 项离线测试通过、27 项跳过，其中数据库相关用例随后在临时环境补验。看板登记了五份报告，三道历史 SWE-bench 题中两道通过独立评分、一道未评分。23 道开发题清单尚无独立评分，可用配对数为 0。固定安全夹具通过三项边界检查和两项正常任务。正式 23/300 题、外部安全评测及其统计分析属于 M11–M12。 [验证证据](#m9-m10-验证证据)
+本机 Compose 默认将新开关设为关闭以保持基线可复现，日常工作台可在 `.stellarweaver/workbench.compose.env` 中按需全量开启。全套配置表见[使用与部署](USAGE.md#harness-增强开关速查)，验证复现入口见[评测体系](EVALUATION.md#复现入口)。
 
 ## M0-M1 审计与评测契约
 
-审计基线为 `7ececb5c34ccd33b9fb4f47738421d95d548b7cf`（`master`，开始时工作树干净）。总方案记录的是 `c981a915de368776dd6413a848bffe3a6b70a61c`。两者之间只新增了总方案及其归档版本，无运行时代码差异。总方案开头的蓝色节点表示已有主体，橙色节点表示新增、统一或增强目标。一个橙色节点也可能已有局部实现。 [总方案](StellarWeaver_Harness_Complete_Improvement_Plan_2026-11-21.md)
+审计基线为 `7ececb5c34ccd33b9fb4f47738421d95d548b7cf`（`master`，开始时工作树干净）。总方案记录的是 `c981a915de368776dd6413a848bffe3a6b70a61c`。两者之间只新增了总方案及其归档版本，无运行时代码差异。总方案的原始归档见[M0–M12 总方案](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md)。
 
 ### M0 源码与测试清单
 
@@ -52,8 +46,8 @@
 | 部分实现 | 现有 guard 和授权前后回调是内部路径。CLI 支持可信 Skills 和 stdio MCP，Web Skills 为只读浏览。风险引擎、可配置的可信 Hook 管理器及 Web 扩展统一装配仍缺。 | [工具调度](../src/stellarweaver/tools/registry.py) · [CLI 扩展](../src/stellarweaver/extensions/) · [Web Skills](../src/stellarweaver/web/skills.py) |
 | 部分实现 | Web 有私有 worktree 和断网的一次性验证容器，主要执行预配置命令。CLI `run_command` 使用宿主进程，Windows Job 负责进程生命周期。通用沙箱 profile、统一命令隔离和开发服务器或浏览器验证仍待实现。 | [验证隔离](../src/stellarweaver/web/isolation.py) · [执行服务](../src/stellarweaver/web/broker.py) · [宿主命令](../src/stellarweaver/tools/commands.py) · [隔离回归](../tests/integration/test_web_g4.py) |
 | 部分实现 | 实验界面读取一份已发布报告，可查看事件和评分证据；多实验筛选、按样本轨迹对照、安全指标界面仍缺。M1 导出独立 JSON，未扩大此界面的读取契约。 | [实验视图](../frontend/src/experiment.tsx) · [实验 API](../src/stellarweaver/web/app.py) |
-| 缺失 | 到 M0 审计时，统一 Manifest/Attempt/Score/Evidence、哈希校验与配对汇总尚未接通。M1 补齐 SWE-bench 契约；安全夹具、独立效果 Oracle、外部安全套件及修复过程指标归后续里程碑。跨任务项目记忆、多 Agent 和多候选是可选目标。 | [M1 评测协议](EVAL_PROTOCOL.md) · [里程碑总表](StellarWeaver_Harness_Complete_Improvement_Plan_2026-11-21.md#71-里程碑总表) |
-| 不能确定 | 完整 `dev`/`test` 的可执行性和正式成绩、DeepSeek API 别名对应的权重修订、外部安全套件的可比性、真实部署的隔离性质均需对应证据。已保存 `dev` 清单 23 条，本机配方 3 条。历史三题评分仅有 2 个已保存候选获 `resolved`、1 个未评分。 | [现有实验记录](EVAL.md#phase-2-多仓库试跑记录) · [历史内部评测](archive/00_Sample_Run.md) |
+| 缺失 | 到 M0 审计时，统一 Manifest/Attempt/Score/Evidence、哈希校验与配对汇总尚未接通。M1 补齐 SWE-bench 契约；安全夹具、独立效果 Oracle、外部安全套件及修复过程指标归后续里程碑。跨任务项目记忆、多 Agent 和多候选是可选目标。 | [统一评测协议](EVALUATION.md#统一评测协议) · [里程碑总表](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md#71-里程碑总表) |
+| 不能确定 | 完整 `dev`/`test` 的可执行性和正式成绩、DeepSeek API 别名对应的权重修订、外部安全套件的可比性、真实部署的隔离性质均需对应证据。已保存 `dev` 清单 23 条，本机配方 3 条。历史三题评分仅有 2 个已保存候选获 `resolved`、1 个未评分。 | [现有实验记录](EVALUATION.md#phase-2-三题试跑证据) · [历史内部评测](archive/00_Sample_Run.md) |
 
 ### 离线验收与证据
 
@@ -101,7 +95,7 @@ tests/unit/test_runtime_limits.py
 
 ### M2 的输入条件
 
-M2 以预注册的合成夹具和正常任务对照、独立副作用判定以及隔离测试资源为输入。G-EVAL-06 的验证结果见下节。样本级分母和比较口径见[评测协议](EVAL_PROTOCOL.md)。
+M2 以预注册的合成夹具和正常任务对照、独立副作用判定以及隔离测试资源为输入。G-EVAL-06 的验证结果见下节。样本级分母和比较口径见[统一评测协议](EVALUATION.md#统一评测协议)。
 
 ## M2-M4 固定夹具与授权
 
@@ -137,7 +131,7 @@ python -B -m pytest -q -ra --tb=short -m 'not live_model' -p no:cacheprovider
 python -B -m pytest -q -ra --tb=short -p no:cacheprovider tests/integration/test_web_g5.py
 ```
 
-固定场景、判定口径、工具威胁模型和外部套件可行性见[工具安全与评测](SECURITY.md)。定位、编辑和冲突恢复指标见[修复过程夹具](EVAL.md#修复过程的离线夹具)。M5 对通用执行器、镜像、断网、资源约束和清理的验证见下节。
+固定场景、判定口径、工具威胁模型和外部套件可行性见[工具安全与评测](SECURITY.md)。定位、编辑和冲突恢复指标见[修复过程离线夹具](EVALUATION.md#修复过程离线夹具与-20-题评测)。M5 对通用执行器、镜像、断网、资源约束和清理的验证见下节。
 
 ## M5-M8 沙箱与修复工具
 
@@ -170,7 +164,7 @@ CLI、Web 与评测共用 ToolRegistry 和 Agent 循环。开发工具、导航�
 
 CLI 通过 `stellarweaver.toml` 的 `[execution]` 配置 Docker 和镜像，`[harness]` 分别设置 `development_tools`、`issue_navigation` 和 `repair_controller`。工作台的 Compose 环境可设置 `SW_RUNNER_IMAGE`、`SW_WEB_SANDBOX_PROFILE`、`SW_WEB_DEVELOPMENT_TOOLS`、`SW_WEB_ISSUE_NAVIGATION` 和 `SW_WEB_REPAIR_CONTROLLER`。
 
-SWE-bench 的 `--sandbox-commands` 切换到共享快照执行器。`--development-tools` 在使用同一执行器的前提下开放四个开发工具。导航与修复反馈另有 `--issue-navigation` 和 `--repair-controller`。比较固定工具与开发工具时，两组都使用共享执行器，固定其余开关。`run-settings.json` 和工具 schema 哈希记录选择。正式评测仍按[统一评测协议](EVAL_PROTOCOL.md)登记。
+SWE-bench 的 `--sandbox-commands` 切换到共享快照执行器。`--development-tools` 在使用同一执行器的前提下开放四个开发工具。导航与修复反馈另有 `--issue-navigation` 和 `--repair-controller`。比较固定工具与开发工具时，两组都使用共享执行器，固定其余开关。`run-settings.json` 和工具 schema 哈希记录选择。正式评测仍按[统一评测协议](EVALUATION.md#统一评测协议)登记。
 
 本机证据目录为 `.validation/harness-m58-2026-11-21-7ececb5-98fab6d1/`。Docker 为 Windows Docker Desktop / WSL2、Linux amd64，复用本地 Python 3.12 镜像，镜像 ID 见 `docker-image.txt`。
 
@@ -218,7 +212,7 @@ uv run --locked --offline pytest -q tests/integration/test_harness_m58.py
 
 以冻结的共享沙箱和固定测试入口作为基线。开发工具、导航、修复反馈、任务证据和预算提示各自单独对照。固定数据修订、题号、题序、模型版本、权限、评分镜像和总预算。只放行与实验设计一致的配置、工具 schema 或提示变化。补丁暂存的人工审核成本单独记录。
 
-按当前每题上限估算每组每次的输入、输出 Token 封顶，23 题分别为 **736 万 / 36.8 万**，300 题分别为 **9,600 万 / 480 万**。预算金额以审批时存档的每百万 Token 价格按输入、输出分别计算，输入按未命中缓存估上限，最后乘以组数和重复次数。费用、Docker 资源与并发上限在运行前单独批准。计量和配对口径见 [评测协议](EVAL_PROTOCOL.md)，实验设定见 [评测计划](EVAL_PLAN.md)。
+按当前每题上限估算每组每次的输入、输出 Token 封顶，23 题分别为 **736 万 / 36.8 万**，300 题分别为 **9,600 万 / 480 万**。预算金额以审批时存档的每百万 Token 价格按输入、输出分别计算，输入按未命中缓存估上限，最后乘以组数和重复次数。费用、Docker 资源与并发上限在运行前单独批准。计量和配对口径见[统一评测协议](EVALUATION.md#统一评测协议)，实验设定见[实验设计](EVALUATION.md#swe-bench-lite-实验设计与对照规划)。
 
 首批 23 题以确认流程、分母和独立评分为目标，预注册范围为单组、单次。若批准正式对照，优先采用一组基线和一组单变量改进，总输入、输出上限分别为 **1,472 万 / 73.6 万**（23 题）或 **1.92 亿 / 960 万**（300 题）。首批评测前需冻结具体模型、单价、组别、资源上限和停止条件。
 
@@ -235,7 +229,19 @@ uv run --locked --offline pytest -q tests/integration/test_harness_m58.py
 
 验收证据位于 `.validation/harness-m910-2026-11-21-b1bba826/`。该阶段使用本地夹具、隔离容器和已保存的评分完成验收。
 
+## N 阶段 Batch 1-3 与上下文优化验收
+
+在 M0–M10 基础上，围绕执行流水线吞吐、编辑事务、沙箱传输、导航召回、探索隔离与上下文效率分四批落地，所有新开关默认关闭，均接入 CLI、Web 与 SWE-bench 入口：
+
+| 批次 | 核心交付 | 离线 / 集成夹具验收结论 | 验收用例 |
+| --- | --- | --- | --- |
+| **Batch 1**（`N0` / `N1-a` / `N2-a` / `N4-a` / `N4-b`） | Token 误差与沙箱分段计时、单文件多块编辑（最多 64 处）、写后 Python 内存语法诊断、双流 Head/Tail 日志保真、全仓库有界文本预筛。 | 单文件三处编辑由 3 次工具/4 次模型调用降至 1 次工具/2 次模型调用；长 Pytest 输出保留 `FAILED` 与 `AssertionError` 2/2；500 文件末尾符号召回成功；全量 564 通过、0 失败。 | [test_harness_n_batch1.py](../tests/integration/test_harness_n_batch1.py) |
+| **Batch 2**（`N1-b` / `N2-b` / `N5`） | `apply_patch` 跨文件事务写回与 CLI/Web 成组撤销、崩溃混合态检测、`ReadDispatch` 4 路保序只读并发、沙箱受控测试工具跨目标会话级授权复用。 | 3 文件修改/新建/删除 1 次写回与 1 次成组撤销（冲突零写入）；4 路只读并发整轮耗时 2.178s → 1.049s（下降 ~52%）且 Journal 事件序与串行一致；切换测试文件审批 2 次 → 1 次；全量 576 通过 + 4 项临时 PG 通过。 | [test_harness_n_batch2.py](../tests/integration/test_harness_n_batch2.py) |
+| **Batch 3**（`N3` / `N4-c` / `N6-b`） | Worker→Broker 内容寻址基线缓存与增量快照传输（`SnapshotCache`）、`NavigationSources` 元数据缓存、`import_aware` RepoMap、`delegate_exploration` 只读探索 Sub-agent。 | 增量快照传输体积 409,600 → 10,240 字节（减少 97.5%），真 Docker 展开校验文件哈希与 `0o755`/`0o644` 权限一致；500 文件二次导航 1.055s → 0.012s；导入邻居入窗 0 → 2；父子探索预算与临时 PG 周额度结算精确；全量 583 通过。 | [test_harness_n_batch3.py](../tests/integration/test_harness_n_batch3.py) |
+| **上下文三项优化** | 实测 Token 动态校准（`calibrated_context_budget`）、粘性压缩前缀检查点（`sticky_context_checkpoint`）、最新工具全文保护（`protect_fresh_tool_output`）。 | 25 轮连续读文件夹具：首次压缩前真实输入 48,544 → 141,772 token，压缩次数 23 → 4，估算误差中位数 +260% → +8%，压缩后连续 3 次请求前缀逐字节一致 3/3；服务端超限 70% 回退仅重试一次不重放工具；全量 586 通过、0 失败。 | [test_context_pipeline.py](../tests/integration/test_context_pipeline.py) |
+| **子 Agent 并发与工具链完善** | 子 Agent 3 路滑动并发、独立计账、静默流式与无 Thinking 收尾总结（含 `length` 草稿抢救）、DeepSeek Thinking 输出上限提升至 16,384；工作台展示启动任务描述、`exploration.tool` 具体工具名与连续模型请求折叠；SWE-bench `run --harness-profile baseline\|full` 与可配冻结预算；`run_tests` 细粒度 `selector`/`keyword`、`run_python_snippet` 断网复现及 `git_log`/`git_show`。 | 5 子任务并发夹具实测 Web 峰值并发严格 3 路、强制预算模式 1 路、12 次 `request_index` 全部唯一、每子任务计账独立且输出保序；`length` 截断草稿与宽观察保留通过；`run_tests` 过滤、`run_python_snippet` 与 `git_log`/`git_show` 离线回归 58 项全通过；全量离线回归 609+ 通过。 | [test_harness_n_batch3.py](../tests/integration/test_harness_n_batch3.py) · [test_development_tools.py](../tests/unit/test_development_tools.py) · [test_git.py](../tests/unit/test_git.py) · [test_swebench_batch.py](../tests/integration/test_swebench_batch.py) |
+
 ## 后续验证
 
-- 补丁逐块应用、跨轮任务证据，以及真实模型任务的费用与效率趋势仍待验收。
-- 本地夹具和已保存的历史评分构成本阶段的验证证据。23 道开发题、300 道测试题和外部安全集的正式评测待单独确认，M9 对任务修复率的影响仍待验证。
+- 线程历史轮次分叉（`N6-a`）、补丁逐块应用到源分支，以及真实模型任务下的线上 Prefix Cache 命中率与费用趋势仍待验收。
+- 本地夹具和已保存的历史评分构成本阶段的验证证据。23 道开发题、300 道测试题和外部安全集的正式评测待单独确认。

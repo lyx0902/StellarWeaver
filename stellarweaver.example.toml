@@ -63,6 +63,12 @@ scoped_test_grants = false
 incremental_sandbox_snapshots = false
 import_aware_repomap = false
 subagent_exploration = false
+# Safety limits for delegated exploration when the parent has no run budget.
+exploration_max_model_calls = 20
+exploration_max_tool_calls = 60
+exploration_timeout_seconds = 300
+# Consecutive rounds in which all calls repeat or all tools return errors.
+exploration_stall_rounds = 3
 calibrated_context_budget = false
 sticky_context_checkpoint = false
 protect_fresh_tool_output = false

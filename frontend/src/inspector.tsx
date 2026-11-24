@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { Delivery, PatchPreflight, ReviewFeedback, RunEvent, UndoTarget } from './api'
-import { eventLabel } from './conversation'
+import { eventLabel, eventStatus } from './conversation'
 
 export type InspectorTab = 'changes' | 'checks' | 'logs'
 const tabs: { id: InspectorTab; label: string }[] = [
@@ -196,8 +196,13 @@ export function Inspector({ active, onSelect, onClose, delivery, events, canAppl
             <li key={event.seq} data-seq={event.seq}>
               <strong>{eventLabel(event)}</strong>
               {eventLabel(event) !== event.type && <small>{event.type}</small>}
-              {event.payload.status && <span className="muted">{event.payload.status}</span>}
+              {eventStatus(event) && <span className="muted">{eventStatus(event)}</span>}
               {event.payload.code && <code>{event.payload.code}</code>}
+              {(event.type === 'exploration.started' || event.type === 'exploration.completed' || event.payload.tool_name === 'delegate_exploration')
+                && event.payload.paths?.length ? (
+                <span>{event.payload.paths.map(path => <code key={path}>{path}</code>)}</span>
+              ) : null}
+              {event.type === 'exploration.started' && event.payload.goal && <pre>{event.payload.goal}</pre>}
               {typeof event.payload.status_code === 'number' && <span>HTTP {event.payload.status_code}</span>}
               {typeof event.payload.exit_code === 'number' && <span>退出码 {event.payload.exit_code}</span>}
               {event.payload.argv && <pre>{JSON.stringify(event.payload.argv)}</pre>}

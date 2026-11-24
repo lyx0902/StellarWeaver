@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-DEFAULT_WEEKLY_TOKENS = 10_000_000
+DEFAULT_WEEKLY_TOKENS = 100_000_000
 
 
 class Member(BaseModel):
@@ -25,7 +25,7 @@ class Member(BaseModel):
     weekly_tokens: int = Field(
         default=DEFAULT_WEEKLY_TOKENS,
         ge=1,
-        le=100_000_000,
+        le=1_000_000_000,
         validation_alias=AliasChoices("weekly_tokens", "daily_tokens"),
     )
 

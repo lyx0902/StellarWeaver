@@ -12,7 +12,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
@@ -26,19 +26,20 @@ from stellarweaver.config import (
     AppConfig,
     ContextConfig,
     ExecutionConfig,
+    HarnessConfig,
     LimitsConfig,
     ModelConfig,
 )
-from stellarweaver.domain import JSONDict
+from stellarweaver.domain import DEFAULT_CONTEXT_WINDOW_TOKENS, JSONDict
 from stellarweaver.evals.provenance import canonical_json
 from stellarweaver.evals.swebench_official import GRADER_VERSION
 from stellarweaver.evals.swebench_pilot import (
-    BENCHMARK_CONTEXT_WINDOW_TOKENS,
     checkout,
     digest,
     git,
     register_fixed_tools,
 )
+from stellarweaver.policy import DEVELOPMENT_TOOLS
 from stellarweaver.policy.risk import HARD_PATH_ERRORS, POLICY_VERSION
 from stellarweaver.providers.fake import FakeModel
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
@@ -86,6 +87,7 @@ OFFICIAL_REQUIRED = {
     "PASS_TO_PASS",
     "test_patch",
 }
+LEGACY_CONTEXT_WINDOW_TOKENS = 100_000
 LIMITS = {
     "max_tool_calls": 50,
     "max_wall_seconds": 360,
@@ -107,6 +109,20 @@ _PIPELINE_OPTIONS = (
     "calibrated_context_budget",
     "sticky_context_checkpoint",
     "protect_fresh_tool_output",
+)
+_HARNESS_SWITCHES = (
+    "development_tools",
+    "issue_navigation",
+    "patch_staging",
+    "task_evidence",
+    "budget_guidance",
+    *_PIPELINE_OPTIONS,
+)
+_EXPLORATION_OPTIONS = (
+    "exploration_max_model_calls",
+    "exploration_max_tool_calls",
+    "exploration_timeout_seconds",
+    "exploration_stall_rounds",
 )
 VISIBLE_PYTEST = """\
 import os
@@ -158,6 +174,87 @@ class Prediction(BaseModel):
     instance_id: str = Field(pattern=ID_PATTERN)
     model_name_or_path: str = Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$")
     model_patch: str = Field(min_length=1, max_length=8 * 1024 * 1024)
+
+
+@dataclass(frozen=True)
+class RunConfiguration:
+    profile: Literal["baseline", "full"]
+    sandbox_commands: bool
+    adaptive_round_retention: bool
+    app: AppConfig
+
+    @classmethod
+    def from_manifest(cls, args: argparse.Namespace, manifest: JSONDict) -> RunConfiguration:
+        def explicit(name: str, default: Any) -> Any:
+            value = getattr(args, name, None)
+            return default if value is None else value
+
+        full = getattr(args, "harness_profile", "baseline") == "full"
+        sandbox = explicit("sandbox_commands", full)
+        harness = HarnessConfig.model_validate(
+            {
+                **{name: explicit(name, full) for name in _HARNESS_SWITCHES},
+                "repair_controller": explicit("repair_controller", "feedback" if full else "off"),
+                **{
+                    name: getattr(args, name)
+                    for name in _EXPLORATION_OPTIONS
+                    if getattr(args, name, None) is not None
+                },
+            }
+        )
+        if harness.development_tools and not sandbox:
+            raise ValueError("Development tools require --sandbox-commands")
+        app = effective_config(
+            AppConfig(
+                model=ModelConfig(
+                    context_window_tokens=frozen_context_window(manifest),
+                    model=manifest.get("model", "deepseek-flash"),
+                    thinking=manifest.get("thinking", "enabled"),
+                    reasoning_effort=manifest.get("reasoning_effort", "high"),
+                ),
+                limits=LimitsConfig.model_validate(manifest["limits"]),
+                context=ContextConfig(fresh_tool_rounds=explicit("fresh_tool_rounds", 2)),
+                harness=harness,
+            ),
+            "deepseek" if args.live else "fake",
+            "benchmark",
+            True,
+        )
+        return cls(
+            "full" if full else "baseline", sandbox, explicit("adaptive_round_retention", full), app
+        )
+
+    def settings(self) -> JSONDict:
+        return {
+            "harness_profile": self.profile,
+            "sandbox_commands": self.sandbox_commands,
+            "adaptive_round_retention": self.adaptive_round_retention,
+            "enforce_exploration_caps": True,
+            "provider": self.app.model.provider,
+            "policy": {"preset": self.app.policy.preset, "version": POLICY_VERSION},
+            "limits": self.app.limits.model_dump(),
+            "context_window_tokens": self.app.model.context_window_tokens,
+            "fresh_tool_rounds": self.app.context.fresh_tool_rounds,
+            **self.app.harness.model_dump(),
+            "app_config": self.app.model_dump(mode="json"),
+        }
+
+
+def frozen_context_window(manifest: JSONDict) -> int:
+    value = manifest.get("context_window_tokens", LEGACY_CONTEXT_WINDOW_TOKENS)
+    return TypeAdapter(int).validate_python(value, strict=True)
+
+
+def run_config_sha256(settings: JSONDict) -> str:
+    return digest(
+        canonical_json(
+            {
+                name: value
+                for name, value in settings.items()
+                if name not in {"config_sha256", "assets", "fixtures", "code_sha", "source_sha256"}
+            }
+        )
+    )
 
 
 def execution_fingerprint() -> JSONDict:
@@ -253,7 +350,16 @@ def prepare(args: argparse.Namespace) -> None:
         if args.recipes
         else {}
     )
-    limits = LimitsConfig.model_validate({**LIMITS, "max_model_calls": args.max_model_calls})
+    limits = LimitsConfig.model_validate(
+        {
+            **{name: getattr(args, name, default) for name, default in LIMITS.items()},
+            "max_model_calls": args.max_model_calls,
+        }
+    )
+    model = ModelConfig(
+        provider="deepseek",
+        context_window_tokens=getattr(args, "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS),
+    )
     manifest: JSONDict = {
         "schema_version": 1,
         "dataset": "SWE-bench/SWE-bench_Lite",
@@ -262,9 +368,10 @@ def prepare(args: argparse.Namespace) -> None:
         "dataset_sha256": args.dataset_sha256,
         "split": args.split,
         "limits": limits.model_dump(),
-        "model": "deepseek-flash",
-        "thinking": "enabled",
-        "reasoning_effort": "high",
+        "context_window_tokens": model.context_window_tokens,
+        "model": model.model,
+        "thinking": model.thinking,
+        "reasoning_effort": model.reasoning_effort,
         "hints": False,
         "web_search": False,
         "completion_gate": False,
@@ -454,7 +561,11 @@ def visible_runner(
 
 
 async def solve_task(
-    case: Path, attempt: Path, args: argparse.Namespace, limits: LimitsConfig
+    case: Path,
+    attempt: Path,
+    args: argparse.Namespace,
+    run: RunConfiguration,
+    config_sha256: str,
 ) -> None:
     task = Task.model_validate_json((case / "task.json").read_bytes())
     recipe = Recipe.model_validate_json((case / "recipe.json").read_bytes())
@@ -462,11 +573,10 @@ async def solve_task(
     workspace = attempt / "checkout"
     await asyncio.to_thread(git_base, task, args.assets, workspace)
     argv = ["pytest", *recipe.pytest_args]
-    sandbox = getattr(args, "sandbox_commands", False)
-    development = getattr(args, "development_tools", False)
-    pipeline_options = {name: getattr(args, name, False) for name in _PIPELINE_OPTIONS}
-    if development and not sandbox:
-        raise ValueError("Development tools require --sandbox-commands")
+    config = run.app
+    harness = config.harness
+    sandbox = run.sandbox_commands
+    development = harness.development_tools
     runner: CommandRunner
     if sandbox:
         dependency = None
@@ -497,52 +607,24 @@ async def solve_task(
                 recipe.image, (tuple(argv),), "stellarweaver-swe-fixture", development=development
             ),
             dependency,
-            pipeline_metrics=pipeline_options["pipeline_metrics"],
-            incremental_snapshots=pipeline_options["incremental_sandbox_snapshots"],
+            pipeline_metrics=harness.pipeline_metrics,
+            incremental_snapshots=harness.incremental_sandbox_snapshots,
         )
     else:
         runner = visible_runner(
-            recipe, workspace, args.assets, pipeline_metrics=pipeline_options["pipeline_metrics"]
+            recipe, workspace, args.assets, pipeline_metrics=harness.pipeline_metrics
         )
     policy = attempt / "policy.json"
     grants = [{"tool": "run_command", "argv": argv, "cwd": "."}]
     save(policy, {"workspace": str(workspace), "grants": grants})
-    provider: Literal["deepseek", "fake"] = "deepseek" if args.live else "fake"
-    config = effective_config(
-        AppConfig(model=ModelConfig(context_window_tokens=BENCHMARK_CONTEXT_WINDOW_TOKENS)),
-        provider,
-        "benchmark",
-        True,
-    )
-    config = config.model_copy(
-        update={
-            "limits": limits,
-            "context": ContextConfig(fresh_tool_rounds=getattr(args, "fresh_tool_rounds", 2)),
-            "harness": config.harness.model_copy(
-                update={
-                    "development_tools": development,
-                    "issue_navigation": getattr(args, "issue_navigation", False),
-                    "repair_controller": getattr(args, "repair_controller", "off"),
-                    "task_evidence": getattr(args, "task_evidence", False),
-                    "budget_guidance": getattr(args, "budget_guidance", False),
-                    **pipeline_options,
-                }
-            ),
-        }
-    )
+    provider = config.model.provider
     model = (
         build_provider(config, workspace, "deepseek", None, args.env_file, stream=True)
-        if args.live
+        if provider == "deepseek"
         else FakeModel.from_script(
             args.fake_scripts / f"{task.instance_id}.json",
             context_window_tokens=config.model.context_window_tokens,
         )
-    )
-    prompt = (
-        f"Fix {task.instance_id} in {task.repo} at base commit {task.base_commit}. "
-        "Inspect the repository, make the smallest correct change, and run run_visible_tests "
-        "with {} when useful. Report the change and the actual validation evidence.\n\n"
-        + task.problem_statement
     )
     try:
         with SessionStore(workspace, data_dir=attempt / "state") as store:
@@ -556,6 +638,9 @@ async def solve_task(
                 command_boundary=digest(canonical_json(recipe.model_dump())) if sandbox else None,
                 allow_sandbox_development=development,
                 sandbox_commands=(tuple(argv),) if sandbox else None,
+                adaptive_round_retention=run.adaptive_round_retention,
+                allow_benchmark_staging=harness.patch_staging,
+                enforce_exploration_caps=True,
             )
             register_fixed_tools(
                 agent.registry,
@@ -567,7 +652,20 @@ async def solve_task(
                     )
                 },
             )
-            tools_sha256 = digest(canonical_json(agent.registry.schemas()))
+            schemas = agent.registry.schemas()
+            allowed = {schema["function"]["name"] for schema in schemas}
+            optional = allowed & (
+                DEVELOPMENT_TOOLS | {"delegate_exploration", "stage_patch", "apply_patch"}
+            )
+            prompt = (
+                f"Fix {task.instance_id} in {task.repo} at base commit {task.base_commit}. "
+                "Inspect the repository, make the smallest correct change, and run run_visible_tests "
+                "with {} when useful. Report the change and the actual validation evidence."
+            )
+            if optional:
+                prompt += "\nAvailable additional tools: " + ", ".join(sorted(optional)) + "."
+            prompt += "\n\n" + task.problem_statement
+            tools_sha256 = digest(canonical_json(schemas))
             outcome = await agent.run(prompt)
             requests = [
                 event
@@ -640,7 +738,7 @@ async def solve_task(
             "reasoning_effort": config.model.reasoning_effort,
             "prompt_sha256": digest(prompt.encode()),
             "tools_sha256": tools_sha256,
-            "config_sha256": digest(canonical_json(config.model_dump(mode="json"))),
+            "config_sha256": config_sha256,
             "policy_sha256": digest(
                 canonical_json(
                     {"version": POLICY_VERSION, "preset": config.policy.preset, "grants": grants}
@@ -703,15 +801,11 @@ def saved_prediction(case: Path) -> Prediction | None:
 
 
 async def solve(root: Path, args: argparse.Namespace) -> None:
-    if getattr(args, "development_tools", False) and not getattr(args, "sandbox_commands", False):
-        raise ValueError("Development tools require --sandbox-commands")
     keys = prepared_tasks(root)
-    limits = LimitsConfig.model_validate(read_json(root / "manifest.json")["limits"])
+    run = RunConfiguration.from_manifest(args, read_json(root / "manifest.json"))
     settings_path = root / "run-settings.json"
     settings = {
-        "provider": "deepseek" if args.live else "fake",
-        "policy": {"preset": "benchmark", "version": POLICY_VERSION},
-        "limits": limits.model_dump(),
+        **run.settings(),
         "assets": str(args.assets),
         "fixtures": {
             key: digest((args.fake_scripts / f"{key}.json").read_bytes())
@@ -720,17 +814,7 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
         },
         **execution_fingerprint(),
     }
-    for name in (
-        "sandbox_commands",
-        "development_tools",
-        "issue_navigation",
-        "repair_controller",
-        "task_evidence",
-        "budget_guidance",
-        *_PIPELINE_OPTIONS,
-    ):
-        if (value := getattr(args, name, None)) not in (None, False, "off"):
-            settings[name] = value
+    settings["config_sha256"] = run_config_sha256(settings)
     if settings_path.exists() and read_json(settings_path) != settings:
         raise ValueError(
             "Run settings changed. Use a new experiment for a different configuration."
@@ -752,7 +836,7 @@ async def solve(root: Path, args: argparse.Namespace) -> None:
         save(case / "solve.json", {"status": "running", "attempt": attempt.name})
         try:
             verify_inputs(root, case, "task.json", "recipe.json")
-            await solve_task(case, attempt, args, limits)
+            await solve_task(case, attempt, args, run, settings["config_sha256"])
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             finish_attempt(
                 case,
@@ -971,18 +1055,33 @@ def parser() -> argparse.ArgumentParser:
         help="Optional positive model-request limit per task (default: no request-count limit)",
     )
     prepare_cmd.add_argument("--recipes", type=Path)
-    solve_cmd = subs.add_parser("run", help="Run pending tasks with an explicit provider")
-    solve_cmd.add_argument("--sandbox-commands", action="store_true")
-    solve_cmd.add_argument("--development-tools", action="store_true")
-    solve_cmd.add_argument("--issue-navigation", action="store_true")
-    solve_cmd.add_argument("--task-evidence", action="store_true")
-    solve_cmd.add_argument("--budget-guidance", action="store_true")
-    for name in _PIPELINE_OPTIONS:
-        solve_cmd.add_argument("--" + name.replace("_", "-"), action="store_true")
-    solve_cmd.add_argument("--fresh-tool-rounds", type=int, default=2)
-    solve_cmd.add_argument(
-        "--repair-controller", choices=("off", "feedback", "enforce"), default="off"
+    prepare_cmd.add_argument(
+        "--context-window-tokens", type=int, default=DEFAULT_CONTEXT_WINDOW_TOKENS
     )
+    for name, default in LIMITS.items():
+        prepare_cmd.add_argument(
+            "--" + name.replace("_", "-"),
+            type=int,
+            default=default,
+            help=f"Freeze the per-task budget (default: {default})",
+        )
+    solve_cmd = subs.add_parser("run", help="Run pending tasks with an explicit provider")
+    solve_cmd.add_argument(
+        "--harness-profile",
+        choices=("baseline", "full"),
+        default="baseline",
+        help="Start with all enhancements disabled (baseline) or enabled (full)",
+    )
+    for name in ("sandbox_commands", "adaptive_round_retention", *_HARNESS_SWITCHES):
+        solve_cmd.add_argument("--" + name.replace("_", "-"), action=argparse.BooleanOptionalAction)
+    for name in _EXPLORATION_OPTIONS:
+        solve_cmd.add_argument(
+            "--" + name.replace("_", "-"),
+            type=int,
+            help=f"Exploration safety limit (default: {getattr(HarnessConfig(), name)})",
+        )
+    solve_cmd.add_argument("--fresh-tool-rounds", type=int, default=2)
+    solve_cmd.add_argument("--repair-controller", choices=("off", "feedback", "enforce"))
     provider = solve_cmd.add_mutually_exclusive_group(required=True)
     provider.add_argument("--live", action="store_true")
     provider.add_argument("--fake-scripts", type=Path)
