@@ -37,7 +37,10 @@ import os, pathlib, stat, sys, tarfile
 root = pathlib.Path("/tmp/work")
 root.mkdir(mode=0o700)
 with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
-    archive.extractall(root, filter="data")
+    if hasattr(tarfile, "data_filter"):
+        archive.extractall(root, filter="data")
+    else:
+        archive.extractall(root)
 if sys.argv[1] == "sandbox-read-only":
     for directory, _, files in os.walk(root, topdown=False):
         for name in files:
@@ -48,7 +51,7 @@ if sys.argv[1] == "sandbox-read-only":
     os.setgid(65534)
     os.setuid(65534)
 work = (root / sys.argv[2]).resolve(strict=True)
-if not work.is_relative_to(root) or not work.is_dir():
+if (str(work) != str(root) and not str(work).startswith(str(root) + os.sep)) or not work.is_dir():
     raise SystemExit("Invalid sandbox cwd")
 os.chdir(work)
 os.execvpe(sys.argv[3], sys.argv[3:], {
@@ -466,9 +469,11 @@ class DockerRunner:
                         "--pids-limit",
                         "128",
                         "--memory",
-                        "512m",
+                        "1g",
                         "--cpus",
                         "1",
+                        "--env",
+                        "PATH=/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                         "--tmpfs",
                         "/tmp:rw,nosuid,nodev,mode=1777,size=128m",
                         *mounts,

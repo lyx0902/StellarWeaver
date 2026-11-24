@@ -521,6 +521,7 @@ def visible_runner(
             "--cpus=2",
             *mounts,
             "--workdir=/tmp",
+            "--env=PATH=/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "--env=PYTHONNOUSERSITE=1",
             "--env=PYTHONDONTWRITEBYTECODE=1",
             "--env=PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
@@ -714,7 +715,7 @@ async def solve_task(
     candidate = "empty_patch"
     if patch:
         (attempt / "candidate.patch").write_bytes(patch)
-        with tempfile.TemporaryDirectory(prefix="verify-", dir=attempt) as stage:
+        with tempfile.TemporaryDirectory(prefix="sw-verify-", ignore_cleanup_errors=True) as stage:
             clean = Path(stage) / "checkout"
             await asyncio.to_thread(checkout, workspace, clean, task.base_commit)
             try:
@@ -882,7 +883,12 @@ def import_predictions(root: Path, source: Path) -> None:
 
 
 def evaluate(root: Path, args: argparse.Namespace) -> None:
+    selected = set(getattr(args, "instance_id", None) or ())
+    if selected - set(prepared_tasks(root)):
+        raise ValueError("Unknown requested instance IDs")
     for key in prepared_tasks(root):
+        if selected and key not in selected:
+            continue
         case = root / "cases" / key
         prediction = saved_prediction(case)
         if prediction is None:
@@ -962,6 +968,12 @@ def evaluate(root: Path, args: argparse.Namespace) -> None:
                             [
                                 str(args.grader_python),
                                 "-I",
+                                # Official harness writes eval.sh/patch.diff via write_text()
+                                # without encoding; on non-UTF-8 Windows locales (e.g. GBK)
+                                # that corrupts non-ASCII test code. -I ignores PYTHONUTF8,
+                                # so force UTF-8 mode explicitly.
+                                "-X",
+                                "utf8",
                                 str(OFFICIAL),
                                 "evaluate",
                                 str(oracle),
@@ -1096,6 +1108,9 @@ def parser() -> argparse.ArgumentParser:
     evaluate_cmd = subs.add_parser("evaluate", help="Score saved predictions in the official image")
     evaluate_cmd.add_argument("--timeout", type=int, default=240)
     evaluate_cmd.add_argument("--rescore", action="store_true")
+    evaluate_cmd.add_argument(
+        "--instance-id", action="append", help="Only evaluate these prepared tasks"
+    )
     export_cmd = subs.add_parser("export", help="Collect candidates in official JSONL order")
     report_cmd = subs.add_parser(
         "report", help="Aggregate from saved runs without calling the model"

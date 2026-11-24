@@ -54,6 +54,7 @@ Desktop.ini
 *.log
 /demo-workspace/
 /.validation/
+/SWEBenchLite_Eval/
 
 # Raw validation output contains host paths and references local session data.
 # Public summaries are in docs/EVAL.md.
