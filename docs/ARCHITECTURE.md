@@ -8,7 +8,7 @@ flowchart TB
         direction LR
         CLI["CLI<br/>交互、单次执行、恢复"]
         Web["React 工作台<br/>项目任务、普通对话、补丁审阅"]
-        Eval["评测 CLI<br/>准备、运行、评分"]
+        Eval["评测与 Harbor 入口<br/>SWE-bench Lite · Terminal-Bench 4.1"]
     end
 
     subgraph Assembly["任务装配"]
@@ -18,11 +18,12 @@ flowchart TB
         Queue[("PostgreSQL<br/>持久任务队列")]
         Worker["Web worker<br/>领取、准备环境与运行收尾"]
         Batch["SWE-bench Lite 运行器<br/>冻结配置与逐题工作区"]
+        Harbor["Harbor 原生适配器<br/>StellarWeaverHarborAgent<br/>terminal-minimal 单 bash"]
     end
 
     subgraph Harness["共享 Harness"]
         direction TB
-        Agent["build_agent → Agent<br/>循环取回回复并分派工具"]
+        Agent["build_agent / build_terminal_agent<br/>循环取回回复并分派工具"]
         Context["上下文与指令<br/>历史证据、技能目录、仓库导航"]
         Provider["ModelProvider<br/>DeepSeek、兼容端点或 FakeModel"]
         Tools["ToolRegistry 与 PolicyEngine<br/>参数、路径、版本、授权和复检"]
@@ -41,23 +42,26 @@ flowchart TB
         Local[("SQLite<br/>CLI 与评测会话")]
         PG[("PostgreSQL<br/>Web 会话、授权与事件")]
         Files["文件与 Git 工作区<br/>本机目录、线程 worktree 或逐题目录"]
-        Sandbox["命令执行<br/>CLI 宿主或配置的 Docker<br/>Web 由专用执行服务运行容器"]
+        Sandbox["命令与容器执行<br/>CLI 宿主 · Web 一次性验证容器<br/>Harbor 持久任务容器"]
     end
 
     CLI --> Direct
     Web <-->|REST 与 SSE| API
     Eval --> Batch
+    Eval --> Harbor
     API -->|入队| Queue
     Queue -->|领取| Worker
     Direct --> Agent
     Worker --> Agent
     Batch --> Agent
+    Harbor --> Agent
     Journal -->|CLI 与评测| Local
     Journal -->|Web| PG
     Tools -->|文件与 Git 操作| Files
     Subagent -->|只读检索与导航| Files
-    Tools -->|验证或命令| Sandbox
-    Batch -->|生成候选补丁| Grade["独立官方评分与结果汇总"]
+    Tools -->|验证、命令或 Harbor exec| Sandbox
+    Batch -->|候选补丁| Grade["独立官方评分与结果汇总"]
+    Harbor -->|官方 Verifier| Grade
 
     classDef main fill:#e8f1ff,stroke:#38639b,color:#172a47,stroke-width:2px
     classDef data fill:#edf4f1,stroke:#527a69,color:#16382e
@@ -65,7 +69,7 @@ flowchart TB
     class Local,PG,Queue data
 ```
 
-装配层为每种入口选择模型、权限、上下文配置和 Journal。共享 Harness 通过这些接口完成回合，实际使用的数据库、文件目录和命令执行器由入口配置决定。图中的 Web 任务队列和会话事件由同一个 PostgreSQL 实例保存。评测入口生成候选后进行独立评分，日常工作台交付以选定的验证命令和补丁审阅为主。
+装配层为每种入口选择模型、权限、上下文配置和 Journal。CLI、Web 与 SWE-bench Lite 经 `build_agent` 装配完整工具面；Terminal-Bench 4.1 经 Harbor 原生适配器调用 `build_terminal_agent` 装配极简 `terminal-minimal` 单 `bash` 运行时，共享同一套 `Agent` 主循环、上下文压缩与流式容错引擎。图中的 Web 任务队列和会话事件由同一个 PostgreSQL 实例保存；评测入口分别通过 SWE-bench 独立评分器或 Harbor 官方 Verifier 产出可核验裁决。
 
 ## React 工作台调用链
 
@@ -121,6 +125,52 @@ flowchart TB
 2. **领取。** worker 从数据库领取任务，根据工作区种类选择私有 Git worktree 或普通对话目录。该轮保存的窗口配置随领取结果传入运行时。
 3. **循环。** 模型回复触发工具调用。注册表核对实际工具参数和权限；需要批准时，worker 等待数据库中的决定。启用只读探索时，`delegate_exploration` 可由最多 3 路并发的 `ExplorationAgent` 在线程 worktree 内完成只读检索，经父级独立记账并产生 `exploration.*` 事件。执行结果写入 Journal，并按工具调用 ID 回给模型。
 4. **回传。** FastAPI 从数据库读取已提交的事件。React 通过 REST 获取运行快照，按事件序号拼接 SSE 进度，完成后按需读取验证及改动报告。 [任务提交](../frontend/src/main.tsx) · [工作台 API](../src/stellarweaver/web/app.py) · [Worker](../src/stellarweaver/web/worker.py)
+
+## Terminal-Bench 4.1（Harbor）调用链
+
+Terminal-Bench 4.1 评测由 Harbor 0.25.0 统一编排任务容器与官方独立 Verifier，StellarWeaver 以原生 `BaseAgent` 接入并挂载极简 `terminal-minimal` 单 `bash` 运行时。整条链路复用共享 `Agent` 主循环、粘性前缀压缩与长程容错机制，同时严格不向容器暴露宿主机文件或 Git 工具。
+
+```mermaid
+---
+config:
+  flowchart:
+    rankSpacing: 35
+    nodeSpacing: 24
+    wrappingWidth: 185
+---
+flowchart TB
+    HarborCLI["Harbor 0.25.0 调度器<br/>读取 YAML · 管理任务并发与超时"]
+    Container["Harbor 持久 Docker 容器<br/>完整 Linux 任务环境 · 支持常驻进程"]
+    Adapter["StellarWeaverHarborAgent<br/>原生 BaseAgent · terminal-minimal 预设"]
+    Agent["build_terminal_agent → Agent<br/>512k 窗口 · 64k 输出 · 续写与复读重试"]
+    Model["DeepSeek-V4.1-Flash-1017<br/>Thinking max · 粘性前缀缓存"]
+    BashTool["ToolRegistry（仅注册单 bash 工具）<br/>关闭宿主文件 / Git / RepoMap / Linter"]
+    SQLite[("SQLite SessionStore<br/>短路径归档 logs_dir/sw")]
+    Verifier["Harbor 官方 Verifier<br/>独立隐藏测试集 · ctrf.json & reward"]
+    Report["评测报告与遥测合并<br/>manifest.json · trial-report.json<br/>collect_harbor_job_reports()"]
+
+    HarborCLI -->|启动持久环境| Container
+    HarborCLI -->|"run(instruction, environment, context)"| Adapter
+    Adapter -->|装配长程预算与单 bash| Agent
+    Agent <-->|流式 Chat Completions| Model
+    Agent <-->|bash 工具调用与截断输出| BashTool
+    BashTool <-->|"BaseEnvironment.exec()"| Container
+    Agent -->|消息、工具事件与用量| SQLite
+    Adapter -->|回填 AgentContext 用量<br/>落盘 manifest & trial-report| Report
+    HarborCLI -->|Agent 结束后执行评分| Verifier
+    Container -->|最终容器状态| Verifier
+    Verifier -->|写入 result.json 与 ctrf.json| Report
+
+    classDef entry fill:#dbeafe,stroke:#1d4ed8,color:#0f172a,stroke-width:3px
+    classDef data fill:#edf4f1,stroke:#527a69,color:#16382e
+    class HarborCLI,Verifier entry
+    class SQLite,Report data
+```
+
+1. **调度与持久容器。** Harbor 根据任务清单（如 [harbor-tb41-smoke5.yaml](../deploy/harbor-tb41-smoke5.yaml)）拉起对应任务的持久 Linux Docker 容器，并在整题生命周期内保持容器状态（支持安装依赖、编译构建与后台守护进程保活），随后将 `instruction`、`environment` 与 `context` 交给 `StellarWeaverHarborAgent`。
+2. **极简装配与长程主循环。** 适配器加载 `long_horizon_deepseek_flash(harness_profile="terminal-minimal")` 预设（`512k` 上下文窗口、`64k` 单次输出、`1,000,000` 累计输出上限、`300` 次工具调用、`3600s` 墙钟与 `max_retries=5`），经 `build_terminal_agent` 构造 `Agent`。此路径刻意关闭宿主机文件/Git 工具、`RepoMap`、`InstructionLoader`、`ChangesManager` 与 `run_linter`，仅保留单个容器 `bash` 工具以压缩 Preamble 并维持高 Prefix Cache 命中率（5 题实测 `96.38%`）；同时完整保留 `sticky_context_checkpoint`、`calibrated_context_budget`、`length` 安全续写、双级失败软引导与 `reasoning_content` 滑动窗口复读检测。
+3. **单 `bash` 委托与短路径归档。** 每次 `bash` 调用由 `TerminalExecutor` 委托给 Harbor 的 `BaseEnvironment.exec()` 在持久容器内执行，自动注入非交互环境变量（`DEBIAN_FRONTEND=noninteractive`、`GIT_TERMINAL_PROMPT=0`、`PIP_NO_INPUT=1`、`CI=true`）并支持单命令最长 `1800s` 超时；会话明细写入短路径 `logs_dir/sw/`（规避 Windows `MAX_PATH` 限制），即使触发外层 `asyncio.CancelledError` 也会先落盘已采集遥测再向上传播。
+4. **独立官方 Verifier 与指标合并。** Agent 结束后（无论是 `model finished` 还是触及超时/预算上限），Harbor 在同一容器终态上运行官方独立 Verifier 生成 `verifier/ctrf.json` 与 `result.json`（含 `reward`）；StellarWeaver 仅对 `model.completed` 事件聚合缓存与费用写入 `trial-report.json`（零字节断连不虚扣输出预算），并由 `collect_harbor_job_reports()` 合并官方裁决与 Harness 遥测。 [Harbor 原生适配器](../src/stellarweaver/evals/terminal_bench.py) · [容器终端工具](../src/stellarweaver/tools/terminal.py) · [Terminal-Bench 4.1 冒烟报告](TerminalBench4Eval.md)
 
 ## 模块职责
 

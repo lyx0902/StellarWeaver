@@ -174,6 +174,7 @@ uv run --locked python scripts/swebench_eval_helper.py prune-images `
 
 | 阶段 | 数据集与范围 | 状态与目标 |
 | --- | --- | --- |
-| **开发集全量闭环（已完成）** | `dev`（23 题，`--harness-profile full`） | 已完成 6 仓库分批实跑与官方评分：**9/23 原始（39.1%）、9/15 有效镜像（60.0%）**，实测均摊 **¥0.20/题**。同时暴露 `dev` 集 34.8% 上游官方镜像腐化，不适合作为后续主力验收集（详见 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)）。 |
-| **P0 修复与基准迁移（下一步）** | 更干净且有 1017 公开基线的基准（如 Terminal-Bench 4.1 63 题无 GPU 版 / SWE-bench Pro V2 HARD-51） | 先落地 2 项 P0 修复（`edit_file` CRLF 兼容 + `swebench.py` 缓存统计），完成 3 题容器冒烟验收后切入新基准做高信噪比对照。 |
+| **SWE-bench `dev` 全量闭环（已完成）** | `dev`（23 题，`--harness-profile full`） | 已完成 6 仓库分批实跑与官方评分：**9/23 原始（39.1%）、9/15 有效镜像（60.0%）**，实测均摊 **¥0.20/题**。详见 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)。 |
+| **Phase 1–3a 改造与 TB 4.1 5 题冒烟（已完成）** | Harbor `0.25.0` · `terminal-bench/terminal-bench@4.1.0`（5 题显式 CPU，[harbor-tb41-smoke5.yaml](../deploy/harbor-tb41-smoke5.yaml)） | 已完成 Phase 1（CRLF / `run_linter` / 软提醒 / 缓存统计）、Phase 2（512k/64k 长程预设 / `length` 续写 / 双级失败引导 / 复读检测）与 Phase 3a（`terminal-minimal` 单 `bash` + Harbor 原生适配 + 真实评分合并与短路径归档）。5 题 CPU 冒烟实测 **2/5（40.0%）**、Prefix Cache **96.38%**、谷期 ¥13.37（同 5 题 Harbor Hub 一手对照：Claude Code **28.0% [7/25]**、Ante 0.3.5 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）；基于 610 次 `bash` 零编辑摩擦决定跳过 Phase 3b，并修复零字节断连虚扣输出预算 Bug。详见 [TerminalBench4Eval.md](TerminalBench4Eval.md)。 |
+| **Terminal-Bench 4.1 63 题全量（下一步）** | `terminal-bench/terminal-bench@4.1.0`（63 题无 GPU 版，谷期窗口） | 预计谷期总费 ¥140–¥170（`n_concurrent_trials=2`），对标 Mini-SWE-agent（31.8%）、Claude Code（38.5%）与 Ante（40.9%）；如需进一步压降单题标准价，可重点评估长程 `bash` 输出截断长度与上下文压缩阈值。 |
 | **SWE-bench Lite 正式集与消融（按需）** | `test`（300 题） | ① `baseline`（全关）vs `full`（全开）正式基线；② 单因素消融（`--no-development-tools`、`--no-issue-navigation`、`--no-subagent-exploration`、`--no-sticky-context-checkpoint`、`--repair-controller off|feedback|enforce`）。 |

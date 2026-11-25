@@ -18,11 +18,15 @@
 | 补丁审阅与交付 | 按文件或改动块审阅，针对候选发送反馈，选择改动独立复验，预检目标分支并下载补丁。支持单文件与 `apply_patch` 成组撤销。 |
 | 上下文、模型与扩展 | CLI 和 Web 默认使用 200k 单请求窗口，支持实测校准预算、固定前缀压缩、最近回合原文保护与导入加权 RepoMap。DeepSeek Flash 默认使用 Thinking High，支持按需网页搜索。工作台支持模型自主加载 Skills 和手动指定版本，CLI 可装配本地 stdio MCP。 |
 | 运行证据与恢复 | Web 用 PostgreSQL 保存任务队列、审批、事件和用量，通过 SSE 回显进度，可导出脱敏 JSON 或离线 HTML。CLI 用 SQLite 保存消息、操作及恢复记录。 |
-| SWE-bench Lite 评测 | 冻结题面、仓库基线和执行配置，按题生成候选补丁。官方评分在独立环境运行，工作台可读取已发布的结果与证据。 |
+| SWE-bench Lite & Terminal-Bench 评测 | SWE-bench 冻结题面、基线和执行配方，独立官方评分并支持看板发布；Terminal-Bench 4.1 通过 Harbor 原生 `BaseAgent` 与 `terminal-minimal` 单 `bash` 持久容器执行，自动合并官方 Verifier 评分与自包含归档。 |
 
 ### 当前进展
 
-CLI M0–M5、工作台 G0–G11、Harness M0–M10，以及 N 阶段（Batch 1–3）与三项上下文优化均已完成源码实现与离线验收（586 项离线回归通过）。已完成 SWE-bench Lite `dev` 全量 23 题 `full` Harness 实测（DeepSeek Flash Thinking High · 200k 窗口）：23/23 全部产出合法补丁，官方原始通过 **9/23（39.1%）**，剔除 8 题上游官方镜像损坏后有效通过率 **9/15（60.0%）**，实测 Prefix Cache 命中率 86.67%、闲时均摊 **¥0.20 / 题**。 [当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系与计划](docs/EVALUATION.md) · [dev 23 题详细报告](docs/SWEBenchLiteEval.md)
+CLI M0–M5、工作台 G0–G11、Harness M0–M10、N 阶段（Batch 1–3）与上下文三项优化，以及 **Harness Phase 1–3a**（CRLF 自动兼容、`run_linter` 降级、软收敛提醒、长程预设、`length` 安全续写、双级失败引导、流式复读检测与 Harbor 原生 `terminal-minimal` 适配）均已完成实现与验收（**668 项离线回归全绿**）。已完成两项真实基准实测：
+- **SWE-bench Lite `dev` 全量 23 题**（`full` · DeepSeek Flash Thinking High · 200k）：23/23 产出合法补丁，原始通过 **9/23（39.1%）**，剔除 8 题上游镜像损坏后有效通过 **9/15（60.0%）**，Prefix Cache 86.67%、闲时均摊 **¥0.20 / 题**。
+- **Terminal-Bench 4.1 5 题 CPU 冒烟**（`terminal-minimal` · DeepSeek Flash `max` · 512k）：官方通过 **2/5（40.0%）**（`kv-live-surgery` 6/6、`payments-pipeline-fix` 3/3），`0` 超时、`0` 异常，Prefix Cache 高达 **96.38%**，谷期总费 **¥13.37**（同 5 题一手对照：Claude Code 5 次试验均值 **28.0% [7/25]**；Ante 0.3.5 同为 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）。
+
+[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系与计划](docs/EVALUATION.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [Terminal-Bench 4.1 冒烟报告](docs/TerminalBench4Eval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
 
 ## 工作原理
 
@@ -32,18 +36,18 @@ CLI M0–M5、工作台 G0–G11、Harness M0–M10，以及 N 阶段（Batch 1�
 flowchart TB
     CLI["CLI<br/>交互、单次任务、恢复"] --> Direct["CLI 装配<br/>配置与终端确认"]
     Web["React 工作台<br/>项目任务、普通对话、审阅"] --> Queue["FastAPI · PostgreSQL 队列 · worker"]
-    Eval["SWE-bench Lite CLI<br/>冻结题目、基线与配方"] --> Batch["逐题运行器"]
+    Eval["评测与 Harbor 入口<br/>SWE-bench Lite · Terminal-Bench 4.1"] --> Batch["SWE-bench 批量运行器<br/>Harbor 原生适配器 (terminal-minimal)"]
 
-    Direct --> Agent["build_agent → 共享 Agent"]
+    Direct --> Agent["build_agent / build_terminal_agent<br/>共享 Agent 主循环"]
     Queue --> Agent
     Batch --> Agent
-    Batch -->|候选补丁| Score["独立官方评分"]
+    Batch -->|候选补丁 / 容器终态| Score["独立官方评分 / Harbor Verifier"]
 
-    Agent --> Context["上下文<br/>项目指令、Skill 目录、历史"]
+    Agent --> Context["上下文<br/>项目指令、Skill 目录、历史与粘性前缀"]
     Agent <-->|模型请求与回复| Model["ModelProvider<br/>DeepSeek、兼容端点、FakeModel"]
-    Agent <-->|工具调用与结果| Tools["ToolRegistry 与 PolicyEngine<br/>路径、版本、风险和授权"]
+    Agent <-->|工具调用与结果| Tools["ToolRegistry 与 PolicyEngine<br/>路径、版本、风险授权或单 bash"]
     Agent --> Journal["RunJournal<br/>消息、操作、检查点与终态"]
-    Tools --> Execution["本机目录或 Git worktree<br/>宿主命令或隔离容器"]
+    Tools --> Execution["本机目录 · Git worktree<br/>一次性验证容器 · Harbor 持久容器"]
     Journal --> SQLite[("SQLite<br/>CLI 与评测")]
     Journal --> PG[("PostgreSQL<br/>Web 会话与事件")]
 
@@ -53,7 +57,7 @@ flowchart TB
     class SQLite,PG storage
 ```
 
-三种入口共用 `build_agent` 和模型—工具循环。CLI 在终端进程中装配，Web 由后台 worker 装配，评测运行器以冻结参数逐题装配。入口分别选择工作目录、权限、执行器和 Journal。Web 队列与会话事件存于同一个 PostgreSQL 实例。 [整体架构](docs/ARCHITECTURE.md#stellarweaver-整体架构) · [共享装配入口](src/stellarweaver/runtime/service.py)
+多种入口共用同一套 `Agent` 主循环、上下文压缩与流式容错引擎：CLI、Web 与 SWE-bench Lite 经 `build_agent` 装配完整工具面；Terminal-Bench 4.1 经 Harbor 原生适配器调用 `build_terminal_agent` 装配容器专用 `terminal-minimal` 单 `bash` 运行时。Web 队列与会话事件存于同一个 PostgreSQL 实例。 [整体架构](docs/ARCHITECTURE.md#stellarweaver-整体架构) · [TB 4.1 调用链](docs/ARCHITECTURE.md#terminal-bench-41harbor调用链) · [共享装配入口](src/stellarweaver/runtime/service.py)
 
 ### 从工作台到 Agent Runtime
 
@@ -248,11 +252,11 @@ uv run --locked --offline python -m stellarweaver.evals.swebench --help
 
 | 范围 | 已记录的进度 |
 | --- | --- |
-| 三道历史开发题 | 2026-11-24 `full` 冒烟实测 2/3 通过（`marshmallow-1359`、`pydicom-1694`），3/3 产出合法补丁。 |
-| 完整开发集（23 题） | 已完成全量 23 题 `full` 实跑（按 6 仓库分批复用官方镜像）：23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题。 |
-| 后续对照与基准迁移 | 待落地 2 项 P0 修复（`edit_file` CRLF 兼容 + 缓存统计修复），随后评估迁移至更干净且有 1017 基线的基准或运行 `test` 300 题消融。 |
+| SWE-bench Lite `dev`（23 题） | 已完成全量 23 题 `full` 实跑（按 6 仓库分批复用官方镜像）：23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题。 |
+| Terminal-Bench 4.1 冒烟（5 题 CPU） | 已通过 Harbor `0.25.0` 完成 5 题跨领域纯 CPU 冒烟（`terminal-minimal` 单 `bash` + DeepSeek Flash `max`）：官方通过 **2/5（40.0%）**，Prefix Cache **96.38%**，谷期总费 ¥13.37；基于 610 次 `bash` 零编辑摩擦决定暂不实施 Phase 3b。 |
+| 后续全量与消融 | 视谷期窗口推进 Terminal-Bench 4.1 63 题无 GPU 全量跑榜，并单独完成 Web Compose 环境变量透传与重建。 |
 
-[评测命令与试跑记录](docs/EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [dev 23 题详细报告](docs/SWEBenchLiteEval.md) · [实验设计](docs/EVALUATION.md#swe-bench-lite-实验设计与对照规划) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
+[评测命令与试跑记录](docs/EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [Terminal-Bench 4.1 冒烟报告](docs/TerminalBench4Eval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ### 回归测试与效果验证
 
@@ -294,6 +298,6 @@ StellarWeaver/
 | [架构与调用链](docs/ARCHITECTURE.md) | 工作台架构、共享运行时、模型、工具、隔离与交付流程。 |
 | [数据库与持久化](docs/DATABASE.md) | PostgreSQL 与 SQLite 的结构、职责、迁移和恢复。 |
 | [工具授权与安全](docs/SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与本地安全夹具。 |
-| [评测体系与实验计划](docs/EVALUATION.md) · [dev 23 题报告](docs/SWEBenchLiteEval.md) | 复现入口、统一评测协议、SWE-bench Lite 命令、全量 `dev` 23 题归因报告与后续迁移规划。 |
-| [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [后续路线图](docs/ROADMAP.md) | M0–M10 与 N 阶段（Batch 1–3）及上下文优化的验收核对和后续计划。 |
+| [评测体系与实验计划](docs/EVALUATION.md) · [SWE-bench dev 23 题](docs/SWEBenchLiteEval.md) · [TB 4.1 冒烟](docs/TerminalBench4Eval.md) | 复现入口、统一评测协议、SWE-bench Lite 与 Terminal-Bench 4.1 实测归因报告。 |
+| [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [演进路线图](docs/StellarWeaver_Harness_Roadmap.md) · [后续路线图](docs/ROADMAP.md) | M0–M10、N 阶段及 Phase 1–4 长程演进的验收核对与后续计划。 |
 | [历史归档索引](docs/archive/README.md) | 已完成规划方案（含 M0–M10 总方案与 N 阶段方案）、历史阶段进度与外部工作流对照。 |

@@ -37,6 +37,8 @@ uv run --offline python -m stellarweaver.demo
 | [工具安全、授权与评测](SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与 Hook、本地安全夹具。 |
 | [评测体系与实验记录](EVALUATION.md) | 复现入口、统一评测协议、SWE-bench Lite 批量评测与分批助手命令、实验汇总与迁移规划。 |
 | [SWE-bench Lite dev 23 题评测报告](SWEBenchLiteEval.md) | 全量 `dev` 23 题逐题明细、上游镜像故障归因、6 道有效失败题轨迹与 Gold Patch 对比及 P0/P1 改进清单。 |
+| [Terminal-Bench 4.1 评测报告](TerminalBench4Eval.md) | Harbor 0.25.0 5 题纯 CPU 冒烟实测（2/5 = 40.0%、Prefix Cache 96.38%）、`ctrf.json` 逐题明细与工程决策。 |
+| [Harness 多阶段演进路线图](StellarWeaver_Harness_Roadmap.md) | Phase 1–4 源码级差距定位、长程容错、Harbor 持久容器适配与谷期跑榜规格书。 |
 | [Harness 实施与验收](HARNESS_ACCEPTANCE.md) | M0–M10 与 N 阶段（Batch 1–3）及上下文优化的实现进度核对与验收证据。 |
 | [后续路线图](ROADMAP.md) | 已完成能力概览、SWE-bench Lite 正式集实验与下一阶段重点。 |
 | [历史归档索引](archive/README.md) | 历史阶段进度、原始设计方案（含 M0–M10 总方案与 N 阶段方案）及外部工作流差距审计。 |
