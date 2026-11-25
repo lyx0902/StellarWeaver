@@ -478,5 +478,377 @@ async def test_harbor_adapter_cache_accounting_ignores_failed_retry_and_aggregat
     assert summary["total_cached_input_tokens"] == 850
 
     markdown = render_markdown_summary([{**report, "resolved": True}])
-    assert "| Resolved | 1 (100.0%) |" in markdown
+    assert "| Resolved (Passed) | 1 (100.0%) |" in markdown
     assert "| Cached Input Tokens | 850 |" in markdown
+
+
+async def test_harbor_docker_runtime_error_timeout_classified_as_command_timeout(
+    tmp_path: Path,
+) -> None:
+    def handle(rec: dict[str, Any]) -> Any:
+        # Mirrors harbor/environments/docker/docker.py:_collect_buffered_output()
+        raise RuntimeError(f"Command timed out after {rec['timeout_sec']} seconds")
+
+    env = _MockHarborEnvironment(handle)
+    model = FakeModel(
+        [
+            AssistantReply(
+                text="",
+                tool_calls=(
+                    ToolCall(
+                        "t1", "bash", json.dumps({"command": "sleep 30", "timeout_seconds": 5})
+                    ),
+                ),
+                stop_reason="tool_calls",
+            ),
+            AssistantReply(text="Handled Docker RuntimeError timeout.", stop_reason="stop"),
+        ]
+    )
+    adapter = StellarWeaverHarborAgent(
+        logs_dir=tmp_path / "docker_timeout",
+        provider=model,
+        stream=False,
+    )
+    report = await adapter.run("Run slow command", env, HarborAgentContext())
+    assert report["outcome"]["run_status"] == "completed"
+    tool = report["tools_invoked"][0]
+    assert tool["status"] == "error"
+    assert tool["data"]["timed_out"] is True
+    assert tool["data"]["code"] == "COMMAND_TIMEOUT"
+    assert tool["data"]["exit_code"] is None
+
+
+async def test_harbor_trial_timeout_propagates_cancellation_and_preserves_telemetry(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    class _SlowEnv:
+        async def exec(
+            self,
+            command: str,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: int | None = None,
+        ) -> Any:
+            await asyncio.sleep(10)
+            return _MockExecResult(stdout="", stderr="", return_code=0)
+
+    model = FakeModel(
+        [
+            AssistantReply(
+                text="",
+                tool_calls=(ToolCall("s1", "bash", json.dumps({"command": "sleep 10"})),),
+                stop_reason="tool_calls",
+                usage={
+                    "prompt_tokens": 900,
+                    "completion_tokens": 30,
+                    "total_tokens": 930,
+                    "prompt_cache_hit_tokens": 400,
+                },
+            ),
+            AssistantReply(text="Never reached", stop_reason="stop"),
+        ]
+    )
+    logs_dir = tmp_path / "timeout_trial"
+    adapter = StellarWeaverHarborAgent(logs_dir=logs_dir, provider=model, stream=False)
+    ctx = HarborAgentContext()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(adapter.run("Slow task", _SlowEnv(), ctx), timeout=0.25)
+
+    # Outer asyncio.wait_for saw TimeoutError AND telemetry was persisted before re-raising.
+    assert ctx.n_input_tokens == 900
+    assert ctx.n_cache_tokens == 400
+    assert ctx.n_output_tokens == 30
+    saved = json.loads((logs_dir / "trial-report.json").read_text(encoding="utf-8"))
+    assert saved["outcome"]["run_status"] == "cancelled"
+    assert saved["cached_input_tokens"] == 400
+
+
+async def test_harbor_trial_archives_sqlite_and_artifacts_under_short_sw_dir(
+    tmp_path: Path,
+) -> None:
+    big_stdout = "line\n" * 40_000  # Exceeds output limit -> triggers artifact offload.
+    env = _MockHarborEnvironment(
+        lambda _rec: _MockExecResult(stdout=big_stdout, stderr="", return_code=0)
+    )
+    model = FakeModel(
+        [
+            AssistantReply(
+                text="",
+                tool_calls=(ToolCall("a1", "bash", json.dumps({"command": "cat big.log"})),),
+                stop_reason="tool_calls",
+                provider_model="deepseek-flash-1017",
+                provider_fingerprint="fp-1017",
+                usage={
+                    "prompt_tokens": 600,
+                    "completion_tokens": 20,
+                    "total_tokens": 620,
+                    "prompt_cache_hit_tokens": 300,
+                },
+            ),
+            AssistantReply(
+                text="Done.",
+                stop_reason="stop",
+                provider_model="deepseek-flash-1017",
+                provider_fingerprint="fp-1017",
+                usage={
+                    "prompt_tokens": 800,
+                    "completion_tokens": 10,
+                    "total_tokens": 810,
+                    "prompt_cache_hit_tokens": 500,
+                },
+            ),
+        ]
+    )
+    logs_dir = tmp_path / "archive_trial" / "agent"
+    cfg = AppConfig(
+        model=ModelConfig(supports_streaming=False, context_window_tokens=512_000),
+        execution=ExecutionConfig(max_output_bytes_per_stream=1024),
+        policy=PolicyConfig(preset="benchmark"),
+        harness=terminal_minimal_harness(),
+    )
+    adapter = StellarWeaverHarborAgent(logs_dir=logs_dir, config=cfg, provider=model, stream=False)
+    report = await adapter.run("Dump log", env, HarborAgentContext())
+
+    sw_dir = logs_dir / "sw"
+    assert sw_dir.is_dir()
+    db_path = logs_dir / report["session_db_relpath"]
+    art_dir = logs_dir / report["artifacts_relpath"]
+    assert db_path.is_file()
+    assert db_path.is_relative_to(sw_dir)
+    assert art_dir.is_dir()
+    assert art_dir.is_relative_to(sw_dir)
+    assert list(art_dir.glob("*.stdout.txt"))
+    assert report["response_models"] == ["deepseek-flash-1017"]
+    assert report["system_fingerprints"] == ["fp-1017"]
+    assert report["config_sha256"]
+
+    manifest = json.loads((logs_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["session_db_relpath"].startswith("sw/")
+    assert manifest["config_sha256"] == report["config_sha256"]
+    assert "source_sha256" in manifest
+
+
+def test_merge_harbor_job_verdicts_priority_and_summary(tmp_path: Path) -> None:
+    from stellarweaver.evals.terminal_bench import collect_harbor_job_reports
+
+    job_dir = tmp_path / "job"
+
+    def write_trial(
+        name: str,
+        *,
+        result_json: dict[str, Any],
+        agent_report: dict[str, Any] | None = None,
+    ) -> None:
+        tdir = job_dir / name
+        (tdir / "agent").mkdir(parents=True)
+        (tdir / "result.json").write_text(json.dumps(result_json), encoding="utf-8")
+        if agent_report is not None:
+            (tdir / "agent" / "trial-report.json").write_text(
+                json.dumps(agent_report), encoding="utf-8"
+            )
+
+    def make_agent(inp: int, cache: int, out: int, cost: float) -> dict[str, Any]:
+        return {
+            "outcome": {"input_tokens": inp, "output_tokens": out},
+            "cached_input_tokens": cache,
+            "estimated_cost_usd": cost,
+        }
+
+    # 1. Passed even with AgentTimeoutError (reward_valid=True and reward >= 1.0 -> passed,
+    # while independently preserving exception_type).
+    write_trial(
+        "trial-1-passed-after-timeout",
+        result_json={
+            "id": "u1",
+            "trial_name": "trial-1",
+            "task_name": "task-a",
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "exception_info": {"exception_type": "AgentTimeoutError", "exception_message": "t"},
+        },
+        agent_report=make_agent(1000, 800, 100, 0.01),
+    )
+    # 2. Timeout with reward 0.0 -> timeout (takes precedence over failed).
+    write_trial(
+        "trial-2-timeout",
+        result_json={
+            "id": "u2",
+            "trial_name": "trial-2",
+            "task_name": "task-b",
+            "verifier_result": {"rewards": {"reward": 0.0}},
+            "exception_info": {"exception_type": "AgentTimeoutError", "exception_message": "t"},
+        },
+        agent_report=make_agent(2000, 1500, 200, 0.02),
+    )
+    # 3. Clean run with reward 0.0 -> failed.
+    write_trial(
+        "trial-3-failed",
+        result_json={
+            "id": "u3",
+            "trial_name": "trial-3",
+            "task_name": "task-c",
+            "verifier_result": {"rewards": {"reward": 0.0}},
+            "exception_info": None,
+        },
+        agent_report=make_agent(1000, 700, 100, 0.01),
+    )
+    # 4. Sandbox infra error (reward_valid=False even if rewards present) -> unscored.
+    write_trial(
+        "trial-4-unscored",
+        result_json={
+            "id": "u4",
+            "trial_name": "trial-4",
+            "task_name": "task-d",
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "exception_info": {"exception_type": "SandboxBuildFailedError", "exception_message": "x"},
+        },
+        agent_report=make_agent(500, 200, 50, 0.005),
+    )
+
+    merged = collect_harbor_job_reports(job_dir)
+    by_name = {item["trial_name"]: item for item in merged}
+    assert by_name["trial-1"]["verdict"] == "passed"
+    assert by_name["trial-1"]["resolved"] is True
+    assert by_name["trial-1"]["exception_type"] == "AgentTimeoutError"
+
+    assert by_name["trial-2"]["verdict"] == "timeout"
+    assert by_name["trial-2"]["resolved"] is False
+
+    assert by_name["trial-3"]["verdict"] == "failed"
+    assert by_name["trial-3"]["resolved"] is False
+
+    assert by_name["trial-4"]["verdict"] == "unscored"
+    assert by_name["trial-4"]["resolved"] is None
+    assert by_name["trial-4"]["reward_valid"] is False
+
+    agg = aggregate_trial_reports(merged)
+    assert agg["tasks"] == 4
+    assert agg["passed"] == 1
+    assert agg["failed"] == 1
+    assert agg["timeout"] == 1
+    assert agg["unscored"] == 1
+    assert agg["resolved"] == 1
+    assert agg["resolved_rate"] == 0.25
+    assert agg["total_input_tokens"] == 4500
+    assert agg["total_cached_input_tokens"] == 3200
+
+    md = render_markdown_summary(merged)
+    assert "| Resolved (Passed) | 1 (25.0%) |" in md
+    assert "| Failed | 1 |" in md
+    assert "| Timeout | 1 |" in md
+    assert "| Unscored | 1 |" in md
+
+
+async def test_streaming_zero_chunk_failure_charges_zero_output_tokens(tmp_path: Path) -> None:
+    class _ZeroChunkFlakyStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capabilities(self) -> ModelCapabilities:
+            return ModelCapabilities(
+                tool_calling=True, streaming=True, context_window_tokens=512_000
+            )
+
+        async def complete(self, request: ModelRequest) -> AssistantReply:
+            raise AssertionError("Expected streaming path")
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls <= 5:
+                raise ProviderError(
+                    "Model connection failed; no response was committed",
+                    retryable=True,
+                    partial_stream=False,
+                )
+            yield ModelStreamEvent(
+                "response.completed",
+                reply=AssistantReply(
+                    text="Recovered after 5 zero-chunk drops.",
+                    stop_reason="stop",
+                    usage={
+                        "prompt_tokens": 1000,
+                        "completion_tokens": 42,
+                        "total_tokens": 1042,
+                        "prompt_cache_hit_tokens": 900,
+                    },
+                ),
+            )
+
+    provider = _ZeroChunkFlakyStream()
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal").model_copy(
+        update={
+            "retry": RetryConfig(max_retries=5, base_delay_seconds=0.0, max_delay_seconds=1.0),
+        }
+    )
+    assert config.limits.max_output_tokens_total == 1_000_000
+    env = _MockHarborEnvironment(lambda _rec: _MockExecResult(stdout="", stderr="", return_code=0))
+    events: list[AgentEvent] = []
+    with SessionStore(tmp_path, data_dir=tmp_path) as store:
+        agent = build_terminal_agent(config, provider, store, env, on_event=events.append)
+        outcome = await agent.run("Test zero-chunk retry accounting")
+
+    assert outcome.run_status == "completed"
+    assert provider.calls == 6
+    # Zero-chunk connection drops must charge 0 output tokens (NOT 5 * 65536).
+    failed_events = [e for e in events if e.type == "model.failed"]
+    assert len(failed_events) == 5
+    assert all(e.payload["output_tokens"] == 0 for e in failed_events)
+    assert outcome.output_tokens == 42
+
+
+async def test_streaming_partial_failure_estimates_from_received_content(tmp_path: Path) -> None:
+    class _PartialDropStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capabilities(self) -> ModelCapabilities:
+            return ModelCapabilities(
+                tool_calling=True, streaming=True, context_window_tokens=512_000
+            )
+
+        async def complete(self, request: ModelRequest) -> AssistantReply:
+            raise AssertionError("Expected streaming path")
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 1:
+                yield ModelStreamEvent("text.delta", text="a" * 400)
+                raise ProviderError(
+                    "stream dropped mid-response",
+                    retryable=True,
+                    partial_stream=True,
+                )
+            yield ModelStreamEvent(
+                "response.completed",
+                reply=AssistantReply(
+                    text="Done",
+                    stop_reason="stop",
+                    usage={
+                        "prompt_tokens": 500,
+                        "completion_tokens": 10,
+                        "total_tokens": 510,
+                        "prompt_cache_hit_tokens": 400,
+                    },
+                ),
+            )
+
+    provider = _PartialDropStream()
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal").model_copy(
+        update={
+            "retry": RetryConfig(max_retries=2, base_delay_seconds=0.0, max_delay_seconds=1.0),
+        }
+    )
+    env = _MockHarborEnvironment(lambda _rec: _MockExecResult(stdout="", stderr="", return_code=0))
+    events: list[AgentEvent] = []
+    with SessionStore(tmp_path, data_dir=tmp_path) as store:
+        agent = build_terminal_agent(config, provider, store, env, on_event=events.append)
+        outcome = await agent.run("Test partial-stream accounting")
+
+    assert outcome.run_status == "completed"
+    failed_events = [e for e in events if e.type == "model.failed"]
+    assert len(failed_events) == 1
+    # 400 bytes received -> ~100 estimated output tokens (NOT 65,536).
+    assert failed_events[0].payload["output_tokens"] == 100
+    assert outcome.output_tokens == 110

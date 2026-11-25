@@ -1,0 +1,25 @@
+# Pinned Harbor 0.25.0 configuration for the 5-task CPU-only Terminal-Bench 4.1 smoke run.
+# Usage (recommended during off-peak hours, Beijing 18:00-09:00 / 12:00-14:00 or weekends):
+#   $env:PYTHONUTF8 = "1"
+#   $env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
+#   .\.venv\Scripts\harbor.exe run --config deploy/harbor-tb41-smoke5.yaml --env-file .env
+jobs_dir: .validation/tb41-smoke5
+n_attempts: 1
+n_concurrent_trials: 1
+environment:
+  type: docker
+  delete: false  # Stop/remove containers after each trial, keep images for fast re-runs.
+agents:
+  - name: stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent
+    model_name: deepseek/deepseek-flash
+    kwargs:
+      reasoning_effort: max
+datasets:
+  - name: terminal-bench/terminal-bench
+    version: "4.1.0"
+    task_names:
+      - terminal-bench/vf2-speedup-networkx
+      - terminal-bench/ks-solver-cpp
+      - terminal-bench/kv-live-surgery
+      - terminal-bench/wal-recovery-ordering
+      - terminal-bench/payments-pipeline-fix
