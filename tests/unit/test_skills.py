@@ -40,7 +40,7 @@ async def test_default_manager_has_no_events_no_extra_tools_and_does_not_read_pr
         async with ExtensionManager(registry, store) as manager:
             assert not manager.skill_catalog
             assert registry.extension_context is None
-            assert len(registry.schemas()) == 8
+            assert len(registry.schemas()) == 10
         assert not store.load_events()
 
 

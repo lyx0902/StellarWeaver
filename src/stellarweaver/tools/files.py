@@ -354,6 +354,87 @@ async def prepare_create_file(args: CreateFileArgs, ctx: ToolContext) -> Prepare
     )
 
 
+def _normalize_lf_with_map(text: str) -> tuple[str, list[int]]:
+    """Convert CRLF to LF while recording each LF index's exact start offset in text."""
+    chars: list[str] = []
+    positions: list[int] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] == "\r" and index + 1 < length and text[index + 1] == "\n":
+            positions.append(index)
+            chars.append("\n")
+            index += 2
+        else:
+            positions.append(index)
+            chars.append(text[index])
+            index += 1
+    positions.append(length)
+    return "".join(chars), positions
+
+
+def _span_line_ending(matched_slice: str, *, pure_crlf: bool) -> str:
+    crlf_count = matched_slice.count("\r\n")
+    lf_only_count = matched_slice.replace("\r\n", "").count("\n")
+    if crlf_count and not lf_only_count:
+        return "\r\n"
+    if lf_only_count and not crlf_count:
+        return "\n"
+    if crlf_count and lf_only_count:
+        return "\r\n" if crlf_count >= lf_only_count else "\n"
+    return "\r\n" if pure_crlf else "\n"
+
+
+def _locate_edit_span(
+    text: str, old_text: str, *, pure_crlf: bool, details: dict[str, Any]
+) -> tuple[int, int, str]:
+    count = text.count(old_text)
+    if count > 1:
+        raise ToolError(
+            "EDIT_AMBIGUOUS",
+            "old_text occurs more than once; provide a larger unique context.",
+            {**details, "matches": count},
+        )
+    if count == 1:
+        start = text.index(old_text)
+        end = start + len(old_text)
+        return start, end, _span_line_ending(text[start:end], pure_crlf=pure_crlf)
+
+    if "\r\n" in text:
+        crlf_old = old_text.replace("\r\n", "\n").replace("\n", "\r\n")
+        if crlf_old != old_text:
+            crlf_count = text.count(crlf_old)
+            if crlf_count > 1:
+                raise ToolError(
+                    "EDIT_AMBIGUOUS",
+                    "old_text occurs more than once; provide a larger unique context.",
+                    {**details, "matches": crlf_count},
+                )
+            if crlf_count == 1:
+                start = text.index(crlf_old)
+                end = start + len(crlf_old)
+                return start, end, "\r\n"
+
+        # Mixed line endings fallback: deterministic LF-normalized matching mapped back to raw offsets.
+        norm_text, orig_pos = _normalize_lf_with_map(text)
+        norm_old = old_text.replace("\r\n", "\n")
+        norm_count = norm_text.count(norm_old)
+        if norm_count > 1:
+            raise ToolError(
+                "EDIT_AMBIGUOUS",
+                "old_text occurs more than once; provide a larger unique context.",
+                {**details, "matches": norm_count},
+            )
+        if norm_count == 1:
+            n_start = norm_text.index(norm_old)
+            n_end = n_start + len(norm_old)
+            start = orig_pos[n_start]
+            end = orig_pos[n_end]
+            return start, end, _span_line_ending(text[start:end], pure_crlf=pure_crlf)
+
+    raise ToolError("EDIT_NOT_FOUND", "old_text does not occur exactly in this file.", details)
+
+
 async def prepare_edit_file(
     args: EditFileArgs | MultiEditFileArgs, ctx: ToolContext
 ) -> PreparedTool:
@@ -375,26 +456,17 @@ async def prepare_edit_file(
     else:
         assert args.old_text is not None and args.new_text is not None
         edits = [EditSpan(old_text=args.old_text, new_text=args.new_text)]
-    crlf = "\r\n" in text and "\n" not in text.replace("\r\n", "")
+    pure_crlf = "\r\n" in text and "\n" not in text.replace("\r\n", "")
     spans: list[tuple[int, int, str, int]] = []
     for index, edit in enumerate(edits, 1):
-        count = text.count(edit.old_text)
         details: dict[str, Any] = {"edit_index": index} if batch else {}
-        if count == 0:
-            raise ToolError(
-                "EDIT_NOT_FOUND", "old_text does not occur exactly in this file.", details
-            )
-        if count > 1:
-            raise ToolError(
-                "EDIT_AMBIGUOUS",
-                "old_text occurs more than once; provide a larger unique context.",
-                {**details, "matches": count},
-            )
-        start = text.index(edit.old_text)
+        start, end, line_ending = _locate_edit_span(
+            text, edit.old_text, pure_crlf=pure_crlf, details=details
+        )
         replacement = edit.new_text
-        if crlf:
+        if line_ending == "\r\n":
             replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
-        spans.append((start, start + len(edit.old_text), replacement, index))
+        spans.append((start, end, replacement, index))
     parts: list[str] = []
     previous_end = 0
     for start, end, replacement, index in sorted(spans):

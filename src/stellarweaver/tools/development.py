@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import replace
 from pathlib import PurePosixPath
@@ -72,6 +73,13 @@ if action == "run_tests":
             argv += ["-k", keyword]
         unittest.main(module=None, argv=argv)
 elif action == "run_linter":
+    if importlib.util.find_spec("ruff") is None:
+        print(json.dumps({
+            "skipped": True,
+            "reason": "ruff_not_installed",
+            "message": "ruff is not installed in this environment; skip linting",
+        }))
+        raise SystemExit(0)
     sys.argv = ["ruff", "check", "--no-cache", "--output-format", "concise", "--", target]
     runpy.run_module("ruff", run_name="__main__")
 elif action == "check_syntax":
@@ -241,7 +249,7 @@ def _prepare(action: Literal["run_tests", "discover_tests", "check_syntax", "run
             await recheck()
             result = await prepared.execute()
             data = result["data"]
-            data["diagnostic"] = {
+            diagnostic: JSONDict = {
                 "action": action,
                 "target": checked.target,
                 "framework": checked.framework,
@@ -253,6 +261,18 @@ def _prepare(action: Literal["run_tests", "discover_tests", "check_syntax", "run
                     data.get(key) for key in ("stdout_truncated", "stderr_truncated")
                 ),
             }
+            if action == "run_linter" and data.get("exit_code") == 0:
+                raw_stdout = str(data.get("stdout", "")).strip()
+                if raw_stdout.startswith("{"):
+                    try:
+                        parsed = json.loads(raw_stdout)
+                    except ValueError:
+                        parsed = None
+                    if isinstance(parsed, dict) and parsed.get("skipped") is True:
+                        diagnostic["skipped"] = True
+                        if isinstance(parsed.get("reason"), str):
+                            diagnostic["reason"] = parsed["reason"]
+            data["diagnostic"] = diagnostic
             return result
 
         invocation = {
@@ -305,7 +325,9 @@ async def _prepare_snippet(args: SnippetArgs, ctx: ToolContext) -> PreparedTool:
     return replace(prepared, invocation=invocation, execute=execute)
 
 
-def register_development_tools(registry: ToolRegistry) -> None:
+def register_development_tools(
+    registry: ToolRegistry, *, include_linter: bool = True
+) -> None:
     descriptions: dict[
         Literal["run_tests", "discover_tests", "check_syntax", "run_linter"], str
     ] = {
@@ -318,6 +340,8 @@ def register_development_tools(registry: ToolRegistry) -> None:
         "run_linter": "Run the image's Ruff checker on a Python file or directory.",
     }
     for action in _TARGET_ACTIONS:
+        if action == "run_linter" and not include_linter:
+            continue
         registry.register(
             action,
             descriptions[action],

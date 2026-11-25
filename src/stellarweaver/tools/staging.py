@@ -78,6 +78,19 @@ def _materialize(root: Path, name: str, data: bytes, executable: bool) -> None:
     target.chmod(0o755 if executable else 0o644)
 
 
+def _encode_replacement(content: str | None, original: bytes | None) -> bytes | None:
+    """Encode replacement text while preserving pure-CRLF original line endings."""
+    if content is None:
+        return None
+    if (
+        original is not None
+        and b"\r\n" in original
+        and b"\n" not in original.replace(b"\r\n", b"")
+    ):
+        content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+    return content.encode("utf-8")
+
+
 def _prepare_patch(
     changes: list[FileChange], ctx: ToolContext
 ) -> tuple[str, bytes, dict[str, tuple[bytes | None, bool]], JSONDict]:
@@ -90,7 +103,7 @@ def _prepare_patch(
         original, executable = _read(ctx, change.path)
         if change.expected_sha256 != _digest(original):
             raise ToolError("FILE_CHANGED", "A patch target changed. Read it again before staging.")
-        replacement = change.content.encode() if change.content is not None else None
+        replacement = _encode_replacement(change.content, original)
         if replacement is not None and b"\0" in replacement:
             raise ToolError("PATCH_UNSUPPORTED", "Binary content is unsupported.")
         if replacement == original:
@@ -212,7 +225,7 @@ async def prepare_apply_patch(args: StagePatchArgs, ctx: ToolContext) -> Prepare
         if previous.digest != hashes[change.path]["before_sha256"]:
             raise ToolError("FILE_CHANGED", "A patch target changed during preparation.")
         mode = previous.mode if previous.mode is not None else NEW_MODE
-        content = change.content.encode() if change.content is not None else None
+        content = _encode_replacement(change.content, previous.content)
         if content is not None and len(content) > PATCH_LIMIT:
             raise ToolError("PATCH_TOO_LARGE", "Replacement bytes exceed the per-file limit.")
         after = FileState(content, mode) if content is not None else FileState()

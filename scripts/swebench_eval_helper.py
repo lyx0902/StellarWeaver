@@ -163,12 +163,19 @@ def cmd_prefetch_assets(args: argparse.Namespace) -> int:
             try:
                 subprocess.run(["git", "-C", str(dest), "init", "-q"], check=True, timeout=30)
                 subprocess.run(
+                    ["git", "-C", str(dest), "config", "core.autocrlf", "false"],
+                    check=True,
+                    timeout=30,
+                )
+                subprocess.run(
                     [
                         "git",
                         "-C",
                         str(dest),
                         "-c",
                         "core.longpaths=true",
+                        "-c",
+                        "core.autocrlf=false",
                         *proxy_args,
                         "fetch",
                         "--depth=1",
@@ -180,7 +187,19 @@ def cmd_prefetch_assets(args: argparse.Namespace) -> int:
                     timeout=180,
                 )
                 subprocess.run(
-                    ["git", "-C", str(dest), "-c", "core.longpaths=true", "checkout", "-q", "--detach", base_commit],
+                    [
+                        "git",
+                        "-C",
+                        str(dest),
+                        "-c",
+                        "core.longpaths=true",
+                        "-c",
+                        "core.autocrlf=false",
+                        "checkout",
+                        "-q",
+                        "--detach",
+                        base_commit,
+                    ],
                     check=True,
                     timeout=60,
                 )

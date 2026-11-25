@@ -93,9 +93,19 @@ def git(root: Path, *argv: str) -> bytes:
 
 
 def checkout(source: Path, destination: Path, base_commit: str | None = None) -> None:
-    git(source, "clone", "--quiet", "--no-hardlinks", "--no-checkout", ".", str(destination))
+    git(
+        source,
+        "-c",
+        "core.autocrlf=false",
+        "clone",
+        "--quiet",
+        "--no-hardlinks",
+        "--no-checkout",
+        ".",
+        str(destination),
+    )
     git(destination, "config", "core.autocrlf", "false")
-    git(destination, "checkout", "--quiet", "--detach", base_commit or BASE)
+    git(destination, "-c", "core.autocrlf=false", "checkout", "--quiet", "--detach", base_commit or BASE)
 
 
 class NoArguments(BaseModel):

@@ -44,7 +44,7 @@ def attach_harness(registry: ToolRegistry, config: AppConfig) -> None:
     if config.harness.development_tools:
         if registry.command_runner is None:
             raise ValueError("Development tools require a configured sandbox")
-        register_development_tools(registry)
+        register_development_tools(registry, include_linter=config.harness.include_linter)
     if config.harness.issue_navigation:
         register_navigation(registry, prefilter=config.harness.navigation_prefilter)
     if config.harness.patch_staging:

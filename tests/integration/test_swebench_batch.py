@@ -638,8 +638,9 @@ def fixture_score(monkeypatch: pytest.MonkeyPatch, *, resolved: bool = True) -> 
 
     def grade(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
         if argv[0] != "docker":
-            directory = Path(argv[6])
-            row = bench.read_json(Path(argv[5]))
+            eval_idx = argv.index("evaluate")
+            row = bench.read_json(Path(argv[eval_idx + 2]))
+            directory = Path(argv[eval_idx + 3])
             calls.append(directory.name)
             bench.save(directory / "report.json", {row["instance_id"]: {"resolved": resolved}})
         return subprocess.CompletedProcess(argv, 0)
