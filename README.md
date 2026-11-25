@@ -22,7 +22,7 @@
 
 ### 当前进展
 
-CLI M0–M5、工作台 G0–G11、Harness M0–M10，以及 N 阶段（Batch 1–3）与三项上下文优化均已完成源码实现与离线验收（586 项离线回归通过）。SWE-bench Lite 的三道历史开发题中，两道候选补丁通过独立官方评分，一道未生成可评分的补丁。已冻结 23 道开发题清单，完整开发集和 300 道测试题的正式基线待运行。 [当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系与计划](docs/EVALUATION.md)
+CLI M0–M5、工作台 G0–G11、Harness M0–M10，以及 N 阶段（Batch 1–3）与三项上下文优化均已完成源码实现与离线验收（586 项离线回归通过）。已完成 SWE-bench Lite `dev` 全量 23 题 `full` Harness 实测（DeepSeek Flash Thinking High · 200k 窗口）：23/23 全部产出合法补丁，官方原始通过 **9/23（39.1%）**，剔除 8 题上游官方镜像损坏后有效通过率 **9/15（60.0%）**，实测 Prefix Cache 命中率 86.67%、闲时均摊 **¥0.20 / 题**。 [当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系与计划](docs/EVALUATION.md) · [dev 23 题详细报告](docs/SWEBenchLiteEval.md)
 
 ## 工作原理
 
@@ -248,11 +248,11 @@ uv run --locked --offline python -m stellarweaver.evals.swebench --help
 
 | 范围 | 已记录的进度 |
 | --- | --- |
-| 三道历史开发题 | Marshmallow 和 Pydicom 的候选补丁通过官方评分。Astroid 的历史尝试因当时预算停止、未生成补丁，记为未评分。 |
-| 完整开发集 | 已冻结 23 道 `dev` 的清单，已有三道题的执行配方。其余环境及完整实跑待验收。 |
-| 正式对照 | 300 道 `test` 基线及仓库导航、失败反馈、上下文等消融已列入实验计划。 |
+| 三道历史开发题 | 2026-11-24 `full` 冒烟实测 2/3 通过（`marshmallow-1359`、`pydicom-1694`），3/3 产出合法补丁。 |
+| 完整开发集（23 题） | 已完成全量 23 题 `full` 实跑（按 6 仓库分批复用官方镜像）：23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题。 |
+| 后续对照与基准迁移 | 待落地 2 项 P0 修复（`edit_file` CRLF 兼容 + 缓存统计修复），随后评估迁移至更干净且有 1017 基线的基准或运行 `test` 300 题消融。 |
 
-[评测命令与试跑记录](docs/EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [实验设计](docs/EVALUATION.md#swe-bench-lite-实验设计与对照规划) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
+[评测命令与试跑记录](docs/EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [dev 23 题详细报告](docs/SWEBenchLiteEval.md) · [实验设计](docs/EVALUATION.md#swe-bench-lite-实验设计与对照规划) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ### 回归测试与效果验证
 
@@ -294,6 +294,6 @@ StellarWeaver/
 | [架构与调用链](docs/ARCHITECTURE.md) | 工作台架构、共享运行时、模型、工具、隔离与交付流程。 |
 | [数据库与持久化](docs/DATABASE.md) | PostgreSQL 与 SQLite 的结构、职责、迁移和恢复。 |
 | [工具授权与安全](docs/SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与本地安全夹具。 |
-| [评测体系与实验计划](docs/EVALUATION.md) | 复现入口、统一评测协议、SWE-bench Lite 命令、实验设计与阶段验收。 |
+| [评测体系与实验计划](docs/EVALUATION.md) · [dev 23 题报告](docs/SWEBenchLiteEval.md) | 复现入口、统一评测协议、SWE-bench Lite 命令、全量 `dev` 23 题归因报告与后续迁移规划。 |
 | [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [后续路线图](docs/ROADMAP.md) | M0–M10 与 N 阶段（Batch 1–3）及上下文优化的验收核对和后续计划。 |
 | [历史归档索引](docs/archive/README.md) | 已完成规划方案（含 M0–M10 总方案与 N 阶段方案）、历史阶段进度与外部工作流对照。 |

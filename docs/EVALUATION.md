@@ -76,38 +76,72 @@ uv run --locked --offline python -m stellarweaver.evals.swebench_contract compar
 - **冻结窗口与预算**：`prepare` 默认冻结 `200,000` token 窗口（兼容旧清单回退 `100,000`），默认不限模型调用次数，每题默认 `max_tool_calls=50`、`max_wall_seconds=360`、`max_input_tokens_total=320,000`、`max_output_tokens_total=16,000`，均可在 `prepare` 阶段自定义冻结（DeepSeek Thinking 推荐 `--max-tool-calls 80 --max-wall-seconds 600 --max-input-tokens-total 3000000 --max-output-tokens-total 64000`，对照两组须保持一致）。
 - **执行配方（`--recipes`）**：按题号或 `owner/repo` 指定 `image`（本地镜像 `sha256:...`）、`pytest_args`、可选 `dependencies`（`--assets` 下的只读依赖目录，容器内通过 `site.addsitedir("/deps")` 加载含 `.pth` 在内的依赖）和 `grader_image`（官方评分镜像 `repo@sha256:...`）。
 - **一键预设与单因素消融**：`run` 支持 `--harness-profile baseline|full`（默认 `baseline` 全关；`full` 开启全部已交付 Harness 能力与 14 项流水线开关，含 `run_tests` 细粒度过滤、`run_python_snippet`、`git_log`/`git_show`、`apply_patch`、只读并发、上下文三项优化与子 Agent 探索），并支持在预设上用 `--no-<开关>` 或显式开关覆盖。展开后的完整配置与 `config_sha256` 冻结写入 `run-settings.json` 防漂移。
-- **Windows 长路径兼容**：基线检出统一传 `-c core.longpaths=true`，避免深层测试路径触发 `Filename too long`。
+- **Windows 兼容与官方镜像复用**：基线检出统一传 `-c core.longpaths=true` 避免深层测试路径报错；补丁校验临时目录使用短路径系统 temp 并开启容错清理避免 `MAX_PATH` 异常；评分器以 `python -I -X utf8` 启动修复中文 Windows 下非 ASCII 测试补丁编码问题，并支持 `evaluate --instance-id` 定向重评。
+- **按仓库分批评测助手（[swebench_eval_helper.py](../scripts/swebench_eval_helper.py)）**：支持直接复用 Docker Hub 官方预构建 SWE-bench 镜像，评测数据与产物统一存放在已 `.gitignore` 忽略的 `SWEBenchLite_Eval/` 目录中：
+  - `prepare-recipes --repo <owner/repo>`：按仓库拉取官方镜像（带 180s 超时 4 次重试）并生成 `recipes.json`；
+  - `prefetch-assets`：带 5 次重试与 `HEAD` 完整性校验预拉取基线提交；
+  - `prune-images --report <合同报告>`：带防误删守卫（仅在 `not_evaluated=0` 且 `evaluation_error=0` 时清理本批镜像，避免本地磁盘膨胀）。
 
 ```powershell
-$swRun = '.validation/swebench-dev-full'
-$swData = '.validation/swebench-lite-dataset/dev.parquet'
+$swRun = 'SWEBenchLite_Eval/runs/dev-full-marshmallow'
+$swData = 'SWEBenchLite_Eval/datasets/dev.parquet'
 $swSha = (Get-FileHash -LiteralPath $swData).Hash.ToLowerInvariant()
 $swGrader = '.validation/swebench-lite-pilot/grader-venv/Scripts/python.exe'
-$swAssets = '.validation/swebench-phase2-assets'
-$swRecipes = "$swAssets/recipes.json"
+$swAssets = 'SWEBenchLite_Eval/assets'
+$swRecipes = 'SWEBenchLite_Eval/recipes/dev-marshmallow.json'
 
-# 1. 冻结清单与预算
+# 1. 按仓库拉取官方镜像并生成配方
+uv run --locked python scripts/swebench_eval_helper.py prepare-recipes `
+  --dataset $swData --grader-python $swGrader --repo marshmallow-code/marshmallow --output $swRecipes
+
+# 2. 冻结清单与预算，并预拉取基线提交
 uv run --locked python -m stellarweaver.evals.swebench prepare `
   --dataset $swData --dataset-sha256 $swSha --split dev `
   --grader-python $swGrader --recipes $swRecipes --output $swRun `
   --context-window-tokens 200000 --max-tool-calls 80 --max-wall-seconds 600 `
-  --max-input-tokens-total 3000000 --max-output-tokens-total 64000 `
-  --instance-id marshmallow-code__marshmallow-1359 `
-  --instance-id pylint-dev__astroid-1333 --instance-id pydicom__pydicom-1694
+  --max-input-tokens-total 3000000 --max-output-tokens-total 64000
+uv run --locked python scripts/swebench_eval_helper.py prefetch-assets `
+  --experiment-dir $swRun --assets $swAssets
 
-# 2. 运行（baseline / full / 单因素覆盖，支持 --fake-scripts 与 --retry-interrupted）
+# 3. 运行（baseline / full / 单因素覆盖，支持 --fake-scripts 与 --retry-interrupted）
 uv run --locked python -m stellarweaver.evals.swebench run `
   --output $swRun --assets $swAssets --env-file .env --harness-profile full --live
 
-# 3. 导出、官方独立评分（swebench==5.0.2 断网容器）与汇总
+# 4. 导出、官方独立评分（支持 --instance-id 定向重评）、汇总、发布看板并清理本批镜像
 uv run --locked python -m stellarweaver.evals.swebench export --output $swRun
 uv run --locked python -m stellarweaver.evals.swebench evaluate --output $swRun --grader-python $swGrader
 uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
+uv run --locked python -m stellarweaver.evals.swebench_contract report $swRun `
+  --output .validation/workbench-experiment/reports/dev-full-marshmallow.json
+uv run --locked python scripts/swebench_eval_helper.py prune-images `
+  --recipes $swRecipes --report .validation/workbench-experiment/reports/dev-full-marshmallow.json
 ```
 
-### 三题实测与官方评分记录
+### SWE-bench Lite 实测与官方评分记录
 
-#### 1. 2026-11-24 Full Harness 实测（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
+#### 1. 2026-11-24 ~ 25 全量 `dev` 23 题 Full Harness 实测（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
+
+> 完整 23 题逐题明细、官方镜像报错堆栈、6 道有效失败题轨迹与 Gold Patch 对比归因，见专题报告 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)。
+
+按 6 个仓库分批执行（预算冻结：`--context-window-tokens 200000 --max-tool-calls 80 --max-wall-seconds 600 --max-input-tokens-total 3000000 --max-output-tokens-total 64000`），全部 6 批合同报告已发布至工作台看板：
+
+| 批次 | 仓库 | 计划题数 | 官方原始成绩 | 上游镜像异常 | 有效镜像成绩 | 工作台报告 |
+| --- | --- | :---: | :---: | :---: | :---: | --- |
+| Batch 1 | `marshmallow-code/marshmallow` | 2 | **2 / 2 (100%)** | 0 | **2 / 2 (100%)** | [dev-full-marshmallow.json](../.validation/workbench-experiment/reports/dev-full-marshmallow.json) |
+| Batch 2 | `pydicom/pydicom` | 5 | **2 / 5 (40.0%)** | 2（pytest 8.3.5 破坏 nose `setup`） | **2 / 3 (66.7%)** | [dev-full-pydicom.json](../.validation/workbench-experiment/reports/dev-full-pydicom.json) |
+| Batch 3 | `pylint-dev/astroid` | 5 | **3 / 5 (60.0%)** | 0 | **3 / 5 (60.0%)** | [dev-full-astroid.json](../.validation/workbench-experiment/reports/dev-full-astroid.json) |
+| Batch 4 | `pvlib/pvlib-python` | 5 | **0 / 5 (0%)** | 5（NumPy 2.0 移除 `np.Inf` + 离线失败） | —（0 有效） | [dev-full-pvlib.json](../.validation/workbench-experiment/reports/dev-full-pvlib.json) |
+| Batch 5 | `sqlfluff/sqlfluff` | 5 | **2 / 5 (40.0%)** | 0 | **2 / 5 (40.0%)** | [dev-full-sqlfluff.json](../.validation/workbench-experiment/reports/dev-full-sqlfluff.json) |
+| Batch 6 | `pyvista/pyvista` | 1 | **0 / 1 (0%)** | 1（缺 `libGL.so.1` + 离线失败） | —（0 有效） | [dev-full-pyvista.json](../.validation/workbench-experiment/reports/dev-full-pyvista.json) |
+| **合计** | **全量 `dev`** | **23** | **9 / 23 (39.1%)** | **8（34.8%）** | **9 / 15 (60.0%)** | 有效口径 Wilson 95% CI `[35.7%, 80.2%]` |
+
+- **端到端稳定性**：**23/23 题全部 `model finished` 并产出合法 `valid_patch`**（0 空补丁、0 非法补丁、0 超时、0 Harness 误杀硬中断）；`pydicom-1413` 核心 `FAIL_TO_PASS` 实际已 **3/3 全过**，仅挂在官方镜像 `pytest 8.3.5` 的 2 个 nose `setup` 回归测试。
+- **精确用量与成本**（由 23 份 `session.sqlite3` 精确汇总，DeepSeek-Flash 闲时定价：命中 ¥0.02/1M、未命中 ¥1.00/1M、输出 ¥4.00/1M）：
+  - 总输入 `19,913,835`（~19.91M）、缓存命中 `17,258,493`（**86.67%** 命中率）、总输出 `386,007`（~0.39M）；
+  - 闲时实测总费用 **¥4.54**（均摊 **¥0.20 / 题**）；单题中位耗时 `148.7s`（均值 `194.5s`，总计 `74.6` 分钟）、中位轮次 `18` 轮。
+- **沉淀的 P0 工程修复项**：① `edit_file` 兼容 Windows CRLF 行尾（消除 `astroid-1196` 连续 8 次 `EDIT_NOT_FOUND` 绕路）；② 修复 `swebench.py` 将 `model.failed` 混入缓存统计导致重试题丢失 `cached_input_tokens` 的问题。
+
+#### 2. 2026-11-24 三题冒烟实测（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
 
 已发布至工作台看板（[full-3tasks-20261124-v2.json](../.validation/workbench-experiment/reports/full-3tasks-20261124-v2.json)、[full-astroid-20261124.json](../.validation/workbench-experiment/reports/full-astroid-20261124.json)），独立官方评分器 `swebench 5.0.2` 裁决结果如下：
 
@@ -118,9 +152,8 @@ uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
 | `pylint-dev__astroid-1333` | `completed` | `valid_patch` | `unresolved` | 32 / 44 | 2,440,849（**89.5%**） | 35,045 | 301s | ¥0.44 |
 
 - **实测观察**：3 题全部干净 `completed` 并产出可应用的 `valid_patch`（0 环境故障、0 评分异常）；DeepSeek 实测 Prefix Cache 命中率达 **82.6%–89.5%**（均值 **88.7%**）；`astroid-1333` 所有 45 项 `PASS_TO_PASS` 通过，未过项为模型改了 `astroid/manager.py` 而非金标准 `astroid/modutils.py`。
-- **成本参考（`deepseek-flash` 官方谷期定价：缓存命中 ¥0.02/1M、未命中 ¥1.00/1M、输出 ¥4.00/1M）**：三题均值约 **¥0.26 / 题**，推算 23 题 `dev` 单组约 **¥5–¥8**，300 题 `test` 单组约 **¥60–¥105**。
 
-#### 2. 2026-11-20 历史 Phase 2 基线试跑（旧 100k 窗口 · 无 Harness 增强）
+#### 3. 2026-11-20 历史 Phase 2 基线试跑（旧 100k 窗口 · 无 Harness 增强）
 
 - `marshmallow-code__marshmallow-1359`：`valid_patch` → **`resolved`**
 - `pydicom__pydicom-1694`：`valid_patch` → **`resolved`**
@@ -137,9 +170,10 @@ uv run --locked python -m stellarweaver.evals.swebench report --output $swRun
 - **执行架构**：Agent 运行器、可见测试容器与官方独立评分器物理隔离；评分阶段仅读取 `predictions.jsonl` 与冻结 `scorer.json`。
 - **工作台看板**：Web「实验记录」以只读方式加载 `.validation/workbench-experiment/reports/*.json`，展示汇总指标、单题终态、用量与两份报告的严格配对差异。
 
-### 阶段目标与消融分组
+### 阶段目标与基准迁移规划
 
-| 阶段 | 数据集与范围 | 目标与分组设计 |
+| 阶段 | 数据集与范围 | 状态与目标 |
 | --- | --- | --- |
-| **开发集配对对照（下一步）** | `dev`（23 题，已冻结清单） | 同预算同窗口下跑 **`baseline` vs `full`** 配对对照，验证整套 Harness 相对基线的解决率、轮次与缓存命中率提升。 |
-| **正式集基线与消融** | `test`（300 题） | ① `baseline`（全关）vs `full`（全开）正式基线；② 单因素消融（`--no-development-tools`、`--no-issue-navigation`、`--no-subagent-exploration`、`--no-sticky-context-checkpoint`、`--repair-controller off|feedback|enforce`）。 |
+| **开发集全量闭环（已完成）** | `dev`（23 题，`--harness-profile full`） | 已完成 6 仓库分批实跑与官方评分：**9/23 原始（39.1%）、9/15 有效镜像（60.0%）**，实测均摊 **¥0.20/题**。同时暴露 `dev` 集 34.8% 上游官方镜像腐化，不适合作为后续主力验收集（详见 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)）。 |
+| **P0 修复与基准迁移（下一步）** | 更干净且有 1017 公开基线的基准（如 Terminal-Bench 4.1 63 题无 GPU 版 / SWE-bench Pro V2 HARD-51） | 先落地 2 项 P0 修复（`edit_file` CRLF 兼容 + `swebench.py` 缓存统计），完成 3 题容器冒烟验收后切入新基准做高信噪比对照。 |
+| **SWE-bench Lite 正式集与消融（按需）** | `test`（300 题） | ① `baseline`（全关）vs `full`（全开）正式基线；② 单因素消融（`--no-development-tools`、`--no-issue-navigation`、`--no-subagent-exploration`、`--no-sticky-context-checkpoint`、`--repair-controller off|feedback|enforce`）。 |
