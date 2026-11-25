@@ -85,6 +85,7 @@ class PolicyEngine:
         allow_sandbox_development: bool = False,
         scoped_test_grants: bool = False,
         allow_benchmark_staging: bool = False,
+        allow_terminal_container: bool = False,
     ) -> None:
         if preset not in {"ask", "read-only", "workspace-edit", "auto", "benchmark"}:
             raise ValueError("Unknown policy preset")
@@ -94,9 +95,13 @@ class PolicyEngine:
         self.approval = approval
         self.allow_sandbox_development = allow_sandbox_development
         self.scoped_test_grants = scoped_test_grants
-        self.benchmark_tools = (
-            BENCHMARK_TOOLS | {"stage_patch"} if allow_benchmark_staging else BENCHMARK_TOOLS
-        )
+        self.allow_terminal_container = allow_terminal_container and preset == "benchmark"
+        tools = set(BENCHMARK_TOOLS)
+        if allow_benchmark_staging:
+            tools.add("stage_patch")
+        if self.allow_terminal_container:
+            tools.add("bash")
+        self.benchmark_tools = frozenset(tools)
         self._grants: tuple[FrozenGrant, ...] = ()
         self._session: set[str] = set()
         if policy_file is not None:
@@ -230,6 +235,7 @@ class PolicyEngine:
                 ],
                 **({"scoped_test_grants": True} if self.scoped_test_grants else {}),
                 **({"benchmark_staging": True} if "stage_patch" in self.benchmark_tools else {}),
+                **({"terminal_container": True} if self.allow_terminal_container else {}),
             }
         )
 

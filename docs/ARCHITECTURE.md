@@ -234,7 +234,8 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 | `edit_file` | 要求 `expected_sha256` 和唯一匹配的旧文本（启用 `multi_edit_tools` 时支持单文件一次最多 64 处非重叠替换），自动兼容 LF/CRLF 及混合行尾的确定性匹配并保留原文件行尾，生成合并差异供预览。授权后复检，将修改前快照和差异保存为制品，再写同目录临时文件并替换。启用 `post_edit_syntax_hook` 时，写入 `.py` 文件后执行内存 `ast.parse` 并将语法诊断附在结果中。 |
 | `apply_patch` | 启用 `multi_file_apply` 后注册。接受带 `expected_sha256` 的最多 12 个文件修改/新建/删除清单，与 `stage_patch` 共用行尾归一化逻辑以保留纯 CRLF 原文件行尾，经双临时目录 `git apply --check` 校验后，先保存全部 `.before` 备份再逐文件原子替换；普通 I/O 异常自动补偿回滚，崩溃混合态由恢复逻辑标记为 `RECOVERY_PATCH_MIXED`，支持 CLI 与 Web 成组撤销。 |
 | `delegate_exploration` | 启用 `subagent_exploration` 后注册。在私密上下文中启动强制 `read-only` 的子 Agent 检索源码与导航符号，共享父运行预算与 Web 周额度，仅回传精简结论与文件 SHA-256 证据。 |
-| `run_command` | 参数采用 argv 和工作目录，返回退出码、输出、超时、取消与清理状态。Web 可注入验证执行器，CLI 默认使用宿主后端。 |
+| `run_command` | 参数采用 argv 和工作目录，默认注入非交互环境变量（`DEBIAN_FRONTEND=noninteractive`、`GIT_TERMINAL_PROMPT=0`、`PIP_NO_INPUT=1`、`CI=true`），支持放宽单命令超时上限至 `1800s`，返回退出码、输出、超时、取消与强进程树清理状态。Web 可注入验证执行器，CLI 默认使用宿主后端。 |
+| `bash`（容器专用） | 仅在 `terminal-minimal` Profile 且 `policy.preset == "benchmark"` + `allow_terminal_container=True` 下注册，绝不暴露给交互式 CLI/Web 或 `swe-python`；通过 Harbor 持久任务容器 `exec` 接口执行命令，默认注入非交互环境变量、支持 `timeout_seconds` 最高 `1800s`、截断超长输出至制品并自然保留容器内后台守护进程。 |
 | `git_status`、`git_diff`、`git_log`、`git_show` | 调用 workspace 范围内的只读 Git 查询（含历史提交与受保护路径过滤），返回版本控制证据。 |
 | `find_symbol`、`find_references`、`find_related_tests` | 按配置启用 Python 静态查询，返回可回读的路径、行号和哈希。 |
 | `run_tests`、`run_python_snippet`、`discover_tests`、`check_syntax`、`run_linter` | 将受控的操作、目标、单测过滤（`selector`/`keyword`）或断网复现脚本交给配置的执行器，返回结构化诊断、退出码和清理状态。`run_linter` 支持 `include_linter` 显式开关（SWE-bench 官方镜像默认关闭），且容器内缺少 `ruff` 时以退出码 0 返回结构化跳过结果（零 Traceback）。 |
@@ -420,6 +421,13 @@ CLI `resume` 打开原 SQLite 会话并协调未闭合操作。Web worker 重启
 3. **离线汇总与配对。** `swebench_contract` 从已有制品生成 Manifest、Attempt、Score 和 Evidence，按计划题数保留所有终态。对照先检查冻结配置、模型、执行环境和评分条件，再配对双方同时有独立判定的题号，记录其余题目的排除原因。 [统一评测契约](../src/stellarweaver/evals/swebench_contract.py) · [验证与复现](EVALUATION.md#swe-bench-lite-批量评测与单题试跑)
 
 本地安全与修复夹具沿用 ToolRegistry、FakeModel 与 SQLite Journal，使用文件哈希、最终内容和模拟接收器进行独立判定，输出单独的夹具报告。SWE-bench Lite 与固定夹具各自拥有运行入口和报告格式。 [安全边界夹具](SECURITY.md#本地工具边界评测) · [M2–M4 夹具验收](HARNESS_ACCEPTANCE.md#m2-m4-固定夹具与授权)
+
+### Harbor / Terminal-Bench 4.1 原生适配链路（`terminal-minimal`）
+
+为兼容非 Python 占比超过 70% 的长程终端任务并严格保持宿主机安全边界，Harness 区分命名 Profile `swe-python`（现有 SWE-bench 增强链路）与容器专用 `terminal-minimal`：
+
+1. **极简容器工具面。** `build_terminal_agent` 在 `policy.preset == "benchmark"` + `allow_terminal_container=True` 下关闭全部宿主机内置文件/Git 工具、`ChangesManager.capture_baseline()`、`RepoMap`、`InstructionLoader` 与 `run_linter`，仅通过 [tools/terminal.py](../src/stellarweaver/tools/terminal.py) 注册单个容器内 `bash` 工具，保留 `sticky_context_checkpoint` 固定前缀、`calibrated_context_budget`、`repair_controller="feedback"`、`length` 安全续写与流式复读检测。
+2. **Harbor 原生执行委托。** [evals/terminal_bench.py](../src/stellarweaver/evals/terminal_bench.py) 中的 `StellarWeaverHarborAgent` 直接对接 Harbor `BaseAgent` 与 `BaseEnvironment.exec()` 接口（默认挂载 `long_horizon_deepseek_flash(harness_profile="terminal-minimal")`），不自行编排 `docker run` 容器或实现 verifier；运行结束后在 `logs_dir` 落盘 `manifest.json`（含 Profile、工具清单与 Preamble 估算）与 `trial-report.json`（仅对 `model.completed` 聚合 `cached_input_tokens` 并记录压缩/续写/软引导/复读重试计数），同时回填 Harbor `AgentContext` 用量字段。
 
 ### 实验记录发布链路
 

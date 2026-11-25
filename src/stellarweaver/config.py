@@ -4,7 +4,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -63,8 +63,8 @@ class ExecutionConfig(StrictConfig):
     image: str | None = None
     profile: Literal["sandbox-workspace", "sandbox-read-only"] = "sandbox-workspace"
     allow_argv: bool = False
-    default_timeout_seconds: int = Field(default=60, ge=1)
-    max_timeout_seconds: int = Field(default=300, ge=1)
+    default_timeout_seconds: int = Field(default=60, ge=1, le=1800)
+    max_timeout_seconds: int = Field(default=300, ge=1, le=1800)
     max_output_bytes_per_stream: int = Field(default=1048576, ge=1024)
 
     @model_validator(mode="after")
@@ -106,7 +106,11 @@ class RetryConfig(StrictConfig):
     max_delay_seconds: float = Field(default=30.0, gt=0, le=120)
 
 
+HarnessProfile = Literal["custom", "swe-python", "terminal-minimal"]
+
+
 class HarnessConfig(StrictConfig):
+    profile: HarnessProfile = "custom"
     development_tools: bool = False
     issue_navigation: bool = False
     repair_controller: Literal["off", "feedback", "enforce"] = "off"
@@ -159,14 +163,99 @@ class AppConfig(StrictConfig):
     harness: HarnessConfig = Field(default_factory=HarnessConfig)
 
 
+def swe_python_harness(*, include_linter: bool = False, **overrides: Any) -> HarnessConfig:
+    """Named profile for Python repository benchmarks (SWE-bench / SWE-bench Pro)."""
+    defaults: dict[str, Any] = {
+        "profile": "swe-python",
+        "development_tools": True,
+        "issue_navigation": True,
+        "repair_controller": "feedback",
+        "patch_staging": True,
+        "task_evidence": True,
+        "budget_guidance": True,
+        "pipeline_metrics": True,
+        "multi_edit_tools": True,
+        "post_edit_syntax_hook": True,
+        "smart_tool_truncation": True,
+        "navigation_prefilter": True,
+        "multi_file_apply": True,
+        "parallel_read_tools": True,
+        "scoped_test_grants": True,
+        "incremental_sandbox_snapshots": True,
+        "import_aware_repomap": True,
+        "subagent_exploration": True,
+        "calibrated_context_budget": True,
+        "sticky_context_checkpoint": True,
+        "protect_fresh_tool_output": True,
+        "include_linter": include_linter,
+        "soft_test_failure_reminder": True,
+        "max_length_continuations": 3,
+        "repeated_failure_soft_threshold": 3,
+        "repeated_failure_hard_threshold": 6,
+        "benchmark_allow_denied_tool_continue": True,
+        "stream_repetition_detection": True,
+        "stream_repetition_max_retries": 2,
+    }
+    defaults.update(overrides)
+    return HarnessConfig.model_validate(defaults)
+
+
+def terminal_minimal_harness(**overrides: Any) -> HarnessConfig:
+    """Named profile for isolated persistent containers (Harbor / Terminal-Bench 4.1)."""
+    defaults: dict[str, Any] = {
+        "profile": "terminal-minimal",
+        "development_tools": False,
+        "issue_navigation": False,
+        "repair_controller": "feedback",
+        "patch_staging": False,
+        "task_evidence": False,
+        "budget_guidance": False,
+        "pipeline_metrics": True,
+        "multi_edit_tools": False,
+        "post_edit_syntax_hook": False,
+        "smart_tool_truncation": True,
+        "navigation_prefilter": False,
+        "multi_file_apply": False,
+        "parallel_read_tools": True,
+        "scoped_test_grants": False,
+        "incremental_sandbox_snapshots": False,
+        "import_aware_repomap": False,
+        "subagent_exploration": False,
+        "calibrated_context_budget": True,
+        "sticky_context_checkpoint": True,
+        "protect_fresh_tool_output": True,
+        "include_linter": False,
+        "soft_test_failure_reminder": False,
+        "max_length_continuations": 3,
+        "repeated_failure_soft_threshold": 3,
+        "repeated_failure_hard_threshold": 6,
+        "benchmark_allow_denied_tool_continue": True,
+        "stream_repetition_detection": True,
+        "stream_repetition_max_retries": 2,
+    }
+    defaults.update(overrides)
+    return HarnessConfig.model_validate(defaults)
+
+
 def long_horizon_deepseek_flash(
     *,
     context_window_tokens: int = 512_000,
     max_output_tokens: int = 65_536,
     max_wall_seconds: int = 3600,
     policy_preset: PolicyPreset = "benchmark",
+    harness_profile: Literal["swe-python", "terminal-minimal"] = "swe-python",
 ) -> AppConfig:
     """Preset for long-horizon DeepSeek-Flash-1017 runs (probed: max_tokens=65536, effort=max)."""
+    harness = (
+        terminal_minimal_harness()
+        if harness_profile == "terminal-minimal"
+        else swe_python_harness(include_linter=False)
+    )
+    execution = (
+        ExecutionConfig(default_timeout_seconds=120, max_timeout_seconds=1800)
+        if harness_profile == "terminal-minimal"
+        else ExecutionConfig()
+    )
     return AppConfig(
         model=ModelConfig(
             provider="deepseek",
@@ -187,38 +276,10 @@ def long_horizon_deepseek_flash(
             max_input_tokens_total=80_000_000,
             max_output_tokens_total=600_000,
         ),
+        execution=execution,
         policy=PolicyConfig(preset=policy_preset),
         retry=RetryConfig(max_retries=5, base_delay_seconds=1.0, max_delay_seconds=60.0),
-        harness=HarnessConfig(
-            development_tools=True,
-            issue_navigation=True,
-            repair_controller="feedback",
-            patch_staging=True,
-            task_evidence=True,
-            budget_guidance=True,
-            pipeline_metrics=True,
-            multi_edit_tools=True,
-            post_edit_syntax_hook=True,
-            smart_tool_truncation=True,
-            navigation_prefilter=True,
-            multi_file_apply=True,
-            parallel_read_tools=True,
-            scoped_test_grants=True,
-            incremental_sandbox_snapshots=True,
-            import_aware_repomap=True,
-            subagent_exploration=True,
-            calibrated_context_budget=True,
-            sticky_context_checkpoint=True,
-            protect_fresh_tool_output=True,
-            include_linter=False,
-            soft_test_failure_reminder=True,
-            max_length_continuations=3,
-            repeated_failure_soft_threshold=3,
-            repeated_failure_hard_threshold=6,
-            benchmark_allow_denied_tool_continue=True,
-            stream_repetition_detection=True,
-            stream_repetition_max_retries=2,
-        ),
+        harness=harness,
     )
 
 

@@ -207,7 +207,7 @@ class ToolRegistry:
 
     def is_command(self, name: str) -> bool:
         tool = self._tools.get(name)
-        return name == "run_command" or (
+        return name in {"run_command", "bash"} or (
             tool is not None and tool.authorization_tool == "run_command"
         )
 
