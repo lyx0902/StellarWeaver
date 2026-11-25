@@ -216,6 +216,32 @@ def _relative_posix(path: Path, base: Path) -> str:
         return path.as_posix()
 
 
+def _safe_execution_fingerprint() -> JSONDict:
+    """Capture code_sha and source_sha256 without failing if `git` is absent from PATH."""
+    try:
+        return execution_fingerprint()
+    except (OSError, Exception):
+        package = Path(__file__).resolve().parents[1]
+        root = package.parents[1]
+        revision: str | None = None
+        head_file = root / ".git" / "HEAD"
+        if head_file.is_file():
+            head_text = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if head_text.startswith("ref: "):
+                ref_path = root / ".git" / head_text[5:].strip()
+                if ref_path.is_file():
+                    revision = ref_path.read_text(encoding="utf-8", errors="ignore").strip()
+            elif len(head_text) == 40:
+                revision = head_text
+        return {
+            "code_sha": revision,
+            "source_sha256": {
+                path.relative_to(package).as_posix(): digest(path.read_bytes())
+                for path in sorted(package.rglob("*.py"))
+            },
+        }
+
+
 class StellarWeaverHarborAgent(_HarborBaseAgent):
     """Harbor-native Agent wrapping StellarWeaver in `terminal-minimal` single-`bash` mode."""
 
@@ -503,7 +529,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "session_id": store.session_id,
                     "session_db_relpath": _relative_posix(store.path, self.logs_dir),
                     "artifacts_relpath": _relative_posix(store.artifacts_dir, self.logs_dir),
-                    **execution_fingerprint(),
+                    **_safe_execution_fingerprint(),
                 }
                 save(self.logs_dir / "manifest.json", manifest)
 

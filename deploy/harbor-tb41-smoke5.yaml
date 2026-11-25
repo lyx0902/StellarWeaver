@@ -1,5 +1,6 @@
 # Pinned Harbor 0.25.0 configuration for the 5-task CPU-only Terminal-Bench 4.1 smoke run.
 # Usage (recommended during off-peak hours, Beijing 18:00-09:00 / 12:00-14:00 or weekends):
+#   $env:PYTHONUTF8 = "1"
 #   $env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
 #   .\.venv\Scripts\harbor.exe run --config deploy/harbor-tb41-smoke5.yaml --env-file .env
 jobs_dir: .validation/tb41-smoke5
