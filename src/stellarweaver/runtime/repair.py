@@ -87,7 +87,9 @@ class RepairController:
         self.notes: JSONDict | None = None
         self._note_subject: str | None = None
 
-    def observe(self, result: ToolResult, *, command: bool) -> tuple[JSONDict | None, bool]:
+    def observe(
+        self, result: ToolResult, *, command: bool, hard_threshold: int = 3
+    ) -> tuple[JSONDict | None, bool]:
         data = result.data
         path = data.get("path")
         if result.status == "ok" and result.tool_name in {
@@ -146,7 +148,9 @@ class RepairController:
         self.failures[key] += 1
         count = self.failures[key]
         stalled = (
-            count >= 3 and result.status == "error" and (command or category == "PATCH_CONFLICT")
+            count >= hard_threshold
+            and result.status == "error"
+            and (command or category == "PATCH_CONFLICT")
         )
         event = {
             "category": "NO_PROGRESS" if stalled else category,

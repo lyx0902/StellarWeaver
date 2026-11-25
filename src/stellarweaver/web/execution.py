@@ -135,6 +135,8 @@ async def run(
             protect_fresh_tool_output=os.getenv("SW_WEB_PROTECT_FRESH_TOOL_OUTPUT") == "1",
             include_linter=os.getenv("SW_WEB_INCLUDE_LINTER", "1") != "0",
             soft_test_failure_reminder=os.getenv("SW_WEB_SOFT_TEST_FAILURE_REMINDER") == "1",
+            max_length_continuations=int(os.getenv("SW_WEB_MAX_LENGTH_CONTINUATIONS", "0")),
+            stream_repetition_detection=os.getenv("SW_WEB_STREAM_REPETITION_DETECTION") == "1",
             repair_controller=(
                 "enforce"
                 if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "enforce"

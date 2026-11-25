@@ -40,6 +40,35 @@ class _CallFragments:
     arguments: list[str] = field(default_factory=list)
 
 
+REPETITION_ERROR_MESSAGE = "Detected repetitive generation loop in stream"
+
+
+def _has_reasoning_repetition(
+    text: str, *, min_chars: int = 1200, min_repeats: int = 16
+) -> bool:
+    """Conservatively detect degenerate tail repetition in reasoning_content only."""
+    if len(text) < min_chars:
+        return False
+    window = text[-4000:]
+    # 1. Exact consecutive short phrase/n-gram loop at the tail (2..80 chars, >= min_repeats).
+    max_period = min(80, len(window) // min_repeats)
+    for period in range(2, max_period + 1):
+        unit = window[-period:]
+        if not unit.strip():
+            continue
+        span = period * min_repeats
+        if window.endswith(unit * min_repeats) and len(window) >= span:
+            return True
+    # 2. Exact consecutive identical short non-empty lines at the tail (>= min_repeats).
+    lines = [line.strip() for line in window.splitlines() if line.strip()]
+    if len(lines) >= min_repeats:
+        tail = lines[-min_repeats:]
+        first = tail[0]
+        if 2 <= len(first) <= 120 and all(line == first for line in tail):
+            return True
+    return False
+
+
 class ChatCompletionAccumulator:
     """Accept one assistant choice and return a reply only after its finish marker.
 
@@ -53,6 +82,9 @@ class ChatCompletionAccumulator:
         max_output_tokens: int,
         max_bytes: int | None = None,
         capture_reasoning: bool = False,
+        detect_repetition: bool = False,
+        repetition_min_chars: int = 1200,
+        repetition_min_repeats: int = 16,
     ) -> None:
         self.max_bytes = (
             max_bytes
@@ -65,6 +97,11 @@ class ChatCompletionAccumulator:
         self._text: list[str] = []
         self._capture_reasoning = capture_reasoning
         self._reasoning: list[str] = []
+        self._detect_repetition = detect_repetition
+        self._repetition_min_chars = repetition_min_chars
+        self._repetition_min_repeats = repetition_min_repeats
+        self._reasoning_chars = 0
+        self._next_repetition_check = repetition_min_chars
         self._calls: dict[int, _CallFragments] = {}
         self._ids: dict[str, int] = {}
         self._stop_reason: str | None = None
@@ -107,6 +144,21 @@ class ChatCompletionAccumulator:
                 self._count(reasoning)
                 self._reasoning.append(reasoning)
                 self.partial |= bool(reasoning)
+                if self._detect_repetition and reasoning:
+                    self._reasoning_chars += len(reasoning)
+                    if self._reasoning_chars >= self._next_repetition_check:
+                        self._next_repetition_check = self._reasoning_chars + 256
+                        if _has_reasoning_repetition(
+                            "".join(self._reasoning),
+                            min_chars=self._repetition_min_chars,
+                            min_repeats=self._repetition_min_repeats,
+                        ):
+                            raise ProviderError(
+                                REPETITION_ERROR_MESSAGE,
+                                retryable=True,
+                                usage=self.usage,
+                                partial_stream=True,
+                            )
         text = delta.content or ""
         if text:
             self._count(text)
@@ -155,7 +207,7 @@ class ChatCompletionAccumulator:
             ToolCall(fragments.call_id, "".join(fragments.names), "".join(fragments.arguments))
             for _, fragments in sorted(self._calls.items())
         )
-        if self._stop_reason != "length":
+        if self._stop_reason not in {"length", "max_tokens"}:
             if any(not call.call_id or not call.name for call in calls):
                 raise self._fail("Model stream ended with incomplete tool call metadata")
             if calls and self._stop_reason != "tool_calls":
