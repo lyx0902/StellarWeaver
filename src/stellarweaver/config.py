@@ -22,6 +22,12 @@ def _default_output_tokens(data: dict[str, object]) -> int:
     return 4096
 
 
+def _default_request_timeout(data: dict[str, object]) -> int:
+    if data.get("provider") == "deepseek" and data.get("thinking") == "enabled":
+        return 240
+    return 90
+
+
 class ModelConfig(StrictConfig):
     provider: Literal["fake", "deepseek", "openai-compatible-chat"] = "fake"
     base_url: str = "https://api.deepseek.com"
@@ -31,7 +37,7 @@ class ModelConfig(StrictConfig):
     reasoning_effort: Literal["low", "high", "max"] = "high"
     context_window_tokens: int = Field(default=DEFAULT_CONTEXT_WINDOW_TOKENS, ge=2048)
     max_output_tokens: int = Field(default_factory=_default_output_tokens, ge=1)
-    request_timeout_seconds: int = Field(default=90, ge=1, le=600)
+    request_timeout_seconds: int = Field(default_factory=_default_request_timeout, ge=1, le=900)
     supports_streaming: bool = False
     supports_tools: bool = True
 
@@ -95,9 +101,9 @@ class ContextConfig(StrictConfig):
 
 
 class RetryConfig(StrictConfig):
-    max_retries: int = Field(default=2, ge=0, le=2)
+    max_retries: int = Field(default=2, ge=0, le=8)
     base_delay_seconds: float = Field(default=0.5, ge=0, le=30)
-    max_delay_seconds: float = Field(default=30.0, gt=0, le=60)
+    max_delay_seconds: float = Field(default=30.0, gt=0, le=120)
 
 
 class HarnessConfig(StrictConfig):
@@ -127,6 +133,20 @@ class HarnessConfig(StrictConfig):
     protect_fresh_tool_output: bool = False
     include_linter: bool = True
     soft_test_failure_reminder: bool = False
+    max_length_continuations: int = Field(default=0, ge=0, le=10)
+    repeated_failure_soft_threshold: int = Field(default=3, ge=1, le=20)
+    repeated_failure_hard_threshold: int = Field(default=3, ge=1, le=20)
+    benchmark_allow_denied_tool_continue: bool = False
+    stream_repetition_detection: bool = False
+    stream_repetition_max_retries: int = Field(default=2, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def failure_threshold_order(self) -> "HarnessConfig":
+        if self.repeated_failure_hard_threshold < self.repeated_failure_soft_threshold:
+            raise ValueError(
+                "repeated_failure_hard_threshold must not be smaller than repeated_failure_soft_threshold"
+            )
+        return self
 
 
 class AppConfig(StrictConfig):
@@ -137,6 +157,69 @@ class AppConfig(StrictConfig):
     context: ContextConfig = Field(default_factory=ContextConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     harness: HarnessConfig = Field(default_factory=HarnessConfig)
+
+
+def long_horizon_deepseek_flash(
+    *,
+    context_window_tokens: int = 512_000,
+    max_output_tokens: int = 65_536,
+    max_wall_seconds: int = 3600,
+    policy_preset: PolicyPreset = "benchmark",
+) -> AppConfig:
+    """Preset for long-horizon DeepSeek-Flash-1017 runs (probed: max_tokens=65536, effort=max)."""
+    return AppConfig(
+        model=ModelConfig(
+            provider="deepseek",
+            base_url="https://api.deepseek.com",
+            model="deepseek-flash",
+            thinking="enabled",
+            reasoning_effort="max",
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            request_timeout_seconds=240,
+            supports_streaming=True,
+            supports_tools=True,
+        ),
+        limits=LimitsConfig(
+            max_model_calls=None,
+            max_tool_calls=300,
+            max_wall_seconds=max_wall_seconds,
+            max_input_tokens_total=80_000_000,
+            max_output_tokens_total=600_000,
+        ),
+        policy=PolicyConfig(preset=policy_preset),
+        retry=RetryConfig(max_retries=5, base_delay_seconds=1.0, max_delay_seconds=60.0),
+        harness=HarnessConfig(
+            development_tools=True,
+            issue_navigation=True,
+            repair_controller="feedback",
+            patch_staging=True,
+            task_evidence=True,
+            budget_guidance=True,
+            pipeline_metrics=True,
+            multi_edit_tools=True,
+            post_edit_syntax_hook=True,
+            smart_tool_truncation=True,
+            navigation_prefilter=True,
+            multi_file_apply=True,
+            parallel_read_tools=True,
+            scoped_test_grants=True,
+            incremental_sandbox_snapshots=True,
+            import_aware_repomap=True,
+            subagent_exploration=True,
+            calibrated_context_budget=True,
+            sticky_context_checkpoint=True,
+            protect_fresh_tool_output=True,
+            include_linter=False,
+            soft_test_failure_reminder=True,
+            max_length_continuations=3,
+            repeated_failure_soft_threshold=3,
+            repeated_failure_hard_threshold=6,
+            benchmark_allow_denied_tool_continue=True,
+            stream_repetition_detection=True,
+            stream_repetition_max_retries=2,
+        ),
+    )
 
 
 def load_config(workspace: Path, config_path: Path | None = None) -> AppConfig:

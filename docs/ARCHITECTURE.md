@@ -171,7 +171,7 @@ flowchart TB
 
 运行结束与验证通过是两项状态。`_finish` 按命令和工作目录保留最新检查；一次成功的内置写入会清除前一版本的有效检查。模型发出结束回复可以让运行达到 `completed`，验证字段仍取决于真实工具结果。Web 交付层另按快照细化检查的新鲜度。
 
-启用修复控制器后，工具失败按断言、依赖、语法或运行时错误、补丁冲突、权限、超时和基础环境等类别归纳。控制器结合当前候选指纹、操作和失败签名统计重复失败，把诊断和建议写入 Journal，并提供给下一轮模型请求。`feedback` 仅提供建议。`enforce` 对同一候选和操作的重复错误实行三次停机规则，适用于命令失败与补丁冲突。后续工具调用由主循环按原权限和预算执行。 [修复控制器](../src/stellarweaver/runtime/repair.py) · [运行时接入](../src/stellarweaver/runtime/loop.py)
+启用修复控制器后，工具失败按断言、依赖、语法或运行时错误、补丁冲突、权限、超时和基础环境等类别归纳。控制器结合当前候选指纹、操作和失败签名统计重复失败，把诊断和建议写入 Journal，并提供给下一轮模型请求。`feedback` 仅提供建议；`enforce` 与主循环的重复失败熔断共享可配置的双级阈值（`repeated_failure_soft_threshold` / `repeated_failure_hard_threshold`，基线默认 `3/3`，`full` 与长程预设为 `3/6`）。当达到软阈值且尚未触发硬停机时，运行时直接将诊断提醒拼接在当前 `tool` 结果文本尾部并记录 `repair.soft_guidance`（不插入额外 `user` 消息，避免打断 DeepSeek Thinking 回合连续性）；达到硬阈值后停机。`benchmark_allow_denied_tool_continue` 仅在 `policy.preset == "benchmark"` 下允许模型在工具被策略拒绝后继续调整策略，交互式 `ask`/`auto` 模式下用户显式拒绝仍立即以 `blocked` 停机。主循环还支持可配的 `length`/`max_tokens` 安全续写（`max_length_continuations`，`full` 与长程预设为 `3`）：对截断且参数 JSON 不完整的 `tool_calls` 严禁执行并整组丢弃；对纯思考耗尽输出上限（无可见文本且无工具调用）写入极短非空占位助手消息并记录 `model.truncated_thinking` 后续写，确保严格的 Role 交替与零空助手消息。 [修复控制器](../src/stellarweaver/runtime/repair.py) · [运行时接入](../src/stellarweaver/runtime/loop.py)
 
 ### 只读子 Agent 探索
 
@@ -202,9 +202,9 @@ flowchart LR
 
 DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`，其中包括有工具调用和无工具调用的助手回复。流式和非流式路径将这部分数据留在进程内。持久化、导出和文本增量只保留公开内容。预算压缩整体保留或移除助手及其工具结果。跨进程续接缺少原始推理时，运行时以历史回复和工具证据生成模型上下文，并移除已归纳的旧助手及工具消息。Journal 仍保存可供核对的回复和工具记录。 [DeepSeek Thinking 协议](https://api-docs.deepseek.com/guides/thinking_mode/)
 
-流式响应经过 `ChatCompletionAccumulator`。文本片段可在到达时以 `text.delta` 通知界面。工具片段按索引合并 ID、函数名和参数，聚合器核对完成标记、工具 ID 与资源上限，随后提交完整的 `AssistantReply`。工具执行位于聚合之后。部分流中断时，事件可记录已经显示的片段，当前不完整回复不会进入工具执行阶段。Provider 能力或用户配置关闭流式时，Agent 使用一次非流式请求。
+流式响应经过 `ChatCompletionAccumulator`。文本片段可在到达时以 `text.delta` 通知界面。工具片段按索引合并 ID、函数名和参数，聚合器核对完成标记、工具 ID 与资源上限，随后提交完整的 `AssistantReply`。工具执行位于聚合之后。启用 `stream_repetition_detection` 后，聚合器仅对 `reasoning_content` 尾部执行低开销滑动窗口复读检测（不监控可见 `content` 或 `tool_calls`，防止误杀重复代码/表格），命中保守连续重复阈值时抛出可重试的 `ProviderError(retryable=True, partial_stream=True)`，复用 `model.interrupted` 与退避重试链路，并受每轮 `stream_repetition_max_retries`（默认 `2`）上限约束。部分流中断时，事件可记录已经显示的片段，当前不完整回复不会进入工具执行阶段。Provider 能力或用户配置关闭流式时，Agent 使用一次非流式请求。
 
-重试由 Agent 管理。一次 HTTP 尝试计入一次模型请求，可重试的网络故障或限流使用退避和 `Retry-After`，入口已配置累计预算时还检查剩余量。遇到服务端上下文长度错误时，运行时尝试以约 70% 的有效窗口重新投影，投影缩小后可再次请求一次。重试复用原有工具结果。用量优先取服务端返回值，缺失或未完整返回时记录估算和不完整标记。`FakeModel` 使用固定回复、JSON 脚本或回调生成同样形状的回复，用于离线验证工具和状态流转。 [Provider 接口](../src/stellarweaver/providers/base.py) · [协议适配](../src/stellarweaver/providers/openai_compatible.py) · [流式聚合](../src/stellarweaver/providers/streaming.py) · [离线模型](../src/stellarweaver/providers/fake.py)
+重试由 Agent 管理（`RetryConfig.max_retries` 最高 `8`、`max_delay_seconds` 最高 `120s`，`ModelConfig.request_timeout_seconds` 最高 `900s` 且 DeepSeek Thinking 默认 `240s`；配置模块另提供 `long_horizon_deepseek_flash()` 长程预设工厂）。一次 HTTP 尝试计入一次模型请求，可重试的网络故障或限流使用退避和 `Retry-After`，入口已配置累计预算时还检查剩余量。遇到服务端上下文长度错误时，运行时尝试以约 70% 的有效窗口重新投影，投影缩小后可再次请求一次。重试复用原有工具结果。用量优先取服务端返回值，缺失或未完整返回时记录估算和不完整标记。`FakeModel` 使用固定回复、JSON 脚本或回调生成同样形状的回复，用于离线验证工具和状态流转。 [Provider 接口](../src/stellarweaver/providers/base.py) · [协议适配](../src/stellarweaver/providers/openai_compatible.py) · [流式聚合](../src/stellarweaver/providers/streaming.py) · [离线模型](../src/stellarweaver/providers/fake.py)
 
 ### 上下文与指令
 

@@ -143,8 +143,8 @@ class Agent:
         adaptive_round_retention: bool = False,
         enforce_exploration_caps: bool = False,
     ) -> None:
-        if not 0 <= max_retries <= 2:
-            raise ValueError("max_retries must be between 0 and 2")
+        if not 0 <= max_retries <= 8:
+            raise ValueError("max_retries must be between 0 and 8")
         if retry_base_seconds < 0 or max_retry_delay_seconds <= 0:
             raise ValueError("Invalid retry delay")
         self.system_prompt = system_prompt if system_prompt is not None else SYSTEM
@@ -231,6 +231,7 @@ class Agent:
         self._failure_repeats = 0
         self._chunk_index = 0
         self._soft_reminder_sent = False
+        self._length_continuations = 0
         self._task_evidence = (
             TaskEvidence()
             if (
@@ -335,7 +336,7 @@ class Agent:
             and self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls
         )
 
-    async def _result(self, result: ToolResult) -> None:
+    async def _result(self, result: ToolResult, *, model_note: str | None = None) -> None:
         event = self.store.record_result(self._assistant_id, result)
         if self._task_evidence is not None:
             self._task_evidence.observe(result, event.seq)
@@ -343,9 +344,12 @@ class Agent:
         self._pending_calls = [
             call for call in self._pending_calls if call.call_id != result.call_id
         ]
+        payload = asdict(result)
+        if model_note:
+            payload["content"] = result.content + model_note
         self.messages.append(
             Message(
-                "tool", json.dumps(asdict(result), ensure_ascii=False), tool_call_id=result.call_id
+                "tool", json.dumps(payload, ensure_ascii=False), tool_call_id=result.call_id
             )
         )
         await self._publish(event)
@@ -598,39 +602,80 @@ class Agent:
     async def _observe_tool(
         self, call: ToolCall, result: ToolResult, stop: tuple[RunStatus, str] | None
     ) -> tuple[RunStatus, str] | None:
-        await self._result(result)
+        soft_threshold = self.harness_config.repeated_failure_soft_threshold
+        hard_threshold = self.harness_config.repeated_failure_hard_threshold
+        repair_event: JSONDict | None = None
+        repair_stalled = False
         if self._repair is not None:
-            event, stalled = self._repair.observe(
-                result, command=self.registry.is_command(call.name)
+            repair_event, repair_stalled = self._repair.observe(
+                result, command=self.registry.is_command(call.name), hard_threshold=hard_threshold
             )
-            if event is not None:
-                await self._emit("repair.diagnostic", event)
-            if stalled and stop is None:
-                stop = ("failed", "repair controller: repeated failure without a changed candidate")
+        soft_guidance: str | None = None
+        if result.status == "error" and self._stop_on_repeated_tool_failure:
+            failure_key = json.dumps(
+                [call.name, stable_arguments(call.arguments_json), stable_failure(result.data)],
+                sort_keys=True,
+            )
+            self._failure_repeats = (
+                self._failure_repeats + 1 if self._last_failure == failure_key else 1
+            )
+            self._last_failure = failure_key
+            if self._failure_repeats >= hard_threshold:
+                reason = (
+                    "three identical tool failures"
+                    if hard_threshold == 3
+                    else f"{hard_threshold} identical tool failures"
+                )
+                stop = ("failed", reason)
+            elif (
+                stop is None
+                and hard_threshold > soft_threshold
+                and self._failure_repeats >= soft_threshold
+            ):
+                suggestion = (
+                    str(repair_event["next_step"])
+                    if isinstance(repair_event, dict) and repair_event.get("next_step")
+                    else "Inspect the full error output and change your approach instead of repeating the identical call."
+                )
+                soft_guidance = (
+                    f"\n[Harness diagnostic: this identical tool call and error has repeated "
+                    f"{self._failure_repeats} times (hard stop at {hard_threshold}). "
+                    f"Do not repeat the same call unchanged. {suggestion}]"
+                )
+        elif result.status == "ok":
+            self._last_failure = None
+            self._failure_repeats = 0
+
+        await self._result(result, model_note=soft_guidance)
+        if repair_event is not None:
+            await self._emit("repair.diagnostic", repair_event)
+        if soft_guidance is not None:
+            await self._emit(
+                "repair.soft_guidance",
+                {
+                    "tool": call.name,
+                    "repeat_count": self._failure_repeats,
+                    "soft_threshold": soft_threshold,
+                    "hard_threshold": hard_threshold,
+                },
+            )
+        if repair_stalled and stop is None:
+            stop = ("failed", "repair controller: repeated failure without a changed candidate")
         if self._cancel_requested and stop is None:
             stop = ("cancelled", "user cancelled")
+        allow_denied_continue = (
+            self.harness_config.benchmark_allow_denied_tool_continue
+            and self.registry.policy.preset == "benchmark"
+        )
         if stop is None and (
-            result.status == "blocked" or (result.status == "denied" and self._stop_on_denied_tool)
+            result.status == "blocked"
+            or (result.status == "denied" and self._stop_on_denied_tool and not allow_denied_continue)
         ):
             stop = ("blocked", result.content)
         elif result.status == "cancelled" and stop is None:
             stop = ("cancelled", result.content)
         elif result.status == "unknown" and stop is None:
             stop = ("failed", "execution state unknown; do not rerun automatically")
-        elif result.status == "error" and self._stop_on_repeated_tool_failure:
-            fingerprint = json.dumps(
-                [call.name, stable_arguments(call.arguments_json), stable_failure(result.data)],
-                sort_keys=True,
-            )
-            self._failure_repeats = (
-                self._failure_repeats + 1 if self._last_failure == fingerprint else 1
-            )
-            self._last_failure = fingerprint
-            if self._failure_repeats >= 3:
-                stop = ("failed", "three identical tool failures")
-        elif result.status == "ok":
-            self._last_failure = None
-            self._failure_repeats = 0
         return stop
 
     def _checked_request(self, request: ModelRequest, input_estimate: int) -> ModelRequest:
@@ -787,6 +832,7 @@ class Agent:
         if request.web_search:
             settings["purpose"] = DS_SEARCH
         retries = min(1, self.max_retries) if exploration is not None else self.max_retries
+        repetition_retries = 0
         for retry_index in range(retries + 1):
             request = self._checked_request(request, input_estimate)
             self._request_sequence += 1
@@ -911,7 +957,17 @@ class Agent:
                             "reason": "provider failure",
                         },
                     )
-                if not error.retryable or retry_index >= retries:
+                is_repetition = "repetitive generation loop" in str(error).lower()
+                if is_repetition:
+                    repetition_retries += 1
+                if (
+                    not error.retryable
+                    or retry_index >= retries
+                    or (
+                        is_repetition
+                        and repetition_retries > self.harness_config.stream_repetition_max_retries
+                    )
+                ):
                     raise error from None
                 # A retry is another full request, never a tool replay.
                 self._checked_request(request, input_estimate)
@@ -1247,7 +1303,15 @@ class Agent:
             if sticky:
                 self._context_baseline = ContextBaseline(history, projection.history)
         self._instruction_seen = set(fingerprint)
-        return ModelRequest(projection.messages, schemas, output), projection
+        return (
+            ModelRequest(
+                projection.messages,
+                schemas,
+                output,
+                detect_repetition=self.harness_config.stream_repetition_detection,
+            ),
+            projection,
+        )
 
     def projected_history(self) -> tuple[Message, ...]:
         """Current model conversation boundary; raw session messages remain complete."""
@@ -1611,6 +1675,50 @@ class Agent:
         await self._emit("convergence.reminder", {"unresolved_failures": failures})
         return True
 
+    @staticmethod
+    def _valid_tool_calls(calls: tuple[ToolCall, ...]) -> bool:
+        seen: set[str] = set()
+        for call in calls:
+            if not call.call_id or not call.name or call.call_id in seen:
+                return False
+            seen.add(call.call_id)
+            try:
+                parsed = json.loads(call.arguments_json)
+            except ValueError:
+                return False
+            if not isinstance(parsed, dict):
+                return False
+        return True
+
+    def _can_continue_on_length(self) -> bool:
+        if (
+            self.harness_config.max_length_continuations <= 0
+            or self._length_continuations >= self.harness_config.max_length_continuations
+        ):
+            return False
+        if self._time_exhausted():
+            return False
+        if self.enforce_run_budget:
+            if (
+                self._input_tokens > self.limits.max_input_tokens_total
+                or self._output_tokens >= self.limits.max_output_tokens_total
+            ):
+                return False
+            model_limit = self.limits.max_model_calls
+            if model_limit is not None and self._model_calls >= model_limit:
+                return False
+        return True
+
+    async def _commit_assistant(self, assistant: Message) -> None:
+        self.messages.append(assistant)
+        self._assistant_id = self.store.record_assistant(assistant)
+        self._operations = {
+            call.call_id: self.store.operation_id_for(self._assistant_id, call.call_id)
+            for call in assistant.tool_calls
+        }
+        self._pending_calls = list(assistant.tool_calls)
+        await self._publish(self.store.last_event)
+
     async def _drive(self) -> tuple[RunStatus, str, str]:
         if self.harness_config != HarnessConfig():
             await self._emit("harness.profile", self.harness_config.model_dump())
@@ -1638,6 +1746,94 @@ class Agent:
                     reply = await self._request_model(request, smaller.size)
                 except ProviderError as retry_error:
                     return self._completion("failed", str(retry_error))
+            if reply.stop_reason in {"length", "max_tokens"} and self._can_continue_on_length():
+                self._length_continuations += 1
+                attempt = self._length_continuations
+                if reply.tool_calls:
+                    if self._valid_tool_calls(reply.tool_calls):
+                        assistant = Message(
+                            "assistant",
+                            reply.text,
+                            reply.tool_calls,
+                            reasoning_content=reply.reasoning_content,
+                        )
+                        await self._commit_assistant(assistant)
+                        await self._emit(
+                            "model.length_continuation",
+                            {"attempt": attempt, "reason": "complete_tool_calls_on_length"},
+                        )
+                        stop = await self._tools(reply, None)
+                        if stop is not None:
+                            return self._completion(*stop, final_text=reply.text)
+                        continue
+                    # Drop truncated/invalid tool calls; commit non-empty visible text or placeholder.
+                    visible_text = (
+                        reply.text
+                        if reply.text.strip()
+                        else "[Response truncated during tool call generation at output token limit.]"
+                    )
+                    await self._commit_assistant(
+                        Message(
+                            "assistant",
+                            visible_text,
+                            (),
+                            reasoning_content=reply.reasoning_content,
+                        )
+                    )
+                    await self._emit(
+                        "model.length_continuation",
+                        {
+                            "attempt": attempt,
+                            "reason": "truncated_tool_calls",
+                            "dropped_tool_calls": len(reply.tool_calls),
+                        },
+                    )
+                    follow_up = Message(
+                        "user",
+                        "Your previous response hit the output token limit while generating tool "
+                        "call arguments, so the incomplete tool call was discarded. Continue from "
+                        "where you left off without repeating completed work.",
+                    )
+                    self.store.append_message(follow_up)
+                    self.messages.append(follow_up)
+                    continue
+                if not reply.text.strip():
+                    await self._commit_assistant(
+                        Message(
+                            "assistant",
+                            "[Thinking truncated at output token limit.]",
+                            (),
+                            reasoning_content=reply.reasoning_content,
+                        )
+                    )
+                    await self._emit(
+                        "model.truncated_thinking",
+                        {"attempt": attempt, "stop_reason": reply.stop_reason},
+                    )
+                    follow_up = Message(
+                        "user",
+                        "Your previous thinking hit the output token limit before producing a "
+                        "response or tool call. Keep reasoning concise and directly output your "
+                        "next tool call or final answer.",
+                    )
+                    self.store.append_message(follow_up)
+                    self.messages.append(follow_up)
+                    continue
+                await self._commit_assistant(
+                    Message("assistant", reply.text, (), reasoning_content=reply.reasoning_content)
+                )
+                await self._emit(
+                    "model.length_continuation",
+                    {"attempt": attempt, "reason": "truncated_text"},
+                )
+                follow_up = Message(
+                    "user",
+                    "Your previous response hit the output token limit before completing. "
+                    "Continue from where you left off without repeating completed work.",
+                )
+                self.store.append_message(follow_up)
+                self.messages.append(follow_up)
+                continue
             ids = [call.call_id for call in reply.tool_calls]
             if len(ids) != len(set(ids)) or any(not identifier for identifier in ids):
                 return self._completion(
@@ -1649,14 +1845,7 @@ class Agent:
             assistant = Message(
                 "assistant", reply.text, reply.tool_calls, reasoning_content=reply.reasoning_content
             )
-            self.messages.append(assistant)
-            self._assistant_id = self.store.record_assistant(assistant)
-            self._operations = {
-                call.call_id: self.store.operation_id_for(self._assistant_id, call.call_id)
-                for call in reply.tool_calls
-            }
-            self._pending_calls = list(reply.tool_calls)
-            await self._publish(self.store.last_event)
+            await self._commit_assistant(assistant)
             initial_stop: tuple[RunStatus, str] | None = None
             if reply.stop_reason not in {"stop", "tool_calls", "end_turn"}:
                 initial_stop = ("failed", f"incomplete model response: {reply.stop_reason}")

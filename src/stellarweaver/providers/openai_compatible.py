@@ -356,6 +356,7 @@ class OpenAICompatibleChatProvider:
             capture_reasoning=(
                 self._thinking_enabled and not request.disable_thinking and bool(request.tools)
             ),
+            detect_repetition=request.detect_repetition,
         )
         try:
             response = await self._client.chat.completions.create(

@@ -198,6 +198,11 @@ class RunConfiguration:
                 **{name: explicit(name, full) for name in _HARNESS_SWITCHES},
                 "include_linter": explicit("include_linter", False),
                 "repair_controller": explicit("repair_controller", "feedback" if full else "off"),
+                "max_length_continuations": 3 if full else 0,
+                "repeated_failure_soft_threshold": 3,
+                "repeated_failure_hard_threshold": 6 if full else 3,
+                "benchmark_allow_denied_tool_continue": full,
+                "stream_repetition_detection": full,
                 **{
                     name: getattr(args, name)
                     for name in _EXPLORATION_OPTIONS
@@ -361,6 +366,7 @@ def prepare(args: argparse.Namespace) -> None:
     )
     model = ModelConfig(
         provider="deepseek",
+        reasoning_effort=getattr(args, "reasoning_effort", "high"),
         context_window_tokens=getattr(args, "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS),
     )
     manifest: JSONDict = {
@@ -1078,6 +1084,12 @@ def parser() -> argparse.ArgumentParser:
     prepare_cmd.add_argument("--recipes", type=Path)
     prepare_cmd.add_argument(
         "--context-window-tokens", type=int, default=DEFAULT_CONTEXT_WINDOW_TOKENS
+    )
+    prepare_cmd.add_argument(
+        "--reasoning-effort",
+        choices=("low", "high", "max"),
+        default="high",
+        help="DeepSeek thinking reasoning_effort frozen in manifest (default: high)",
     )
     for name, default in LIMITS.items():
         prepare_cmd.add_argument(
