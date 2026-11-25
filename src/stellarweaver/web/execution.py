@@ -133,6 +133,8 @@ async def run(
             calibrated_context_budget=os.getenv("SW_WEB_CALIBRATED_CONTEXT_BUDGET") == "1",
             sticky_context_checkpoint=os.getenv("SW_WEB_STICKY_CONTEXT_CHECKPOINT") == "1",
             protect_fresh_tool_output=os.getenv("SW_WEB_PROTECT_FRESH_TOOL_OUTPUT") == "1",
+            include_linter=os.getenv("SW_WEB_INCLUDE_LINTER", "1") != "0",
+            soft_test_failure_reminder=os.getenv("SW_WEB_SOFT_TEST_FAILURE_REMINDER") == "1",
             repair_controller=(
                 "enforce"
                 if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "enforce"

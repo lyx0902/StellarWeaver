@@ -92,7 +92,7 @@ async def test_multi_edit_original_bytes_single_replace_and_undo(
                 agent = build_agent(config, FakeModel([*responses, AssistantReply("Done")]), store)
                 if not enabled:
                     assert sha256(canonical_json(agent.registry.schemas())).hexdigest() == (
-                        "d46214165da2a031b74951587510d242a7c751102c36a090bb3235ed6dd09e70"
+                        "71dcf99f3d0129444147c04f1c44df7bc239619ad222b255de6b3647aec074b6"
                     )
                 outcome = await agent.run("Modify the three assignments")
                 count = 1 if enabled else 3
@@ -195,7 +195,7 @@ async def test_syntax_diagnostic_reaches_next_model_and_metrics_use_real_usage(
         )
         agent = build_agent(config, FakeModel(visitor), store)
         assert sha256(canonical_json(agent.registry.schemas())).hexdigest() == (
-            "d46214165da2a031b74951587510d242a7c751102c36a090bb3235ed6dd09e70"
+            "71dcf99f3d0129444147c04f1c44df7bc239619ad222b255de6b3647aec074b6"
         )
         outcome = await agent.run("Edit and inspect the syntax diagnostic")
         assert outcome.run_status == "completed"

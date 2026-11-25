@@ -215,7 +215,7 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 - **问题驱动导航。** 启用后，`IssueSignals` 从任务提取路径、符号、异常和测试线索，辅助 Repo Map 排序。`find_symbol`、`find_references` 和 `find_related_tests` 通过 Python AST 查找定义、静态引用和相关测试，返回路径、行号、SHA-256、耗时和覆盖状态。启用 `navigation_prefilter` 后，超过 100 个 `.py` 文件的仓库先按目标符号名全仓库字节预筛（并通过 `NavigationSources` 按文件元数据指纹做有界缓存复用），再对命中文件执行 AST 解析。动态绑定和扫描范围之外的关系仍存在不确定性。 [Python 导航](../src/stellarweaver/context/navigation.py)
 - **窗口计算与动态校准。** DeepSeek Thinking 默认从 200,000 token 窗口中预留 16,384 token 输出和 2,048 token 安全余量，估算输入额度为 181,568 token。其他 provider 和 Non-thinking 默认预留 4,096 token 输出。工具 schema 同样占用窗口。基础计量采用保守的 UTF-8 JSON 字节估算；启用 `calibrated_context_budget` 后，运行时取最近 6 个有效服务端 `prompt_tokens` 样本的最大换算率乘 1.05（钳位到 `[0.30, 1.0]`）动态校准估算系数，显著降低过早压缩。启用 `pipeline_metrics` 时，`model.completed` 额外记录估算误差比。
 - **历史压缩与粘性前缀。** 默认在估算输入达到可用额度的 80% 时尝试压缩，目标为 55%。系统消息和最新用户任务优先保留。常规压缩保护最近六个完整助手回合及最近六个完整工具回合。启用 `smart_tool_truncation` 后，超长工具输出按 35% 头部 + 65% 尾部保留（并为 `stdout`/`stderr` 各自留额），避免丢失末尾的 `FAILED` 与断言堆栈；启用 `protect_fresh_tool_output` 时，最近 `fresh_tool_rounds`（默认 2）轮工具输出全文逐字节保留；启用 `sticky_context_checkpoint` 后，压缩后的历史前缀检查点保持固定，可变证据作为请求后缀更新，减少重复压缩并提升前缀缓存稳定性。用于下一次模型请求的工具调用和对应结果始终成组处理，原始消息仍由 Journal 完整保存。 [压缩配置](../src/stellarweaver/config.py) · [上下文投影](../src/stellarweaver/context/manager.py)
-- **任务证据。** 运行内可选投影从工具结果提取路径、文件哈希、测试状态和暂存补丁引用。每条保留事件序号和操作 ID，准备请求时重新核对文件状态。Web 的跨轮证据由 PostgreSQL Journal 另行投影，按当前 worktree 标注文件及检查是否仍适用。 [运行内证据](../src/stellarweaver/runtime/task_evidence.py) · [跨轮证据](../src/stellarweaver/web/continuation.py)
+- **任务证据与软收敛提醒。** 运行内可选投影从工具结果提取路径、文件哈希、测试状态和暂存补丁引用（覆盖 `edit_file`、`create_file` 与按 `files` 展开的 `apply_patch` 增删改）。每条保留事件序号和操作 ID，准备请求时重新核对文件状态。启用 `soft_test_failure_reminder` 时，在当前编辑指纹下按 `(tool_name, target, selector, keyword)` 追踪未解决失败测试集合；若模型在 `completion_check` 关闭时试图直接结束且仍有未复测通过的失败测试，主循环最多注入 1 次 `convergence.reminder` 轻量提醒（防止死循环）。Web 的跨轮证据由 PostgreSQL Journal 另行投影，按当前 worktree 标注文件及检查是否仍适用。 [运行内证据](../src/stellarweaver/runtime/task_evidence.py) · [跨轮证据](../src/stellarweaver/web/continuation.py)
 
 窗口约束单次模型请求。CLI 的 `LimitsConfig` 默认约束每次运行的模型调用、工具调用和总时长，分别为 30 次、100 次和 900 秒，累计输入和输出分别为 1,000,000 与 30,000 token。独立评测用冻结的运行配置。启用总预算约束的运行可生成阶段余量提示。Web 用单次模型窗口、操作自身超时和账户 UTC 周额度控制运行，累计调用和用量仍写入 Journal。 [历史投影](../src/stellarweaver/context/manager.py) · [运行预算](../src/stellarweaver/runtime/loop.py) · [Web 装配](../src/stellarweaver/web/execution.py)
 
@@ -231,13 +231,13 @@ DeepSeek Thinking 的工具对话需要回传保留轮次的 `reasoning_content`
 | `read_file` | 读取指定行范围，返回内容、行号和文件字节的 SHA-256，供后续读写核对。 |
 | `search_text` | 按工作区范围执行搜索。优先使用 `rg`，缺少时由 Python 实现搜索。 |
 | `create_file` | 预先检查目标路径，再以排他方式创建，防止覆盖已存在的文件。 |
-| `edit_file` | 要求 `expected_sha256` 和唯一匹配的旧文本（启用 `multi_edit_tools` 时支持单文件一次最多 64 处非重叠替换），生成合并差异供预览。授权后复检，将修改前快照和差异保存为制品，再写同目录临时文件并替换。启用 `post_edit_syntax_hook` 时，写入 `.py` 文件后执行内存 `ast.parse` 并将语法诊断附在结果中。 |
-| `apply_patch` | 启用 `multi_file_apply` 后注册。接受带 `expected_sha256` 的最多 12 个文件修改/新建/删除清单，经双临时目录 `git apply --check` 校验后，先保存全部 `.before` 备份再逐文件原子替换；普通 I/O 异常自动补偿回滚，崩溃混合态由恢复逻辑标记为 `RECOVERY_PATCH_MIXED`，支持 CLI 与 Web 成组撤销。 |
+| `edit_file` | 要求 `expected_sha256` 和唯一匹配的旧文本（启用 `multi_edit_tools` 时支持单文件一次最多 64 处非重叠替换），自动兼容 LF/CRLF 及混合行尾的确定性匹配并保留原文件行尾，生成合并差异供预览。授权后复检，将修改前快照和差异保存为制品，再写同目录临时文件并替换。启用 `post_edit_syntax_hook` 时，写入 `.py` 文件后执行内存 `ast.parse` 并将语法诊断附在结果中。 |
+| `apply_patch` | 启用 `multi_file_apply` 后注册。接受带 `expected_sha256` 的最多 12 个文件修改/新建/删除清单，与 `stage_patch` 共用行尾归一化逻辑以保留纯 CRLF 原文件行尾，经双临时目录 `git apply --check` 校验后，先保存全部 `.before` 备份再逐文件原子替换；普通 I/O 异常自动补偿回滚，崩溃混合态由恢复逻辑标记为 `RECOVERY_PATCH_MIXED`，支持 CLI 与 Web 成组撤销。 |
 | `delegate_exploration` | 启用 `subagent_exploration` 后注册。在私密上下文中启动强制 `read-only` 的子 Agent 检索源码与导航符号，共享父运行预算与 Web 周额度，仅回传精简结论与文件 SHA-256 证据。 |
 | `run_command` | 参数采用 argv 和工作目录，返回退出码、输出、超时、取消与清理状态。Web 可注入验证执行器，CLI 默认使用宿主后端。 |
 | `git_status`、`git_diff`、`git_log`、`git_show` | 调用 workspace 范围内的只读 Git 查询（含历史提交与受保护路径过滤），返回版本控制证据。 |
 | `find_symbol`、`find_references`、`find_related_tests` | 按配置启用 Python 静态查询，返回可回读的路径、行号和哈希。 |
-| `run_tests`、`run_python_snippet`、`discover_tests`、`check_syntax`、`run_linter` | 将受控的操作、目标、单测过滤（`selector`/`keyword`）或断网复现脚本交给配置的执行器，返回结构化诊断、退出码和清理状态。 |
+| `run_tests`、`run_python_snippet`、`discover_tests`、`check_syntax`、`run_linter` | 将受控的操作、目标、单测过滤（`selector`/`keyword`）或断网复现脚本交给配置的执行器，返回结构化诊断、退出码和清理状态。`run_linter` 支持 `include_linter` 显式开关（SWE-bench 官方镜像默认关闭），且容器内缺少 `ruff` 时以退出码 0 返回结构化跳过结果（零 Traceback）。 |
 | `stage_patch` | 接受带预期哈希的多文件文本变更。用临时 Git 目录生成和复核 diff，批准后保存待审制品。目标工作区不会由此调用写入。 |
 | `ds_search` | CLI 和 Web 选用支持搜索的 DeepSeek provider 时注册。公开查询通过风险检查后按 L0 自动放行，由独立的 Chat Completions 请求执行服务端搜索。工具返回来源，模型用量沿当前入口记账。 |
 

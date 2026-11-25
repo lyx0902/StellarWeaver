@@ -109,6 +109,7 @@ _PIPELINE_OPTIONS = (
     "calibrated_context_budget",
     "sticky_context_checkpoint",
     "protect_fresh_tool_output",
+    "soft_test_failure_reminder",
 )
 _HARNESS_SWITCHES = (
     "development_tools",
@@ -195,6 +196,7 @@ class RunConfiguration:
         harness = HarnessConfig.model_validate(
             {
                 **{name: explicit(name, full) for name in _HARNESS_SWITCHES},
+                "include_linter": explicit("include_linter", False),
                 "repair_controller": explicit("repair_controller", "feedback" if full else "off"),
                 **{
                     name: getattr(args, name)
@@ -669,14 +671,15 @@ async def solve_task(
             prompt += "\n\n" + task.problem_statement
             tools_sha256 = digest(canonical_json(schemas))
             outcome = await agent.run(prompt)
-            requests = [
-                event
-                for event in store.load_events()
-                if event.type in {"model.completed", "model.failed"}
+            events = store.load_events()
+            completed_requests = [event for event in events if event.type == "model.completed"]
+            failed_requests = [event for event in events if event.type == "model.failed"]
+            all_requests = [
+                event for event in events if event.type in {"model.completed", "model.failed"}
             ]
             cached = [
                 count
-                for event in requests
+                for event in completed_requests
                 if type(count := event.payload.get("prompt_cache_hit_tokens")) is int
             ]
             failure_category = None
@@ -694,7 +697,9 @@ async def solve_task(
             ):
                 failure_category = "policy_blocked"
             elif (
-                outcome.run_status == "failed" and requests and requests[-1].type == "model.failed"
+                outcome.run_status == "failed"
+                and all_requests
+                and all_requests[-1].type == "model.failed"
             ):
                 failure_category = "provider_error"
             evidence = {
@@ -702,8 +707,11 @@ async def solve_task(
                 "outcome": asdict(outcome),
                 "tools": [asdict(tool) for tool in agent.results],
                 "cached_input_tokens": (
-                    sum(cached) if requests and len(cached) == len(requests) else None
+                    sum(cached)
+                    if completed_requests and len(cached) == len(completed_requests)
+                    else None
                 ),
+                "failed_model_calls": len(failed_requests),
                 "failure_category": failure_category,
             }
     finally:
@@ -1085,7 +1093,12 @@ def parser() -> argparse.ArgumentParser:
         default="baseline",
         help="Start with all enhancements disabled (baseline) or enabled (full)",
     )
-    for name in ("sandbox_commands", "adaptive_round_retention", *_HARNESS_SWITCHES):
+    for name in (
+        "sandbox_commands",
+        "adaptive_round_retention",
+        "include_linter",
+        *_HARNESS_SWITCHES,
+    ):
         solve_cmd.add_argument("--" + name.replace("_", "-"), action=argparse.BooleanOptionalAction)
     for name in _EXPLORATION_OPTIONS:
         solve_cmd.add_argument(

@@ -230,9 +230,14 @@ class Agent:
         self._last_failure: str | None = None
         self._failure_repeats = 0
         self._chunk_index = 0
+        self._soft_reminder_sent = False
         self._task_evidence = (
             TaskEvidence()
-            if self.harness_config.task_evidence or self.harness_config.budget_guidance
+            if (
+                self.harness_config.task_evidence
+                or self.harness_config.budget_guidance
+                or self.harness_config.soft_test_failure_reminder
+            )
             else None
         )
         self._last_evidence = ""
@@ -1574,6 +1579,38 @@ class Agent:
         await self._emit("reproduction.feedback", {"attempt": attempt})
         return True
 
+    async def _maybe_remind_unresolved_tests(self) -> bool:
+        """Inject at most one lightweight reminder when failed test checks remain unresolved."""
+        if (
+            self.completion_check is not None
+            or not self.harness_config.soft_test_failure_reminder
+            or self._soft_reminder_sent
+            or self._task_evidence is None
+            or not self._task_evidence.unresolved_failures
+        ):
+            return False
+        model_limit = self.limits.max_model_calls
+        if self._time_exhausted() or (
+            self.enforce_run_budget
+            and model_limit is not None
+            and self._model_calls >= model_limit
+        ):
+            return False
+        self._soft_reminder_sent = True
+        failures = list(self._task_evidence.unresolved_failures.values())[:6]
+        message = Message(
+            "user",
+            "Reminder: one or more test checks failed since your latest edit and have not "
+            "passed on rerun yet. Review whether these failures indicate a missed edge case "
+            "or requirement mismatch, fix and rerun if needed, or confirm they are unrelated "
+            "before finishing:\n"
+            + json.dumps(failures, ensure_ascii=False),
+        )
+        self.store.append_message(message)
+        self.messages.append(message)
+        await self._emit("convergence.reminder", {"unresolved_failures": failures})
+        return True
+
     async def _drive(self) -> tuple[RunStatus, str, str]:
         if self.harness_config != HarnessConfig():
             await self._emit("harness.profile", self.harness_config.model_dump())
@@ -1640,6 +1677,8 @@ class Agent:
             if reply.stop_reason == "tool_calls":
                 return self._completion("failed", "tool_calls stop without calls")
             if self.completion_check is None:
+                if await self._maybe_remind_unresolved_tests():
+                    continue
                 return self._completion("completed", "model finished", reply.text)
             if not await self._check_completion():
                 status = self._completion_proofs[-1]["status"]

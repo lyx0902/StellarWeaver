@@ -125,6 +125,8 @@ class HarnessConfig(StrictConfig):
     calibrated_context_budget: bool = False
     sticky_context_checkpoint: bool = False
     protect_fresh_tool_output: bool = False
+    include_linter: bool = True
+    soft_test_failure_reminder: bool = False
 
 
 class AppConfig(StrictConfig):

@@ -430,7 +430,7 @@ LLM Auto-reviewer 后置为可选实验：只处理确定性规则未能决断�
 
 ## 9. 给 Codex 的首条执行指令（可直接复制）
 
-> 阅读仓库根目录的 `StellarWeaver_Evaluation_First_Security_Implementation_Roadmap.md`，以**当前仓库最新提交**为准，不要假设文档核对的 SHA 仍是 HEAD。首先审计已有 `evals/swebench.py`、`swebench_official.py`、`provenance.py`、`runtime/service.py`、`tools/registry.py`、`policy/`、`web/isolation.py`、`web/approval.py`、`../../frontend/src/experiment.tsx` 及相关测试，给出“已实现 / 有待验收 / 缺失”清单。随后**仅实施 M0 与 M1**，沿用已有 SWE-bench 评测器、评分缓存和 Journal，不新造另一套 Agent Loop，不破坏历史记录。完成后运行所有相关离线测试，记录通过/失败/跳过和证据文件，提交阶段性报告并停止。不要自动进入 M2，更不要运行 23/300 道真实模型 Benchmark、付费安全集或危险攻击测试。后续仅在用户明确指挥时逐阶段推进。
+> 阅读仓库根目录的 `05_HARNESS_EVAL_PLAN.md`，以**当前仓库最新提交**为准，不要假设文档核对的 SHA 仍是 HEAD。首先审计已有 `evals/swebench.py`、`swebench_official.py`、`provenance.py`、`runtime/service.py`、`tools/registry.py`、`policy/`、`web/isolation.py`、`web/approval.py`、`../../frontend/src/experiment.tsx` 及相关测试，给出“已实现 / 有待验收 / 缺失”清单。随后**仅实施 M0 与 M1**，沿用已有 SWE-bench 评测器、评分缓存和 Journal，不新造另一套 Agent Loop，不破坏历史记录。完成后运行所有相关离线测试，记录通过/失败/跳过和证据文件，提交阶段性报告并停止。不要自动进入 M2，更不要运行 23/300 道真实模型 Benchmark、付费安全集或危险攻击测试。后续仅在用户明确指挥时逐阶段推进。
 
 ---
 
