@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import json
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
@@ -15,7 +17,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from stellarweaver.cli import build_provider
-from stellarweaver.config import AppConfig, long_horizon_deepseek_flash, terminal_minimal_harness
+from stellarweaver.config import (
+    AppConfig,
+    get_api_key,
+    long_horizon_deepseek_flash,
+    terminal_minimal_harness,
+)
 from stellarweaver.context import estimate_tokens
 from stellarweaver.domain import JSONDict
 from stellarweaver.evals.provenance import canonical_json
@@ -38,22 +45,32 @@ class _FallbackHarborBaseAgent:
         self,
         logs_dir: Path,
         model_name: str | None = None,
+        *,
+        extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
         self.logs_dir = Path(logs_dir)
         self.model_name = model_name
+        self._extra_env: dict[str, str] = dict(extra_env) if extra_env else {}
         self.extra_kwargs = kwargs
 
 
 if TYPE_CHECKING:
     HARBOR_INSTALLED = False
     _HarborBaseAgent = _FallbackHarborBaseAgent
+    _HARBOR_CAPABILITIES: Any = None
+    _HarborModelUsage: Any = None
 else:
     try:
         _HarborBaseAgent = importlib.import_module("harbor.agents.base").BaseAgent
+        _agent_caps = importlib.import_module("harbor.agents.capabilities").AgentCapabilities
+        _HARBOR_CAPABILITIES = _agent_caps(reasoning_effort=True)
+        _HarborModelUsage = importlib.import_module("harbor.models.agent.context").ModelUsage
         HARBOR_INSTALLED = True
     except ImportError:
         _HarborBaseAgent = _FallbackHarborBaseAgent
+        _HARBOR_CAPABILITIES = None
+        _HarborModelUsage = None
         HARBOR_INSTALLED = False
 
 
@@ -164,8 +181,22 @@ def build_terminal_agent(
     )
 
 
+def _parse_bool_flag(value: bool | str) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean flag value: {value!r}")
+
+
 class StellarWeaverHarborAgent(_HarborBaseAgent):
     """Harbor-native Agent wrapping StellarWeaver in `terminal-minimal` single-`bash` mode."""
+
+    if _HARBOR_CAPABILITIES is not None:
+        capabilities = _HARBOR_CAPABILITIES
 
     def __init__(
         self,
@@ -174,28 +205,37 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         *,
         config: AppConfig | None = None,
         provider: ModelProvider | None = None,
-        env_file: Path | None = None,
+        env_file: Path | str | None = None,
         profile: Literal["terminal-minimal"] = "terminal-minimal",
-        stream: bool = True,
+        reasoning_effort: Literal["low", "high", "max"] | None = None,
+        stream: bool | str = True,
         **kwargs: Any,
     ) -> None:
-        super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
+        init_kwargs = dict(kwargs)
+        if reasoning_effort is not None:
+            init_kwargs["reasoning_effort"] = reasoning_effort
+        super().__init__(logs_dir=logs_dir, model_name=model_name, **init_kwargs)
         self.logs_dir = Path(logs_dir)
         self.model_name = model_name
         self.profile = profile
         self._injected_provider = provider
-        self._env_file = env_file
-        self._stream = stream
+        self._env_file = Path(env_file) if env_file is not None else None
+        self._stream = _parse_bool_flag(stream)
         base_config = (
             config
             if config is not None
             else long_horizon_deepseek_flash(harness_profile="terminal-minimal")
         )
-        if model_name is not None and config is None:
-            normalized = _strip_provider_prefix(model_name)
-            base_config = base_config.model_copy(
-                update={"model": base_config.model.model_copy(update={"model": normalized})}
-            )
+        if config is None:
+            model_updates: dict[str, Any] = {}
+            if model_name is not None:
+                model_updates["model"] = _strip_provider_prefix(model_name)
+            if reasoning_effort is not None:
+                model_updates["reasoning_effort"] = reasoning_effort
+            if model_updates:
+                base_config = base_config.model_copy(
+                    update={"model": base_config.model.model_copy(update=model_updates)}
+                )
         if base_config.harness.profile != "terminal-minimal":
             base_config = base_config.model_copy(
                 update={"harness": terminal_minimal_harness()}
@@ -213,6 +253,42 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         """No host or container pre-installation required for the single-bash MVP."""
         return None
 
+    def _resolve_provider(self, session_dir: Path) -> ModelProvider:
+        if self._injected_provider is not None:
+            return self._injected_provider
+        model_cfg = self.config.model.model_copy(
+            update={"supports_streaming": self._stream and self.config.model.supports_streaming}
+        )
+        if model_cfg.provider == "fake":
+            return build_provider(
+                self.config,
+                session_dir,
+                "fake",
+                None,
+                env_file=self._env_file,
+                stream=self._stream,
+            )
+        extra_env: dict[str, str] = getattr(self, "_extra_env", {}) or {}
+        api_key = (
+            extra_env.get(model_cfg.api_key_env)
+            or get_api_key(model_cfg, session_dir, self._env_file)
+            or (
+                extra_env.get("DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+                if model_cfg.provider == "deepseek"
+                else None
+            )
+        )
+        if api_key:
+            return OpenAICompatibleChatProvider(model_cfg, api_key)
+        return build_provider(
+            self.config,
+            session_dir,
+            model_cfg.provider,
+            None,
+            env_file=self._env_file,
+            stream=self._stream,
+        )
+
     async def run(
         self,
         instruction: str,
@@ -225,18 +301,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         session_dir.mkdir(parents=True, exist_ok=True)
 
         owns_provider = self._injected_provider is None
-        model: ModelProvider = (
-            self._injected_provider
-            if self._injected_provider is not None
-            else build_provider(
-                self.config,
-                session_dir,
-                self.config.model.provider,
-                None,
-                env_file=self._env_file,
-                stream=self._stream,
-            )
-        )
+        model: ModelProvider = self._resolve_provider(session_dir)
         started = time.monotonic()
         try:
             with SessionStore(session_dir) as store:
@@ -309,6 +374,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "tools_sha256": tools_sha256,
                     "preamble_tokens_estimated": preamble_tokens,
                     "session_id": store.session_id,
+                    "model": self.config.model.model,
                     "outcome": asdict(outcome),
                     "tools_invoked": [asdict(tool) for tool in agent.results],
                     "completed_model_calls": len(completed_requests),
@@ -328,39 +394,77 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "wall_seconds": round(time.monotonic() - started, 3),
                 }
                 save(self.logs_dir / "trial-report.json", report)
-                self._populate_context(context, outcome, cached_input_tokens, cost_usd, report)
+                self._populate_context(
+                    context,
+                    input_tokens=outcome.input_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    output_tokens=outcome.output_tokens,
+                    cost_usd=cost_usd,
+                    model_name=self.config.model.model,
+                    report=report,
+                )
                 return report
         finally:
             if owns_provider and isinstance(model, OpenAICompatibleChatProvider):
                 await model.aclose()
 
+    def populate_context_post_run(self, context: Any) -> None:
+        """Backfill Harbor AgentContext from persisted trial-report.json if empty."""
+        report_path = self.logs_dir / "trial-report.json"
+        if context is None or not report_path.is_file():
+            return
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        outcome = report.get("outcome", {})
+        self._populate_context(
+            context,
+            input_tokens=int(outcome.get("input_tokens", 0)),
+            cached_input_tokens=report.get("cached_input_tokens"),
+            output_tokens=int(outcome.get("output_tokens", 0)),
+            cost_usd=float(report.get("estimated_cost_usd", 0.0)),
+            model_name=str(report.get("model") or self.config.model.model),
+            report=report,
+        )
+
     @staticmethod
     def _populate_context(
         context: Any,
-        outcome: Any,
+        *,
+        input_tokens: int,
         cached_input_tokens: int | None,
+        output_tokens: int,
         cost_usd: float,
+        model_name: str,
         report: JSONDict,
     ) -> None:
         if context is None:
             return
+        outcome = report.get("outcome", {})
         for attr, value in (
-            ("n_input_tokens", outcome.input_tokens),
+            ("n_input_tokens", input_tokens),
             ("n_cache_tokens", cached_input_tokens),
-            ("n_output_tokens", outcome.output_tokens),
+            ("n_output_tokens", output_tokens),
             ("cost_usd", cost_usd),
         ):
             if hasattr(context, attr):
                 setattr(context, attr, value)
+        if hasattr(context, "model_usage") and _HarborModelUsage is not None:
+            context.model_usage = {
+                model_name: _HarborModelUsage(
+                    n_input_tokens=input_tokens,
+                    n_cache_tokens=cached_input_tokens or 0,
+                    n_output_tokens=output_tokens,
+                    cost_usd=cost_usd,
+                )
+            }
         if hasattr(context, "metadata"):
             existing = context.metadata
             meta = dict(existing) if isinstance(existing, dict) else {}
             meta.update(
                 {
                     "profile": report["profile"],
-                    "run_status": outcome.run_status,
-                    "model_calls": outcome.model_calls,
-                    "tool_calls": outcome.tool_calls,
+                    "run_status": outcome.get("run_status"),
+                    "model_calls": outcome.get("model_calls"),
+                    "tool_calls": outcome.get("tool_calls"),
                     "failed_model_calls": report["failed_model_calls"],
                     "compactions": report["compactions"],
                     "length_continuations": report["length_continuations"],

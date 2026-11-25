@@ -480,3 +480,94 @@ async def test_harbor_adapter_cache_accounting_ignores_failed_retry_and_aggregat
     markdown = render_markdown_summary([{**report, "resolved": True}])
     assert "| Resolved | 1 (100.0%) |" in markdown
     assert "| Cached Input Tokens | 850 |" in markdown
+
+
+async def test_real_harbor_package_contract_inheritance_factory_and_context(tmp_path: Path) -> None:
+    harbor_base = pytest.importorskip("harbor.agents.base")
+    harbor_env = pytest.importorskip("harbor.environments.base")
+    harbor_factory = pytest.importorskip("harbor.agents.factory")
+    harbor_ctx_mod = pytest.importorskip("harbor.models.agent.context")
+    harbor_trial_cfg = pytest.importorskip("harbor.models.trial.config")
+
+    from stellarweaver.evals.terminal_bench import HARBOR_INSTALLED
+
+    assert HARBOR_INSTALLED is True
+    assert issubclass(StellarWeaverHarborAgent, harbor_base.BaseAgent)
+    assert StellarWeaverHarborAgent.capabilities.reasoning_effort is True
+
+    # Verify Harbor AgentFactory resolves import path, passes preflight with --effort,
+    # and instantiates StellarWeaverHarborAgent cleanly.
+    agent_cfg = harbor_trial_cfg.AgentConfig(
+        name="stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent",
+        model_name="deepseek/deepseek-flash",
+        kwargs={"reasoning_effort": "max", "stream": "false"},
+    )
+    harbor_factory.AgentFactory.run_preflight(agent_cfg, skip_credential_checks=True)
+    inst = harbor_factory.AgentFactory.create_agent_from_config(
+        agent_cfg,
+        logs_dir=tmp_path / "factory_logs",
+    )
+    assert isinstance(inst, StellarWeaverHarborAgent)
+    assert isinstance(inst, harbor_base.BaseAgent)
+    assert inst.config.model.model == "deepseek-flash"
+    assert inst.config.model.reasoning_effort == "max"
+    assert inst._stream is False
+    info = inst.to_agent_info()
+    assert info.name == "stellarweaver"
+    assert info.model_info is not None
+    assert info.model_info.name == "deepseek-flash"
+
+    # Run with real Harbor ExecResult and real Harbor AgentContext (Pydantic model).
+    env = _MockHarborEnvironment(
+        lambda _rec: harbor_env.ExecResult(stdout="harbor-ok\n", stderr="", return_code=0)
+    )
+    model = FakeModel(
+        [
+            AssistantReply(
+                text="",
+                tool_calls=(ToolCall("h1", "bash", json.dumps({"command": "echo harbor-ok"})),),
+                stop_reason="tool_calls",
+                usage={
+                    "prompt_tokens": 500,
+                    "completion_tokens": 25,
+                    "total_tokens": 525,
+                    "prompt_cache_hit_tokens": 100,
+                },
+            ),
+            AssistantReply(
+                text="Verified with real Harbor types.",
+                stop_reason="stop",
+                usage={
+                    "prompt_tokens": 700,
+                    "completion_tokens": 15,
+                    "total_tokens": 715,
+                    "prompt_cache_hit_tokens": 450,
+                },
+            ),
+        ]
+    )
+    runner = StellarWeaverHarborAgent(
+        logs_dir=tmp_path / "real_ctx_logs",
+        model_name="deepseek/deepseek-flash",
+        provider=model,
+        stream=False,
+    )
+    real_ctx = harbor_ctx_mod.AgentContext()
+    await runner.run("Check real Harbor context", env, real_ctx)
+    assert not real_ctx.is_empty()
+    assert real_ctx.n_input_tokens == 1200
+    assert real_ctx.n_cache_tokens == 550
+    assert real_ctx.n_output_tokens == 40
+    assert real_ctx.cost_usd is not None and real_ctx.cost_usd > 0
+    assert real_ctx.model_usage is not None
+    assert real_ctx.model_usage["deepseek-flash"].n_cache_tokens == 550
+    assert real_ctx.metadata is not None
+    assert real_ctx.metadata["profile"] == "terminal-minimal"
+
+    # Verify populate_context_post_run backfills an empty AgentContext from trial-report.json.
+    backfill_ctx = harbor_ctx_mod.AgentContext()
+    assert backfill_ctx.is_empty()
+    runner.populate_context_post_run(backfill_ctx)
+    assert backfill_ctx.n_input_tokens == 1200
+    assert backfill_ctx.n_cache_tokens == 550
+    assert backfill_ctx.n_output_tokens == 40
