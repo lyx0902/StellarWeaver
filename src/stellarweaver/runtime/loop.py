@@ -142,13 +142,17 @@ class Agent:
         enforce_run_budget: bool = True,
         adaptive_round_retention: bool = False,
         enforce_exploration_caps: bool = False,
+        capture_host_changes: bool = True,
     ) -> None:
         if not 0 <= max_retries <= 8:
             raise ValueError("max_retries must be between 0 and 8")
         if retry_base_seconds < 0 or max_retry_delay_seconds <= 0:
             raise ValueError("Invalid retry delay")
+        self.harness_config = harness_config or HarnessConfig()
+        is_terminal_minimal = self.harness_config.profile == "terminal-minimal"
         self.system_prompt = system_prompt if system_prompt is not None else SYSTEM
-        self.project_context = project_context
+        self.project_context = project_context and not is_terminal_minimal
+        self.capture_host_changes = capture_host_changes and not is_terminal_minimal
         self.registry = registry
         self._enable_web_search = enable_web_search
         self._context_rates: deque[float] = deque(maxlen=6)
@@ -180,7 +184,6 @@ class Agent:
         self.retry_base_seconds = retry_base_seconds
         self.max_retry_delay_seconds = max_retry_delay_seconds
         self.context_config = context_config or ContextConfig()
-        self.harness_config = harness_config or HarnessConfig()
         self.preflight = preflight or empty_preflight
         self.completion_check = completion_check
         self._context = ContextManager(
@@ -1040,6 +1043,8 @@ class Agent:
     async def _before_execute(self, call: ToolCall, invocation: JSONDict) -> None:
         if self._previous_before_execute is not None:
             await self._previous_before_execute(call, invocation)
+        if not self.project_context:
+            return
         path = invocation.get("path", invocation.get("cwd"))
         if isinstance(path, str):
             self._scope_paths.add(path)
@@ -1065,7 +1070,7 @@ class Agent:
     async def _after_authorize(self, call: ToolCall, invocation: JSONDict) -> None:
         if self._previous_after_authorize is not None:
             await self._previous_after_authorize(call, invocation)
-        if not self.registry.is_mutation(call.name):
+        if not self.project_context or not self.registry.is_mutation(call.name):
             return
         try:
             instructions = self._instructions.for_paths(sorted(self._scope_paths))
@@ -1530,7 +1535,7 @@ class Agent:
                     else:
                         from stellarweaver.changes import ChangesManager
 
-                        if local_store is not None:
+                        if local_store is not None and self.capture_host_changes:
                             await ChangesManager(
                                 self.registry.workspace.root,
                                 local_store,

@@ -56,6 +56,14 @@ class CommandRunner(Protocol):
     ) -> JSONDict: ...
 
 
+NONINTERACTIVE_ENV: dict[str, str] = {
+    "DEBIAN_FRONTEND": "noninteractive",
+    "GIT_TERMINAL_PROMPT": "0",
+    "PIP_NO_INPUT": "1",
+    "CI": "true",
+}
+
+
 def controlled_environment(overrides: Mapping[str, str] | None = None) -> dict[str, str]:
     """Inherit only OS/runtime essentials, never arbitrary provider credentials."""
     names = {
@@ -79,7 +87,13 @@ def controlled_environment(overrides: Mapping[str, str] | None = None) -> dict[s
         "TZ",
     }
     environment = {key: value for key, value in os.environ.items() if key.upper() in names}
-    environment.update({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"})
+    environment.update(
+        {
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1",
+            **NONINTERACTIVE_ENV,
+        }
+    )
     if overrides:
         environment.update(overrides)
     return environment

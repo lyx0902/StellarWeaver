@@ -70,6 +70,10 @@ def assess(invocation: dict[str, Any], *, read_only: bool = False) -> Risk:
         return Risk(
             "L2", ("EXTENSION_ARGUMENT_HANDOFF",), ("extension:arguments",), "ask", executor
         )
+    if tool == "bash":
+        if executor != "sandbox":
+            return Risk("L3", ("UNISOLATED_TERMINAL_BASH",), ("process:host",), "deny", executor)
+        return Risk("L1", ("CONTAINER_TERMINAL_BASH",), ("process:container",), "ask", executor)
     if tool == "run_command" or invocation.get("authorization_tool") == "run_command":
         if executor == "host" or executor == "builtin":
             return Risk("L2", ("HOST_CODE_EXECUTION",), ("process:host",), "ask", executor)

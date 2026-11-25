@@ -19,6 +19,8 @@ from stellarweaver.tools.staging import register_apply_patch, register_staging
 
 
 def attach_harness(registry: ToolRegistry, config: AppConfig) -> None:
+    if config.harness.profile == "terminal-minimal":
+        return
     if config.execution.backend == "docker" and registry.command_runner is None:
         from stellarweaver.web.isolation import DockerRunner, Isolation
 
