@@ -13,7 +13,14 @@ from uuid import uuid4
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from stellarweaver.config import AppConfig, ContextConfig, HarnessConfig, ModelConfig, PolicyConfig
+from stellarweaver.config import (
+    AppConfig,
+    ContextConfig,
+    HarnessConfig,
+    ModelConfig,
+    PolicyConfig,
+    RetryConfig,
+)
 from stellarweaver.domain import (
     AssistantReply,
     JSONDict,
@@ -70,6 +77,61 @@ def web_model_config(provider: str, context_window_tokens: int | None = None) ->
     return ModelConfig.model_validate(fields)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def web_retry_config() -> RetryConfig:
+    return RetryConfig(max_retries=_env_int("SW_WEB_MAX_RETRIES", 2))
+
+
+def web_harness_config(*, repair: bool, development_tools: bool) -> HarnessConfig:
+    return HarnessConfig(
+        development_tools=development_tools,
+        issue_navigation=os.getenv("SW_WEB_ISSUE_NAVIGATION") == "1",
+        patch_staging=bool(repair and os.getenv("SW_WEB_PATCH_STAGING") == "1"),
+        task_evidence=os.getenv("SW_WEB_TASK_EVIDENCE") == "1",
+        budget_guidance=os.getenv("SW_WEB_BUDGET_GUIDANCE") == "1",
+        pipeline_metrics=os.getenv("SW_WEB_PIPELINE_METRICS") == "1",
+        multi_edit_tools=os.getenv("SW_WEB_MULTI_EDIT_TOOLS") == "1",
+        post_edit_syntax_hook=os.getenv("SW_WEB_POST_EDIT_SYNTAX_HOOK") == "1",
+        smart_tool_truncation=os.getenv("SW_WEB_SMART_TOOL_TRUNCATION") == "1",
+        navigation_prefilter=os.getenv("SW_WEB_NAVIGATION_PREFILTER") == "1",
+        multi_file_apply=bool(repair and os.getenv("SW_WEB_MULTI_FILE_APPLY") == "1"),
+        parallel_read_tools=os.getenv("SW_WEB_PARALLEL_READ_TOOLS") == "1",
+        scoped_test_grants=bool(repair and os.getenv("SW_WEB_SCOPED_TEST_GRANTS") == "1"),
+        incremental_sandbox_snapshots=os.getenv("SW_WEB_INCREMENTAL_SANDBOX_SNAPSHOTS") == "1",
+        import_aware_repomap=os.getenv("SW_WEB_IMPORT_AWARE_REPOMAP") == "1",
+        subagent_exploration=os.getenv("SW_WEB_SUBAGENT_EXPLORATION") == "1",
+        exploration_max_model_calls=_env_int("SW_WEB_EXPLORATION_MAX_MODEL_CALLS", 20),
+        exploration_max_tool_calls=_env_int("SW_WEB_EXPLORATION_MAX_TOOL_CALLS", 60),
+        exploration_timeout_seconds=_env_int("SW_WEB_EXPLORATION_TIMEOUT_SECONDS", 300),
+        exploration_stall_rounds=_env_int("SW_WEB_EXPLORATION_STALL_ROUNDS", 2),
+        calibrated_context_budget=os.getenv("SW_WEB_CALIBRATED_CONTEXT_BUDGET") == "1",
+        sticky_context_checkpoint=os.getenv("SW_WEB_STICKY_CONTEXT_CHECKPOINT") == "1",
+        protect_fresh_tool_output=os.getenv("SW_WEB_PROTECT_FRESH_TOOL_OUTPUT") == "1",
+        include_linter=os.getenv("SW_WEB_INCLUDE_LINTER", "1") != "0",
+        soft_test_failure_reminder=os.getenv("SW_WEB_SOFT_TEST_FAILURE_REMINDER") == "1",
+        max_length_continuations=_env_int("SW_WEB_MAX_LENGTH_CONTINUATIONS", 0),
+        repeated_failure_soft_threshold=_env_int("SW_WEB_REPEATED_FAILURE_SOFT_THRESHOLD", 3),
+        repeated_failure_hard_threshold=_env_int("SW_WEB_REPEATED_FAILURE_HARD_THRESHOLD", 3),
+        stream_repetition_detection=os.getenv("SW_WEB_STREAM_REPETITION_DETECTION") == "1",
+        repair_controller=(
+            "enforce"
+            if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "enforce"
+            else "feedback"
+            if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "feedback"
+            else "off"
+        ),
+    )
+
+
 def offline_repository_model() -> FakeModel:
     return FakeModel(
         [
@@ -108,42 +170,11 @@ async def run(
     config = AppConfig(
         model=web_model_config(provider, context_window_tokens),
         policy=PolicyConfig(preset=("auto" if auto else "ask") if repair else "read-only"),
-        context=ContextConfig(fresh_tool_rounds=int(os.getenv("SW_WEB_FRESH_TOOL_ROUNDS", "2"))),
-        harness=HarnessConfig(
+        context=ContextConfig(fresh_tool_rounds=_env_int("SW_WEB_FRESH_TOOL_ROUNDS", 2)),
+        retry=web_retry_config(),
+        harness=web_harness_config(
+            repair=repair,
             development_tools=bool(repair and runner and runner.isolation.development),
-            issue_navigation=os.getenv("SW_WEB_ISSUE_NAVIGATION") == "1",
-            patch_staging=bool(repair and os.getenv("SW_WEB_PATCH_STAGING") == "1"),
-            task_evidence=os.getenv("SW_WEB_TASK_EVIDENCE") == "1",
-            budget_guidance=os.getenv("SW_WEB_BUDGET_GUIDANCE") == "1",
-            pipeline_metrics=os.getenv("SW_WEB_PIPELINE_METRICS") == "1",
-            multi_edit_tools=os.getenv("SW_WEB_MULTI_EDIT_TOOLS") == "1",
-            post_edit_syntax_hook=os.getenv("SW_WEB_POST_EDIT_SYNTAX_HOOK") == "1",
-            smart_tool_truncation=os.getenv("SW_WEB_SMART_TOOL_TRUNCATION") == "1",
-            navigation_prefilter=os.getenv("SW_WEB_NAVIGATION_PREFILTER") == "1",
-            multi_file_apply=bool(repair and os.getenv("SW_WEB_MULTI_FILE_APPLY") == "1"),
-            parallel_read_tools=os.getenv("SW_WEB_PARALLEL_READ_TOOLS") == "1",
-            scoped_test_grants=bool(repair and os.getenv("SW_WEB_SCOPED_TEST_GRANTS") == "1"),
-            incremental_sandbox_snapshots=os.getenv("SW_WEB_INCREMENTAL_SANDBOX_SNAPSHOTS") == "1",
-            import_aware_repomap=os.getenv("SW_WEB_IMPORT_AWARE_REPOMAP") == "1",
-            subagent_exploration=os.getenv("SW_WEB_SUBAGENT_EXPLORATION") == "1",
-            exploration_max_model_calls=int(os.getenv("SW_WEB_EXPLORATION_MAX_MODEL_CALLS", "20")),
-            exploration_max_tool_calls=int(os.getenv("SW_WEB_EXPLORATION_MAX_TOOL_CALLS", "60")),
-            exploration_timeout_seconds=int(os.getenv("SW_WEB_EXPLORATION_TIMEOUT_SECONDS", "300")),
-            exploration_stall_rounds=int(os.getenv("SW_WEB_EXPLORATION_STALL_ROUNDS", "2")),
-            calibrated_context_budget=os.getenv("SW_WEB_CALIBRATED_CONTEXT_BUDGET") == "1",
-            sticky_context_checkpoint=os.getenv("SW_WEB_STICKY_CONTEXT_CHECKPOINT") == "1",
-            protect_fresh_tool_output=os.getenv("SW_WEB_PROTECT_FRESH_TOOL_OUTPUT") == "1",
-            include_linter=os.getenv("SW_WEB_INCLUDE_LINTER", "1") != "0",
-            soft_test_failure_reminder=os.getenv("SW_WEB_SOFT_TEST_FAILURE_REMINDER") == "1",
-            max_length_continuations=int(os.getenv("SW_WEB_MAX_LENGTH_CONTINUATIONS", "0")),
-            stream_repetition_detection=os.getenv("SW_WEB_STREAM_REPETITION_DETECTION") == "1",
-            repair_controller=(
-                "enforce"
-                if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "enforce"
-                else "feedback"
-                if os.getenv("SW_WEB_REPAIR_CONTROLLER") == "feedback"
-                else "off"
-            ),
         ),
     )
     if runner is not None and (

@@ -162,6 +162,12 @@ Docker Desktop 使用 Linux 容器。先拉取验证镜像 `docker pull python:3
 | `SW_WEB_CALIBRATED_CONTEXT_BUDGET` | `calibrated_context_budget` | 按最近 6 个服务端真实 `prompt_tokens` 样本动态校准本地估算系数，避免 200k 窗口过早压缩。 |
 | `SW_WEB_STICKY_CONTEXT_CHECKPOINT` | `sticky_context_checkpoint` | 压缩后固定历史前缀检查点，可变证据置于末尾，减少重复压缩并提升前缀缓存稳定性。 |
 | `SW_WEB_PROTECT_FRESH_TOOL_OUTPUT` | `protect_fresh_tool_output` | 压缩时逐字节保留最近 `SW_WEB_FRESH_TOOL_ROUNDS`（CLI `[context].fresh_tool_rounds`，默认 `2`）轮完整工具输出。 |
+| `SW_WEB_INCLUDE_LINTER` | `include_linter` | 默认 `1`；设为 `0` 时跳过注册 `run_linter`（适用于验证镜像未安装 `ruff` 的场景；保留 `1` 时缺 `ruff` 也会优雅降级）。 |
+| `SW_WEB_SOFT_TEST_FAILURE_REMINDER` | `soft_test_failure_reminder` | 当存在尚未复测通过的失败测试且模型试图结束时，最多注入 1 次轻量软提醒（`convergence.reminder`）。 |
+| `SW_WEB_MAX_LENGTH_CONTINUATIONS` | `max_length_continuations` | 触发 `length`/`max_tokens` 截断时的安全续写上限（默认 `0` 关闭，推荐 `3`；丢弃不完整工具调用并防止空助手消息）。 |
+| `SW_WEB_STREAM_REPETITION_DETECTION` | `stream_repetition_detection` | 仅针对 `reasoning_content` 尾部启用低开销流式复读检测，命中后触发可重试中断并退避重试。 |
+| `SW_WEB_REPEATED_FAILURE_SOFT_THRESHOLD` / `SW_WEB_REPEATED_FAILURE_HARD_THRESHOLD` | `repeated_failure_soft_threshold` / `repeated_failure_hard_threshold` | 双级重复失败阈值（默认 `3` / `3`，推荐 `3` / `6`）；达到软阈值时在工具结果尾部追加软引导，达到硬阈值后停机（须满足 `hard >= soft`）。 |
+| `SW_WEB_MAX_RETRIES` | `[retry].max_retries` | 模型瞬态断连/限流的最大重试次数（默认 `2`，合法范围 `0–8`，推荐 `4`）。 |
 
 本机 `.stellarweaver/workbench.members.json` 的最小示例。`id` 与 `SW_G5_LOCAL_OWNER_ID` 相同，初始租户使用源码定义的本机租户 UUID。准备好文件后按上面的 `$dc` 命令执行 `up -d --build --wait`。
 
