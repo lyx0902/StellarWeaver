@@ -169,6 +169,18 @@ def register_terminal_tools(
                     return_code=-1,
                     timed_out=True,
                 )
+            except RuntimeError as exc:
+                if "timed out" in str(exc).lower():
+                    timed_out = True
+                    result = TerminalExecResult(
+                        stdout="",
+                        stderr=str(exc) or f"Command timed out after {timeout}s inside container.",
+                        return_code=-1,
+                        timed_out=True,
+                    )
+                else:
+                    exec_error = f"{type(exc).__name__}: {exc}"
+                    result = TerminalExecResult(stdout="", stderr=exec_error, return_code=-1)
             except Exception as exc:
                 exec_error = f"{type(exc).__name__}: {exc}"
                 result = TerminalExecResult(stdout="", stderr=exec_error, return_code=-1)

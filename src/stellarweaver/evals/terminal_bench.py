@@ -6,6 +6,7 @@ Does NOT orchestrate `docker run` containers or implement task verifiers.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.metadata
 import json
@@ -26,7 +27,7 @@ from stellarweaver.config import (
 from stellarweaver.context import estimate_tokens
 from stellarweaver.domain import JSONDict
 from stellarweaver.evals.provenance import canonical_json
-from stellarweaver.evals.swebench import save
+from stellarweaver.evals.swebench import execution_fingerprint, save
 from stellarweaver.evals.swebench_pilot import digest
 from stellarweaver.policy import PolicyEngine
 from stellarweaver.providers.base import ModelProvider
@@ -60,18 +61,34 @@ if TYPE_CHECKING:
     _HarborBaseAgent = _FallbackHarborBaseAgent
     _HARBOR_CAPABILITIES: Any = None
     _HarborModelUsage: Any = None
+    _harbor_policy_for: Any = None
 else:
     try:
         _HarborBaseAgent = importlib.import_module("harbor.agents.base").BaseAgent
         _agent_caps = importlib.import_module("harbor.agents.capabilities").AgentCapabilities
         _HARBOR_CAPABILITIES = _agent_caps(reasoning_effort=True)
         _HarborModelUsage = importlib.import_module("harbor.models.agent.context").ModelUsage
+        _harbor_policy_for = importlib.import_module("harbor.models.trial.error_policy").policy_for
         HARBOR_INSTALLED = True
     except ImportError:
         _HarborBaseAgent = _FallbackHarborBaseAgent
         _HARBOR_CAPABILITIES = None
         _HarborModelUsage = None
+        _harbor_policy_for = None
         HARBOR_INSTALLED = False
+
+
+_REWARD_VALID_EXCEPTIONS = frozenset(
+    {
+        "AgentTimeoutError",
+        "ContextWindowExceededError",
+        "OutputTokenExceededError",
+        "ContextLengthExceededError",
+        "OutputLengthExceededError",
+        "AgentSafetyRefusalError",
+    }
+)
+_TIMEOUT_EXCEPTIONS = frozenset({"AgentTimeoutError", "VerifierTimeoutError"})
 
 
 TERMINAL_MINIMAL_SYSTEM_PROMPT = """\
@@ -93,11 +110,11 @@ class HarborAgentContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def _package_version() -> str:
+def _package_version(name: str = "stellarweaver") -> str | None:
     try:
-        return importlib.metadata.version("stellarweaver")
+        return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
-        return "0.1.0"
+        return "0.1.0" if name == "stellarweaver" else None
 
 
 def _strip_provider_prefix(model_name: str) -> str:
@@ -192,6 +209,13 @@ def _parse_bool_flag(value: bool | str) -> bool:
     raise ValueError(f"Invalid boolean flag value: {value!r}")
 
 
+def _relative_posix(path: Path, base: Path) -> str:
+    try:
+        return path.resolve().relative_to(base.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 class StellarWeaverHarborAgent(_HarborBaseAgent):
     """Harbor-native Agent wrapping StellarWeaver in `terminal-minimal` single-`bash` mode."""
 
@@ -247,7 +271,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         return "stellarweaver"
 
     def version(self) -> str | None:
-        return _package_version()
+        return _package_version("stellarweaver")
 
     async def setup(self, environment: TerminalExecutor) -> None:
         """No host or container pre-installation required for the single-bash MVP."""
@@ -289,6 +313,139 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             stream=self._stream,
         )
 
+    def _persist_report_and_context(
+        self,
+        *,
+        store: SessionStore,
+        agent: Agent,
+        context: Any,
+        tool_names: list[str],
+        tools_sha256: str,
+        preamble_tokens: int,
+        config_sha256: str,
+        harbor_version: str | None,
+        started: float,
+        outcome_dict: JSONDict | None,
+    ) -> JSONDict:
+        events = store.load_events()
+        completed_requests = [e for e in events if e.type == "model.completed"]
+        failed_requests = [e for e in events if e.type == "model.failed"]
+        cached = [
+            count
+            for e in completed_requests
+            if type(count := e.payload.get("prompt_cache_hit_tokens")) is int
+        ]
+        cached_input_tokens: int | None = (
+            sum(cached)
+            if completed_requests and len(cached) == len(completed_requests)
+            else None
+        )
+        response_models = sorted(
+            {
+                str(model_id)
+                for e in completed_requests
+                if (model_id := e.payload.get("response_model")) is not None
+            }
+        )
+        system_fingerprints = sorted(
+            {
+                str(fp)
+                for e in completed_requests
+                if (fp := e.payload.get("system_fingerprint")) is not None
+            }
+        )
+        if outcome_dict is None:
+            input_tokens = sum(
+                int(e.payload.get("input_tokens", 0))
+                for e in (*completed_requests, *failed_requests)
+                if type(e.payload.get("input_tokens")) is int
+            )
+            output_tokens = sum(
+                int(e.payload.get("output_tokens", 0))
+                for e in (*completed_requests, *failed_requests)
+                if type(e.payload.get("output_tokens")) is int
+            )
+            outcome_dict = {
+                "run_status": "cancelled",
+                "task_assessment": "unknown",
+                "verification_status": "not_run",
+                "evidence": (),
+                "final_text": "",
+                "reason": "Harbor trial cancelled or timed out",
+                "model_calls": len(completed_requests) + len(failed_requests),
+                "tool_calls": len(agent.results),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "usage_estimated": False,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "session_id": store.session_id,
+                "run_id": store.run_id,
+                "state_path": str(store.path),
+                "usage_incomplete": bool(failed_requests),
+            }
+        else:
+            input_tokens = int(outcome_dict.get("input_tokens", 0))
+            output_tokens = int(outcome_dict.get("output_tokens", 0))
+
+        compactions = sum(1 for e in events if e.type == "context.compacted")
+        length_continuations = sum(1 for e in events if e.type == "model.length_continuation")
+        truncated_thinking = sum(1 for e in events if e.type == "model.truncated_thinking")
+        soft_guidance_events = sum(1 for e in events if e.type == "repair.soft_guidance")
+        repetition_retries = sum(
+            1
+            for e in failed_requests
+            if "repetitive generation loop" in str(e.payload.get("message", "")).lower()
+        )
+        cost_usd = _estimate_deepseek_cost_usd(
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+        )
+        report: JSONDict = {
+            "agent": self.name(),
+            "version": self.version(),
+            "harbor_version": harbor_version,
+            "profile": agent.harness_config.profile,
+            "tools": tool_names,
+            "tools_sha256": tools_sha256,
+            "config_sha256": config_sha256,
+            "preamble_tokens_estimated": preamble_tokens,
+            "session_id": store.session_id,
+            "session_db_relpath": _relative_posix(store.path, self.logs_dir),
+            "artifacts_relpath": _relative_posix(store.artifacts_dir, self.logs_dir),
+            "model": self.config.model.model,
+            "response_models": response_models,
+            "system_fingerprints": system_fingerprints,
+            "outcome": outcome_dict,
+            "tools_invoked": [asdict(tool) for tool in agent.results],
+            "completed_model_calls": len(completed_requests),
+            "failed_model_calls": len(failed_requests),
+            "cached_input_tokens": cached_input_tokens,
+            "cache_hit_ratio": (
+                round(cached_input_tokens / input_tokens, 4)
+                if cached_input_tokens is not None and input_tokens > 0
+                else None
+            ),
+            "compactions": compactions,
+            "length_continuations": length_continuations,
+            "truncated_thinking": truncated_thinking,
+            "soft_guidance_events": soft_guidance_events,
+            "repetition_retries": repetition_retries,
+            "estimated_cost_usd": cost_usd,
+            "wall_seconds": round(time.monotonic() - started, 3),
+        }
+        save(self.logs_dir / "trial-report.json", report)
+        self._populate_context(
+            context,
+            input_tokens=input_tokens,
+            cached_input_tokens=cached_input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+            model_name=self.config.model.model,
+            report=report,
+        )
+        return report
+
     async def run(
         self,
         instruction: str,
@@ -297,14 +454,16 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
     ) -> JSONDict:
         """Execute one Harbor trial inside `environment` and record structured telemetry."""
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        session_dir = self.logs_dir / "stellarweaver-session"
+        # Keep archive directory name short to avoid Windows MAX_PATH nesting issues.
+        session_dir = self.logs_dir / "sw"
         session_dir.mkdir(parents=True, exist_ok=True)
 
         owns_provider = self._injected_provider is None
         model: ModelProvider = self._resolve_provider(session_dir)
+        harbor_version = _package_version("harbor")
         started = time.monotonic()
         try:
-            with SessionStore(session_dir) as store:
+            with SessionStore(session_dir, data_dir=session_dir) as store:
                 agent = build_terminal_agent(
                     self.config,
                     model,
@@ -319,9 +478,10 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                 preamble_tokens = estimate_tokens(
                     {"system": agent.system_prompt, "tools": schemas}
                 )
-                manifest: JSONDict = {
+                manifest_core: JSONDict = {
                     "agent": self.name(),
                     "version": self.version(),
+                    "harbor_version": harbor_version,
                     "profile": agent.harness_config.profile,
                     "tools": tool_names,
                     "tools_sha256": tools_sha256,
@@ -336,73 +496,49 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "execution": self.config.execution.model_dump(),
                     "harness": agent.harness_config.model_dump(),
                 }
+                config_sha256 = digest(canonical_json(manifest_core))
+                manifest: JSONDict = {
+                    **manifest_core,
+                    "config_sha256": config_sha256,
+                    "session_id": store.session_id,
+                    "session_db_relpath": _relative_posix(store.path, self.logs_dir),
+                    "artifacts_relpath": _relative_posix(store.artifacts_dir, self.logs_dir),
+                    **execution_fingerprint(),
+                }
                 save(self.logs_dir / "manifest.json", manifest)
 
-                outcome = await agent.run(instruction)
-                events = store.load_events()
-                completed_requests = [e for e in events if e.type == "model.completed"]
-                failed_requests = [e for e in events if e.type == "model.failed"]
-                cached = [
-                    count
-                    for e in completed_requests
-                    if type(count := e.payload.get("prompt_cache_hit_tokens")) is int
-                ]
-                cached_input_tokens: int | None = (
-                    sum(cached)
-                    if completed_requests and len(cached) == len(completed_requests)
-                    else None
+                try:
+                    outcome = await agent.run(instruction)
+                except asyncio.CancelledError:
+                    self._persist_report_and_context(
+                        store=store,
+                        agent=agent,
+                        context=context,
+                        tool_names=tool_names,
+                        tools_sha256=tools_sha256,
+                        preamble_tokens=preamble_tokens,
+                        config_sha256=config_sha256,
+                        harbor_version=harbor_version,
+                        started=started,
+                        outcome_dict=None,
+                    )
+                    raise
+
+                report = self._persist_report_and_context(
+                    store=store,
+                    agent=agent,
+                    context=context,
+                    tool_names=tool_names,
+                    tools_sha256=tools_sha256,
+                    preamble_tokens=preamble_tokens,
+                    config_sha256=config_sha256,
+                    harbor_version=harbor_version,
+                    started=started,
+                    outcome_dict=asdict(outcome),
                 )
-                compactions = sum(1 for e in events if e.type == "context.compacted")
-                length_continuations = sum(1 for e in events if e.type == "model.length_continuation")
-                truncated_thinking = sum(1 for e in events if e.type == "model.truncated_thinking")
-                soft_guidance_events = sum(1 for e in events if e.type == "repair.soft_guidance")
-                repetition_retries = sum(
-                    1
-                    for e in failed_requests
-                    if "repetitive generation loop" in str(e.payload.get("message", "")).lower()
-                )
-                cost_usd = _estimate_deepseek_cost_usd(
-                    input_tokens=outcome.input_tokens,
-                    cached_input_tokens=cached_input_tokens,
-                    output_tokens=outcome.output_tokens,
-                )
-                report: JSONDict = {
-                    "agent": self.name(),
-                    "version": self.version(),
-                    "profile": agent.harness_config.profile,
-                    "tools": tool_names,
-                    "tools_sha256": tools_sha256,
-                    "preamble_tokens_estimated": preamble_tokens,
-                    "session_id": store.session_id,
-                    "model": self.config.model.model,
-                    "outcome": asdict(outcome),
-                    "tools_invoked": [asdict(tool) for tool in agent.results],
-                    "completed_model_calls": len(completed_requests),
-                    "failed_model_calls": len(failed_requests),
-                    "cached_input_tokens": cached_input_tokens,
-                    "cache_hit_ratio": (
-                        round(cached_input_tokens / outcome.input_tokens, 4)
-                        if cached_input_tokens is not None and outcome.input_tokens > 0
-                        else None
-                    ),
-                    "compactions": compactions,
-                    "length_continuations": length_continuations,
-                    "truncated_thinking": truncated_thinking,
-                    "soft_guidance_events": soft_guidance_events,
-                    "repetition_retries": repetition_retries,
-                    "estimated_cost_usd": cost_usd,
-                    "wall_seconds": round(time.monotonic() - started, 3),
-                }
-                save(self.logs_dir / "trial-report.json", report)
-                self._populate_context(
-                    context,
-                    input_tokens=outcome.input_tokens,
-                    cached_input_tokens=cached_input_tokens,
-                    output_tokens=outcome.output_tokens,
-                    cost_usd=cost_usd,
-                    model_name=self.config.model.model,
-                    report=report,
-                )
+                if outcome.run_status == "cancelled":
+                    # Propagate cancellation so Harbor's asyncio.wait_for records AgentTimeoutError.
+                    raise asyncio.CancelledError("Harbor trial cancelled or timed out")
                 return report
         finally:
             if owns_provider and isinstance(model, OpenAICompatibleChatProvider):
@@ -478,10 +614,160 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             context.metadata = meta
 
 
+def _exception_allows_valid_reward(exception_type: str) -> bool:
+    if _harbor_policy_for is not None:
+        return bool(_harbor_policy_for(exception_type).reward_valid)
+    return exception_type in _REWARD_VALID_EXCEPTIONS
+
+
+def _extract_primary_reward(rewards: Any) -> float | None:
+    if not isinstance(rewards, dict) or not rewards:
+        return None
+    preferred = rewards.get("reward")
+    if isinstance(preferred, (int, float)) and not isinstance(preferred, bool):
+        return float(preferred)
+    for value in rewards.values():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
+def _classify_harbor_verdict(
+    result_data: JSONDict,
+) -> tuple[Literal["passed", "failed", "timeout", "unscored"], bool | None, float | None, bool, str | None]:
+    """Classify Harbor TrialResult per Harbor 0.25.0 reward_valid semantics.
+
+    Priority:
+      1. reward_valid and reward >= 1.0 -> ("passed", True)  (still preserves exception_type)
+      2. AgentTimeoutError / VerifierTimeoutError -> ("timeout", False)
+      3. reward_valid and reward < 1.0 -> ("failed", False)
+      4. Otherwise -> ("unscored", None)
+    """
+    recorded_exceptions: list[str] = []
+    top_exc = result_data.get("exception_info")
+    if isinstance(top_exc, dict) and isinstance(top_exc.get("exception_type"), str):
+        recorded_exceptions.append(top_exc["exception_type"])
+    for step in result_data.get("step_results") or []:
+        if isinstance(step, dict):
+            step_exc = step.get("exception_info")
+            if isinstance(step_exc, dict) and isinstance(step_exc.get("exception_type"), str):
+                recorded_exceptions.append(step_exc["exception_type"])
+
+    primary_exception = recorded_exceptions[0] if recorded_exceptions else None
+    verifier = result_data.get("verifier_result")
+    rewards = verifier.get("rewards") if isinstance(verifier, dict) else None
+    reward = _extract_primary_reward(rewards)
+    reward_valid = bool(
+        isinstance(rewards, dict)
+        and bool(rewards)
+        and reward is not None
+        and all(_exception_allows_valid_reward(exc) for exc in recorded_exceptions)
+    )
+
+    if reward_valid and reward is not None and reward >= 1.0:
+        return "passed", True, reward, True, primary_exception
+    if any(exc in _TIMEOUT_EXCEPTIONS for exc in recorded_exceptions):
+        return "timeout", False, reward, reward_valid, primary_exception
+    if reward_valid and reward is not None and reward < 1.0:
+        return "failed", False, reward, True, primary_exception
+    return "unscored", None, reward, reward_valid, primary_exception
+
+
+def merge_harbor_trial(trial_dir: Path) -> JSONDict:
+    """Merge Harbor's `<trial_dir>/result.json` with StellarWeaver's `agent/trial-report.json`."""
+    trial_path = Path(trial_dir)
+    result_path = trial_path / "result.json"
+    agent_report_path = trial_path / "agent" / "trial-report.json"
+    agent_manifest_path = trial_path / "agent" / "manifest.json"
+
+    result_data: JSONDict = (
+        json.loads(result_path.read_text(encoding="utf-8")) if result_path.is_file() else {}
+    )
+    agent_report: JSONDict = (
+        json.loads(agent_report_path.read_text(encoding="utf-8"))
+        if agent_report_path.is_file()
+        else {}
+    )
+    agent_manifest: JSONDict = (
+        json.loads(agent_manifest_path.read_text(encoding="utf-8"))
+        if agent_manifest_path.is_file()
+        else {}
+    )
+
+    verdict, resolved, reward, reward_valid, exception_type = _classify_harbor_verdict(result_data)
+    merged: JSONDict = {
+        **agent_report,
+        "trial_dir": trial_path.name,
+        "trial_id": result_data.get("id"),
+        "trial_name": result_data.get("trial_name") or trial_path.name,
+        "task_name": result_data.get("task_name"),
+        "task_id": result_data.get("task_id"),
+        "task_checksum": result_data.get("task_checksum"),
+        "verifier_result": result_data.get("verifier_result"),
+        "exception_type": exception_type,
+        "exception_info": result_data.get("exception_info"),
+        "reward": reward,
+        "reward_valid": reward_valid,
+        "verdict": verdict,
+        "resolved": resolved,
+        "harbor_result_present": result_path.is_file(),
+        "agent_report_present": agent_report_path.is_file(),
+    }
+    if agent_manifest and "code_sha" not in merged:
+        merged["code_sha"] = agent_manifest.get("code_sha")
+    if "outcome" not in merged:
+        agent_res = result_data.get("agent_result") or {}
+        merged["outcome"] = {
+            "input_tokens": int(agent_res.get("n_input_tokens") or 0),
+            "output_tokens": int(agent_res.get("n_output_tokens") or 0),
+        }
+        if "cached_input_tokens" not in merged and isinstance(agent_res.get("n_cache_tokens"), int):
+            merged["cached_input_tokens"] = agent_res["n_cache_tokens"]
+        if "estimated_cost_usd" not in merged and isinstance(agent_res.get("cost_usd"), (int, float)):
+            merged["estimated_cost_usd"] = float(agent_res["cost_usd"])
+    return merged
+
+
+def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
+    """Discover all Harbor trial directories under `job_dir` and merge their verdicts."""
+    root = Path(job_dir)
+    trial_dirs: list[Path] = []
+    if (root / "result.json").is_file() and (root / "agent").is_dir():
+        trial_dirs.append(root)
+    else:
+        for child in sorted(root.iterdir()):
+            if child.is_dir() and (
+                (child / "result.json").is_file()
+                or (child / "agent" / "trial-report.json").is_file()
+            ):
+                trial_dirs.append(child)
+    return [merge_harbor_trial(trial_dir) for trial_dir in trial_dirs]
+
+
+def _item_verdict(item: JSONDict) -> Literal["passed", "failed", "timeout", "unscored"]:
+    verdict = item.get("verdict")
+    if verdict == "passed":
+        return "passed"
+    if verdict == "failed":
+        return "failed"
+    if verdict == "timeout":
+        return "timeout"
+    if verdict == "unscored":
+        return "unscored"
+    if item.get("resolved") is True:
+        return "passed"
+    if item.get("resolved") is False:
+        return "failed"
+    return "unscored"
+
+
 def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
-    """Aggregate per-trial Terminal-Bench reports into a summary dictionary."""
+    """Aggregate per-trial Terminal-Bench reports (including merged Harbor verdicts)."""
     total = len(reports)
-    resolved = sum(1 for item in reports if item.get("resolved") is True)
+    counts = {"passed": 0, "failed": 0, "timeout": 0, "unscored": 0}
+    for item in reports:
+        counts[_item_verdict(item)] += 1
+    resolved = counts["passed"]
     input_tokens = sum(int(item.get("outcome", {}).get("input_tokens", 0)) for item in reports)
     output_tokens = sum(int(item.get("outcome", {}).get("output_tokens", 0)) for item in reports)
     cached_values = [
@@ -492,6 +778,10 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     cached_total: int | None = sum(cached_values) if total and len(cached_values) == total else None
     return {
         "tasks": total,
+        "passed": counts["passed"],
+        "failed": counts["failed"],
+        "timeout": counts["timeout"],
+        "unscored": counts["unscored"],
         "resolved": resolved,
         "resolved_rate": round(resolved / total, 4) if total else 0.0,
         "total_input_tokens": input_tokens,
@@ -525,7 +815,10 @@ def render_markdown_summary(reports: Sequence[JSONDict]) -> str:
         "| Metric | Value |",
         "| --- | --- |",
         f"| Tasks | {agg['tasks']} |",
-        f"| Resolved | {agg['resolved']} ({agg['resolved_rate'] * 100:.1f}%) |",
+        f"| Resolved (Passed) | {agg['passed']} ({agg['resolved_rate'] * 100:.1f}%) |",
+        f"| Failed | {agg['failed']} |",
+        f"| Timeout | {agg['timeout']} |",
+        f"| Unscored | {agg['unscored']} |",
         f"| Total Input Tokens | {agg['total_input_tokens']:,} |",
         f"| Cached Input Tokens | {cached_text} |",
         f"| Cache Hit Ratio | {ratio_text} |",
