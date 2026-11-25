@@ -7,7 +7,7 @@ n_attempts: 1
 n_concurrent_trials: 1
 environment:
   type: docker
-  delete: true
+  delete: false  # Stop/remove containers after each trial, keep images for fast re-runs.
 agents:
   - name: stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent
     model_name: deepseek/deepseek-flash
