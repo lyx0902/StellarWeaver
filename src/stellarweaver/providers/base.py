@@ -24,6 +24,7 @@ class ProviderError(RuntimeError):
         status_code: int | None = None,
         usage: JSONDict | None = None,
         partial_stream: bool = False,
+        partial_output_tokens: int | None = None,
         context_length_exceeded: bool = False,
     ) -> None:
         super().__init__(message)
@@ -32,6 +33,7 @@ class ProviderError(RuntimeError):
         self.status_code = status_code
         self.usage = usage
         self.partial_stream = partial_stream
+        self.partial_output_tokens = partial_output_tokens
         # This is a distinct bounded compaction path, not a transient HTTP retry.
         self.context_length_exceeded = context_length_exceeded
 

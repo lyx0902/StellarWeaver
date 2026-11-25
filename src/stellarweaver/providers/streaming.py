@@ -110,8 +110,18 @@ class ChatCompletionAccumulator:
         self._provider_fingerprint: str | None = None
         self.partial = False
 
+    def partial_output_tokens(self) -> int:
+        if self._bytes <= 0:
+            return 0
+        return max(1, (self._bytes + 3) // 4)
+
     def _fail(self, message: str) -> ProviderError:
-        return ProviderError(message, usage=self.usage, partial_stream=self.partial)
+        return ProviderError(
+            message,
+            usage=self.usage,
+            partial_stream=self.partial,
+            partial_output_tokens=self.partial_output_tokens(),
+        )
 
     def _count(self, value: str) -> None:
         self._bytes += len(value.encode("utf-8"))
@@ -158,6 +168,7 @@ class ChatCompletionAccumulator:
                                 retryable=True,
                                 usage=self.usage,
                                 partial_stream=True,
+                                partial_output_tokens=self.partial_output_tokens(),
                             )
         text = delta.content or ""
         if text:
@@ -202,6 +213,7 @@ class ChatCompletionAccumulator:
                 retryable=True,
                 usage=self.usage,
                 partial_stream=self.partial,
+                partial_output_tokens=self.partial_output_tokens(),
             )
         calls = tuple(
             ToolCall(fragments.call_id, "".join(fragments.names), "".join(fragments.arguments))

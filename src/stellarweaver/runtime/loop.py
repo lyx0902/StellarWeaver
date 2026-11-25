@@ -233,6 +233,7 @@ class Agent:
         self._last_failure: str | None = None
         self._failure_repeats = 0
         self._chunk_index = 0
+        self._stream_output_bytes = 0
         self._soft_reminder_sent = False
         self._length_continuations = 0
         self._task_evidence = (
@@ -751,6 +752,7 @@ class Agent:
                 if response is not None:
                     raise ProviderError("Stream emitted content after the final response")
                 if event.type == "text.delta":
+                    self._stream_output_bytes += len(event.text.encode("utf-8"))
                     if emit_deltas:
                         await self._delta(event.text)
                 elif event.type == "response.completed":
@@ -797,6 +799,23 @@ class Agent:
             raise ToolError("WEB_SEARCH_INCOMPLETE", "DeepSeek could not complete the web search.")
         return reply
 
+    def _failed_output_estimate(
+        self,
+        *,
+        streaming: bool,
+        request: ModelRequest,
+        error: ProviderError | None = None,
+    ) -> int:
+        """Estimate output tokens consumed by a failed request without phantom full reservations."""
+        if error is not None and error.partial_output_tokens is not None:
+            return min(request.max_output_tokens, max(0, error.partial_output_tokens))
+        if streaming:
+            has_partial = self._chunk_index > 0 or (error is not None and error.partial_stream)
+            if not has_partial:
+                return 0
+            return min(request.max_output_tokens, max(1, (self._stream_output_bytes + 3) // 4))
+        return request.max_output_tokens
+
     async def _request_model(
         self,
         initial_request: ModelRequest,
@@ -842,6 +861,7 @@ class Agent:
             request_index = self._request_sequence
             if exploration is None:
                 self._chunk_index = 0
+                self._stream_output_bytes = 0
             await self._emit(
                 "model.started",
                 {
@@ -877,7 +897,7 @@ class Agent:
                 self._account_usage(
                     None,
                     input_estimate,
-                    request.max_output_tokens,
+                    self._failed_output_estimate(streaming=streaming, request=request),
                     incomplete=True,
                     exploration=exploration,
                 )
@@ -899,7 +919,7 @@ class Agent:
                 accounting = self._account_usage(
                     None,
                     input_estimate,
-                    request.max_output_tokens,
+                    self._failed_output_estimate(streaming=streaming, request=request),
                     incomplete=True,
                     exploration=exploration,
                 )
@@ -934,7 +954,9 @@ class Agent:
                 accounting = self._account_usage(
                     error.usage,
                     input_estimate,
-                    request.max_output_tokens,
+                    self._failed_output_estimate(
+                        streaming=streaming, request=request, error=error
+                    ),
                     incomplete=True,
                     exploration=exploration,
                 )

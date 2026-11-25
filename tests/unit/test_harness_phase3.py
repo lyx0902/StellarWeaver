@@ -739,3 +739,116 @@ def test_merge_harbor_job_verdicts_priority_and_summary(tmp_path: Path) -> None:
     assert "| Failed | 1 |" in md
     assert "| Timeout | 1 |" in md
     assert "| Unscored | 1 |" in md
+
+
+async def test_streaming_zero_chunk_failure_charges_zero_output_tokens(tmp_path: Path) -> None:
+    class _ZeroChunkFlakyStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capabilities(self) -> ModelCapabilities:
+            return ModelCapabilities(
+                tool_calling=True, streaming=True, context_window_tokens=512_000
+            )
+
+        async def complete(self, request: ModelRequest) -> AssistantReply:
+            raise AssertionError("Expected streaming path")
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls <= 5:
+                raise ProviderError(
+                    "Model connection failed; no response was committed",
+                    retryable=True,
+                    partial_stream=False,
+                )
+            yield ModelStreamEvent(
+                "response.completed",
+                reply=AssistantReply(
+                    text="Recovered after 5 zero-chunk drops.",
+                    stop_reason="stop",
+                    usage={
+                        "prompt_tokens": 1000,
+                        "completion_tokens": 42,
+                        "total_tokens": 1042,
+                        "prompt_cache_hit_tokens": 900,
+                    },
+                ),
+            )
+
+    provider = _ZeroChunkFlakyStream()
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal").model_copy(
+        update={
+            "retry": RetryConfig(max_retries=5, base_delay_seconds=0.0, max_delay_seconds=1.0),
+        }
+    )
+    assert config.limits.max_output_tokens_total == 1_000_000
+    env = _MockHarborEnvironment(lambda _rec: _MockExecResult(stdout="", stderr="", return_code=0))
+    events: list[AgentEvent] = []
+    with SessionStore(tmp_path, data_dir=tmp_path) as store:
+        agent = build_terminal_agent(config, provider, store, env, on_event=events.append)
+        outcome = await agent.run("Test zero-chunk retry accounting")
+
+    assert outcome.run_status == "completed"
+    assert provider.calls == 6
+    # Zero-chunk connection drops must charge 0 output tokens (NOT 5 * 65536).
+    failed_events = [e for e in events if e.type == "model.failed"]
+    assert len(failed_events) == 5
+    assert all(e.payload["output_tokens"] == 0 for e in failed_events)
+    assert outcome.output_tokens == 42
+
+
+async def test_streaming_partial_failure_estimates_from_received_content(tmp_path: Path) -> None:
+    class _PartialDropStream:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capabilities(self) -> ModelCapabilities:
+            return ModelCapabilities(
+                tool_calling=True, streaming=True, context_window_tokens=512_000
+            )
+
+        async def complete(self, request: ModelRequest) -> AssistantReply:
+            raise AssertionError("Expected streaming path")
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.calls += 1
+            if self.calls == 1:
+                yield ModelStreamEvent("text.delta", text="a" * 400)
+                raise ProviderError(
+                    "stream dropped mid-response",
+                    retryable=True,
+                    partial_stream=True,
+                )
+            yield ModelStreamEvent(
+                "response.completed",
+                reply=AssistantReply(
+                    text="Done",
+                    stop_reason="stop",
+                    usage={
+                        "prompt_tokens": 500,
+                        "completion_tokens": 10,
+                        "total_tokens": 510,
+                        "prompt_cache_hit_tokens": 400,
+                    },
+                ),
+            )
+
+    provider = _PartialDropStream()
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal").model_copy(
+        update={
+            "retry": RetryConfig(max_retries=2, base_delay_seconds=0.0, max_delay_seconds=1.0),
+        }
+    )
+    env = _MockHarborEnvironment(lambda _rec: _MockExecResult(stdout="", stderr="", return_code=0))
+    events: list[AgentEvent] = []
+    with SessionStore(tmp_path, data_dir=tmp_path) as store:
+        agent = build_terminal_agent(config, provider, store, env, on_event=events.append)
+        outcome = await agent.run("Test partial-stream accounting")
+
+    assert outcome.run_status == "completed"
+    failed_events = [e for e in events if e.type == "model.failed"]
+    assert len(failed_events) == 1
+    # 400 bytes received -> ~100 estimated output tokens (NOT 65,536).
+    assert failed_events[0].payload["output_tokens"] == 100
+    assert outcome.output_tokens == 110
