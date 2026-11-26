@@ -275,7 +275,7 @@ def long_horizon_deepseek_flash(
             max_tool_calls=300,
             max_wall_seconds=max_wall_seconds,
             max_input_tokens_total=80_000_000,
-            max_output_tokens_total=1_000_000,
+            max_output_tokens_total=2_000_000,
         ),
         execution=execution,
         policy=PolicyConfig(preset=policy_preset),
