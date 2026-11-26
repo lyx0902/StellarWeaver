@@ -1,6 +1,6 @@
 # Harness 实施与验收记录
 
-本文汇总从 M0–M10 源码审计、统一评测契约、安全沙箱与实验看板，到 **N 阶段（Batch 1–3）流水线演进与上下文优化** 的实施与验收记录。各阶段测试数据按执行批次保留，历史审计以当时的代码和部署为准。
+本文汇总从 M0–M10 源码审计、统一评测契约、安全沙箱与实验看板，到 **N 阶段（Batch 1–3）与上下文优化**，再到 **Phase 1–4 长程容错与 Terminal-Bench 4.1 演进**（至 `d4d2795`）的实施与验收记录。各阶段测试数据按执行批次保留，历史审计以当时的代码和部署为准。
 
 | 阶段 | 主要交付 |
 | --- | --- |
@@ -9,20 +9,21 @@
 | [M5–M8](#m5-m8-沙箱与修复工具) | 容器沙箱、受控开发工具、Python 导航与修复控制。 |
 | [M9–M10](#m9-m10-补丁暂存与实验看板) | 补丁暂存、任务证据、预算提示、实验看板与正式评测预注册。 |
 | [N 阶段（Batch 1–3）与上下文优化](#n-阶段-batch-1-3-与上下文优化验收) | 流水线度量、多块编辑、跨文件补丁与成组撤销、保序只读并发、增量快照、缓存导航、只读探索 Sub-agent、实测 Token 校准与粘性前缀检查点。 |
+| [Phase 1–4 与 Terminal-Bench 4.1 演进（2026-11-24 ~ 11-26）](#phase-14-与-terminal-bench-41-演进验收2026-11-24--11-26) | SWE-bench `dev` 23 题收官归档；CRLF 与 `run_linter` 修复；`long_horizon` 与流式容错；Harbor `0.25.0` 原生适配与 `terminal-minimal` 5 题冒烟；Web Compose 7 开关透传；严苛 `TrialLock` / v2 溯源 / `ctrf.json`；交卷前 `completion_evidence_reminder` 4-trial A/B 实证。 |
 
 ## 当前实现进度核对
 
-2026-11-24 核对基于当前工作树（已完成 M0–M10、N 阶段 Batch 1–3 及上下文三项优化，且均通过独立开关接入 CLI、Web 与评测入口）。早期目标架构与演进规划已归档，M11–M12 的 SWE-bench Lite 正式实验待执行。 [M0–M12 历史总方案](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md) · [N 阶段规划归档](archive/06_HARNESS_N_STAGE_PLAN.md) · [当前架构](ARCHITECTURE.md)
+2026-11-26 核对基于当前 `master` 主线（已完成 M0–M10、N 阶段 Batch 1–3、上下文三项优化、**Phase 1–3a、Web Compose 7 开关透传、TB 4.1 5 题 CPU 冒烟、严苛 `TrialLock` / 逐字段溯源修复及 `completion_evidence_reminder` 4-trial A/B**，**676+ 项离线回归全绿**）。SWE-bench Lite 已于 `dev` 23 题收官归档，不再推进 `test` 300 题；后续重点已切换至 Terminal-Bench 4.1 公开 19 题子集（+ 4 题 = 23 题覆盖）。 [M0–M12 历史总方案](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md) · [N 阶段规划归档](archive/06_HARNESS_N_STAGE_PLAN.md) · [Phase 1–4 演进路线图](StellarWeaver_Harness_Roadmap.md) · [当前架构](ARCHITECTURE.md)
 
 | 架构层 | 已接入能力 | 实现范围与待验收项 |
 | --- | --- | --- |
-| 交互与任务入口 | React、CLI、FastAPI、账号与项目权限、PostgreSQL 队列及 worker。Web 支持普通对话、带证据续接、流式重连及脱敏 JSON／HTML 导出。 | 两种入口共用 Agent，Web 按线程保存独立 worktree。待验收项包括从指定历史轮次分叉线程（`N6-a`）、数据库与 worktree 联合恢复。 |
-| Agent 决策与并发探索 | DeepSeek Thinking、Python Repo Map（支持 `import_aware` 导入加权）、符号与测试导航（支持预筛与元数据缓存）、4 路保序只读并发（`ReadDispatch`）、错误分类与修复控制、共享预算只读探索 Sub-agent（`delegate_exploration`）。 | 离线夹具已验收 4 路并发耗时下降 ~52%、500 文件二次导航提速至 0.012s、父子预算精确对账。真实模型下的消融收益待在 `dev` 23 题检验。 |
-| 上下文、证据与预算 | CLI 和 Web 默认 200k；支持实测 Token 动态校准（误差中位数降至 +8%）、粘性压缩前缀检查点（3/3 前缀逐字节一致）、最新工具全文保护（默认 2 轮）、双流 Head/Tail 日志保真、运行内与跨轮证据投影。 | 离线 25 轮长读回归已验证压缩次数从 23 降至 4。线上 DeepSeek Prefix Cache 实际命中率与 100k/200k 对照待实测。 |
-| 编辑、补丁与撤销 | 单文件多块原子编辑（最多 64 处、防重叠）、`stage_patch` 暂存预览、`apply_patch` 跨文件事务写回（最多 12 文件、I/O 异常补偿回滚、崩溃混合态 `RECOVERY_PATCH_MIXED` 识别）、CLI 与 Web 单/多文件成组撤销。 | 离线与临时 PostgreSQL 已验收多文件修改/新建/删除的成组撤销与冲突零写入。 |
-| 工具、权限与隔离 | 路径硬守卫、L0–L3、可信 Hook、写后内存 Python 语法诊断、审批复核、沙箱开发工具跨目标会话级授权复用（`scoped_test_grants`）、Git worktree 与断网容器、Worker→Broker 增量快照传输（`SnapshotCache`，传输量减少 97.5%）。 | CLI 默认使用宿主执行器，宿主命令仍严格全量 `argv` 匹配；Web 受当前运行模式与固定容器镜像约束。 |
+| 交互与任务入口 | React、CLI、FastAPI、账号与项目权限、PostgreSQL 队列及 worker。Web 支持普通对话、带证据续接、流式重连及脱敏 JSON／HTML 导出；Compose（`deploy/compose.g5.yaml`）已透传 7 项 Phase 1–2 增强环境变量。 | 两种入口共用 Agent，Web 按线程保存独立 worktree。待验收项包括从指定历史轮次分叉线程（`N6-a`）、数据库与 worktree 联合恢复。 |
+| Agent 决策与并发探索 | DeepSeek Thinking（CLI/Web 支持 `reasoning_effort`、TB 4.1 默认 `max`）、Python Repo Map（`import_aware` 导入加权）、符号与测试导航（预筛与元数据缓存）、4 路保序只读并发、两级重复失败软引导（3/6）+ `length` 安全续写 + `reasoning_content` 流式复读检测、共享预算只读探索 Sub-agent（3 路滑动并发）。 | 线下与真实模型均已验收；`delegate_exploration` 在 `dev` 23 题 0 触发后于 `terminal-minimal` 显式关闭，保留给 Web / `swe-python`。 |
+| 上下文、证据与预算 | CLI 和 Web 默认 200k，`long_horizon_deepseek_flash()` 默认 512k/64k、`max_output_tokens_total=2,000,000`；实测 Token 动态校准、粘性压缩前缀检查点、最新工具全文保护（2 轮）、`protect_initial_user` 原始题面保护、双流 Head/Tail 日志保真。 | 真实长程实测已验收 **97.58%–97.97%** Prefix Cache 命中率（5 题冒烟与 4-trial A/B 均在 97.5% 以上）。 |
+| 编辑、补丁与撤销 | 单文件多块原子编辑（最多 64 处、防重叠）与 `staging` **LF/CRLF 自动兼容**、`stage_patch` 暂存预览、`apply_patch` 跨文件事务写回与成组撤销、崩溃混合态识别。 | 离线与真实模型 23 题 `dev`（0 空补丁、0 脏 diff）已验收。 |
+| 工具、权限与隔离 | 路径硬守卫、L0–L3、可信 Hook、写后内存 Python 语法诊断、审批复核、宿主非交互环境变量注入与 `max_timeout_seconds<=1800`、`run_linter` 无 `ruff` 优雅降级及 `include_linter` 开关；Harbor 持久容器 `terminal-minimal` 单 `bash` 运行时。 | 决策跳过 Phase 3b（单 `bash` 610 次零编辑摩擦）；CLI 宿主命令仍严格全量 `argv` 匹配。 |
 | 技能与扩展 | Web 提供共享库、按成员与项目的技能信任、按版本选用技能和模型自动加载。CLI 提供可信 Skills 和 stdio MCP。 | Web 模型自主加载已有离线链路验收，实际任务选用效果及 Web MCP 集成待验收。 |
-| 评测、统计与看板 | SWE-bench Lite 批量运行、独立评分、缓存、离线汇总和严格题号配对；看板读取历史轨迹、批量评测和固定边界夹具，支持筛选和脱敏导出。 | SWE-bench 与本地安全夹具仍分别运行。正式 23/300 题、外部安全评测及消融统计属于 M11–M12。 |
+| 评测、统计与看板 | SWE-bench Lite 批量运行、官方镜像复用与 `dev` 23 题收官归档；Terminal-Bench 4.1 Harbor `0.25.0` 原生适配、严格 `TrialLock` 分母、`verifier/ctrf.json` 诊断、v2 逐字段用量溯源与 WAL 安全 SQLite 回读、零字节流式断连记账修复、可选 `completion_evidence_reminder` 复核提示。 | 下一步执行 `fast-agent` 19 题公开标准子集（+ 已有 4 题 = 23 题），详见 [TB4.1Subset23.md](TB4.1Subset23.md)。 |
 
 本机 Compose 默认将新开关设为关闭以保持基线可复现，日常工作台可在 `.stellarweaver/workbench.compose.env` 中按需全量开启。全套配置表见[使用与部署](USAGE.md#harness-增强开关速查)，验证复现入口见[评测体系](EVALUATION.md#复现入口)。
 
@@ -47,7 +48,7 @@
 | 部分实现 | Web 有私有 worktree 和断网的一次性验证容器，主要执行预配置命令。CLI `run_command` 使用宿主进程，Windows Job 负责进程生命周期。通用沙箱 profile、统一命令隔离和开发服务器或浏览器验证仍待实现。 | [验证隔离](../src/stellarweaver/web/isolation.py) · [执行服务](../src/stellarweaver/web/broker.py) · [宿主命令](../src/stellarweaver/tools/commands.py) · [隔离回归](../tests/integration/test_web_g4.py) |
 | 部分实现 | 实验界面读取一份已发布报告，可查看事件和评分证据；多实验筛选、按样本轨迹对照、安全指标界面仍缺。M1 导出独立 JSON，未扩大此界面的读取契约。 | [实验视图](../frontend/src/experiment.tsx) · [实验 API](../src/stellarweaver/web/app.py) |
 | 缺失 | 到 M0 审计时，统一 Manifest/Attempt/Score/Evidence、哈希校验与配对汇总尚未接通。M1 补齐 SWE-bench 契约；安全夹具、独立效果 Oracle、外部安全套件及修复过程指标归后续里程碑。跨任务项目记忆、多 Agent 和多候选是可选目标。 | [统一评测协议](EVALUATION.md#统一评测协议) · [里程碑总表](archive/05_HARNESS_IMPROVEMENT_PLAN_2026-11-21.md#71-里程碑总表) |
-| 不能确定 | 完整 `dev`/`test` 的可执行性和正式成绩、DeepSeek API 别名对应的权重修订、外部安全套件的可比性、真实部署的隔离性质均需对应证据。已保存 `dev` 清单 23 条，本机配方 3 条。 | [SWE-bench Lite 实测记录](EVALUATION.md#三题实测与官方评分记录) · [历史内部评测](archive/00_Sample_Run.md) |
+| 不能确定 | 完整 `dev`/`test` 的可执行性和正式成绩、DeepSeek API 别名对应的权重修订、外部安全套件的可比性、真实部署的隔离性质均需对应证据。已保存 `dev` 清单 23 条，本机配方 3 条。 | [SWE-bench Lite 实测记录](SWEBenchLiteEval.md#附录历史试跑与阶段基线归档迁移自-evaluationmd) · [历史内部评测](archive/00_Sample_Run.md) |
 
 ### 离线验收与证据
 
@@ -212,7 +213,7 @@ uv run --locked --offline pytest -q tests/integration/test_harness_m58.py
 
 以冻结的共享沙箱和固定测试入口作为基线。开发工具、导航、修复反馈、任务证据和预算提示各自单独对照。固定数据修订、题号、题序、模型版本、权限、评分镜像和总预算。只放行与实验设计一致的配置、工具 schema 或提示变化。补丁暂存的人工审核成本单独记录。
 
-按当前每题上限估算每组每次的输入、输出 Token 封顶，23 题分别为 **736 万 / 36.8 万**，300 题分别为 **9,600 万 / 480 万**。预算金额以审批时存档的每百万 Token 价格按输入、输出分别计算，输入按未命中缓存估上限，最后乘以组数和重复次数。费用、Docker 资源与并发上限在运行前单独批准。计量和配对口径见[统一评测协议](EVALUATION.md#统一评测协议)，实验设定见[实验设计](EVALUATION.md#swe-bench-lite-实验设计与对照规划)。
+按当前每题上限估算每组每次的输入、输出 Token 封顶，23 题分别为 **736 万 / 36.8 万**，300 题分别为 **9,600 万 / 480 万**。预算金额以审批时存档的每百万 Token 价格按输入、输出分别计算，输入按未命中缓存估上限，最后乘以组数和重复次数。费用、Docker 资源与并发上限在运行前单独批准。计量和配对口径见[统一评测协议](EVALUATION.md#统一评测协议)，归档参考见[SWE-bench 批量体系](EVALUATION.md#swe-bench-lite-批量评测体系已归档参考)。
 
 首批 23 题以确认流程、分母和独立评分为目标，预注册范围为单组、单次。若批准正式对照，优先采用一组基线和一组单变量改进，总输入、输出上限分别为 **1,472 万 / 73.6 万**（23 题）或 **1.92 亿 / 960 万**（300 题）。首批评测前需冻结具体模型、单价、组别、资源上限和停止条件。
 
@@ -241,7 +242,23 @@ uv run --locked --offline pytest -q tests/integration/test_harness_m58.py
 | **上下文三项优化** | 实测 Token 动态校准（`calibrated_context_budget`）、粘性压缩前缀检查点（`sticky_context_checkpoint`）、最新工具全文保护（`protect_fresh_tool_output`）。 | 25 轮连续读文件夹具：首次压缩前真实输入 48,544 → 141,772 token，压缩次数 23 → 4，估算误差中位数 +260% → +8%，压缩后连续 3 次请求前缀逐字节一致 3/3；服务端超限 70% 回退仅重试一次不重放工具；全量 586 通过、0 失败。 | [test_context_pipeline.py](../tests/integration/test_context_pipeline.py) |
 | **子 Agent 并发与工具链完善** | 子 Agent 3 路滑动并发、独立计账、静默流式与无 Thinking 收尾总结（含 `length` 草稿抢救）、DeepSeek Thinking 输出上限提升至 16,384；工作台展示启动任务描述、`exploration.tool` 具体工具名与连续模型请求折叠；SWE-bench `run --harness-profile baseline\|full` 与可配冻结预算；`run_tests` 细粒度 `selector`/`keyword`、`run_python_snippet` 断网复现及 `git_log`/`git_show`。 | 5 子任务并发夹具实测 Web 峰值并发严格 3 路、强制预算模式 1 路、12 次 `request_index` 全部唯一、每子任务计账独立且输出保序；`length` 截断草稿与宽观察保留通过；`run_tests` 过滤、`run_python_snippet` 与 `git_log`/`git_show` 离线回归 58 项全通过；全量离线回归 609+ 通过。 | [test_harness_n_batch3.py](../tests/integration/test_harness_n_batch3.py) · [test_development_tools.py](../tests/unit/test_development_tools.py) · [test_git.py](../tests/unit/test_git.py) · [test_swebench_batch.py](../tests/integration/test_swebench_batch.py) |
 
+## Phase 1–4 与 Terminal-Bench 4.1 演进验收（2026-11-24 ~ 11-26）
+
+在 N 阶段完成后，围绕长程终端任务、官方评测实跑、Web 环境配置同步与严格遥测溯源分批推进并合入 `master`，关键历史提交与验收证据如下：
+
+| 日期 / 提交 | 演进节点 | 核心交付与改造 | 实测 / 回归验收结论 | 关联档案 |
+| :--- | :--- | :--- | :--- | :--- |
+| 2026-11-24 `bffdd21` / `9851989` | 子 Agent 并发与工具链补齐 | Subagent 3 路滑动并发、独立计账与 `length` 抢救；`run_python_snippet`、`git_log`/`git_show`；沙箱依赖 `site.addsitedir` 加载 `.pth` 与 Windows `core.longpaths` 支持。 | 离线回归 609+ 通过；Windows 深层路径与第三方 `.pth` 包导入故障消除。 | [test_harness_n_batch3.py](../tests/integration/test_harness_n_batch3.py) |
+| 2026-11-25 `2772613` | SWE-bench 官方镜像复用与 `dev` 全量收官 | 新增按仓库分批助手 `scripts/swebench_eval_helper.py`、`-X utf8` 与 `evaluate --instance-id` 定向重评；完成全量 `dev` 23 题 `full` 实跑。 | 23/23 干净产出 `valid_patch`，原始 **9/23 (39.1%)**、剔除 8 题上游镜像腐化后 **9/15 (60.0%)**、Prefix Cache **86.67%**、均摊 ¥0.20/题；决定收官存档、不再推进 `test` 300 题。 | [SWEBenchLiteEval.md](SWEBenchLiteEval.md) |
+| 2026-11-25 `82d2f5c` (`4172913`) | **Phase 1**：实测摩擦消除与软提醒 | `edit_file` / `staging` LF↔CRLF 兼容与 `core.autocrlf=false`；`run_linter` 无 `ruff` 零开销跳过与 `include_linter` 开关；`soft_test_failure_reminder`；修复 `swebench.py` 失败重试丢弃缓存统计。 | 消除 Windows CRLF 连续 `EDIT_NOT_FOUND` 与 `run_linter` Traceback；Ruff/Mypy/Pytest 全绿。 | [test_files.py](../tests/unit/test_files.py) |
+| 2026-11-25 `8a73c5c` (`2f26de8`) | **Phase 2**：长程容错与 `long_horizon` | `RetryConfig`/`ModelConfig` 解禁、`swebench.py --reasoning-effort`、`long_horizon_deepseek_flash()` 预设、`length` 安全续写、两级失败引导（3/6）、`reasoning_content` 流式复读检测。 | 流式/假模型回归覆蓋全部异常截断、复读与软引导路径，完整保留交互模式 `ask`/`auto` 拒批即停契约。 | [test_deepseek_thinking.py](../tests/integration/test_deepseek_thinking.py) |
+| 2026-11-25 `195a0f8` (`5511aab`) | **Phase 3a**：非交互终端与 Harbor 原生适配 | 宿主机 `controlled_environment` 非交互变量与 `max_timeout_seconds<=1800`；`swe-python` vs `terminal-minimal` 单 `bash` MVP；新建 `StellarWeaverHarborAgent`。 | 宿主机进程组 / Job 强清理契约无损；Harbor `terminal-minimal` 单 `bash` 链路离线验收全绿。 | [terminal_bench.py](../src/stellarweaver/evals/terminal_bench.py) |
+| 2026-11-25 `fa8fde4` | **Phase 4 + 5 题 CPU 冒烟 + 零字节断连修复** | 对齐 `harbor==0.25.0`、官方 `reward_valid` 合并、`CancelledError` 保存报告后重抛、短路径 `sw/` 归档、`.git/HEAD` 回退；修复流式零字节断连（`chunk_count==0`）虚扣输出预算并将输出上限提升；完成 TB 4.1 5 题冒烟。 | **2/5 (40.0%)**（`kv` 14.98×、`payments` 6 次重试救回 3/3），`0` 超时；610 次 `bash` 零编辑摩擦决策**跳过 Phase 3b**；[test_harness_phase3.py](../tests/unit/test_harness_phase3.py) 新增断连双路径回归。 | [TerminalBench4Eval.md](TerminalBench4Eval.md) |
+| 2026-11-25 `86dbd1c` | Web Compose 7 项开关透传与部署 | 打通 `SW_WEB_INCLUDE_LINTER`、`SW_WEB_SOFT_TEST_FAILURE_REMINDER`、`SW_WEB_MAX_LENGTH_CONTINUATIONS`、`SW_WEB_STREAM_REPETITION_DETECTION`、`SW_WEB_REPEATED_FAILURE_SOFT/HARD_THRESHOLD`、`SW_WEB_MAX_RETRIES`，更新 `deploy/compose.g5.yaml` 与 `USAGE.md`。 | 新增 [test_web_execution_config.py](../tests/unit/test_web_execution_config.py) 全绿；本机 Compose `--build` 重部署且 `/healthz` 健康。 | [USAGE.md](USAGE.md#harness-增强开关速查) |
+| 2026-11-26 `c1da3b4` (`e0db0b2`) | TB 4.1 `verification_status`、严格锁与 v2 溯源 | 修复 `bash` 命令去重键碰撞与 `terminal-minimal` 记 `not_run`；实现严格 `TrialLock` 匹配、损坏锁识别、`unplanned` 排除与 `ctrf.json` 解析；v2 逐字段（`reported`/`estimated`/`unknown`）溯源与 WAL 安全只读 SQLite 回读。 | 新增 [test_tb41_telemetry_and_verdict.py](../tests/unit/test_tb41_telemetry_and_verdict.py) 全绿；WAL 重建确认 5 题冒烟实报缓存 **97.58%**、标准价 `$3.0940`。 | [terminal_bench.py](../src/stellarweaver/evals/terminal_bench.py) |
+| 2026-11-26 `d4d2795` (`55d66f6` / `4cb30fe`) | `completion_evidence_reminder` 与 `2M` 上限 A/B | `terminal-minimal` 新增可选交卷前 1 次通用复核提醒、`protect_initial_user` 题面防压缩丢失与 `seq` 增量统计；`long_horizon_deepseek_flash()` `max_output_tokens_total` 调至 **`2,000,000`**。 | `vf2`+`wal` 4-trial 对照 **2/4**（`97.97%` 缓存），实验组提醒后揪出 `vf2` `_core.c`/`graph.py` 2 项漏网 Bug 修至 `60/60`；全量 676+ 回归全绿。 | [TerminalBench4Eval.md](TerminalBench4Eval.md#54-completion_evidence_reminder-交卷前通用复核-4-trial-ab-对照2026-11-26-commit-d4d2795) |
+
 ## 后续验证
 
-- 线程历史轮次分叉（`N6-a`）、补丁逐块应用到源分支，以及真实模型任务下的线上 Prefix Cache 命中率与费用趋势仍待验收。
-- 本地夹具和已保存的历史评分构成本阶段的验证证据。23 道开发题、300 道测试题和外部安全集的正式评测待单独确认。
+- **Terminal-Bench 4.1 19 题公开标准子集（+ 已有 4 题 = 23 题覆盖）**：使用 [harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（开启 `completion_evidence_reminder: true` 与 `delete: true`）跑通主栏 19 题 `pass@1`，补齐与 Claude Code / Ante 0.3.5 的同基座双栏对照报告，详见 [TB4.1Subset23.md](TB4.1Subset23.md)。
+- **工作台与生产演进验证**：线程历史轮次分叉（`N6-a`）、补丁逐块应用到源分支、Web MCP 与团队 OIDC 真实身份源集成，以及外部安全套件评测仍待按优先级验收。

@@ -1,19 +1,25 @@
-# SWE-bench Lite 评测体系与实验记录
+# 评测体系与运行器技术指南
 
-本文档说明 StellarWeaver 的回归复现入口、SWE-bench Lite 统一评测协议、批量评测与看板发布命令、已有 SWE-bench Lite 实测记录，以及 23 题 `dev` / 300 题 `test` 实验规划。历史 20 题内部评测已归档至 [00_Sample_Run.md](archive/00_Sample_Run.md)，M0–M10 与 N 阶段功能验收见 [HARNESS_ACCEPTANCE.md](HARNESS_ACCEPTANCE.md)。
+本文档是 StellarWeaver 双评测体系的工程技术参考，系统说明核心回归复现入口、**Terminal-Bench 4.1（Harbor 原生评测器）** 的执行链路与全部冻结参数，以及 **SWE-bench Lite（批量评测器与契约校验）** 的流水线设计。
+
+> **相关文档**：
+> - Terminal-Bench 4.1 实测冒烟与 A/B 报告：[TerminalBench4Eval.md](TerminalBench4Eval.md) · 23 题基准档案与同模型标杆：[TB4.1Subset23.md](TB4.1Subset23.md)
+> - SWE-bench Lite `dev` 23 题报告与历史归档：[SWEBenchLiteEval.md](SWEBenchLiteEval.md) · 历史 20 题内部评测：[00_Sample_Run.md](archive/00_Sample_Run.md)
+> - Harness 各阶段功能与回归验收：[HARNESS_ACCEPTANCE.md](HARNESS_ACCEPTANCE.md)
 
 ## 目录
 
 - [复现入口](#复现入口)
-- [统一评测协议](#统一评测协议)
-- [SWE-bench Lite 批量评测与单题试跑](#swe-bench-lite-批量评测与单题试跑)
-- [SWE-bench Lite 实验设计与对照规划](#swe-bench-lite-实验设计与对照规划)
+- [Terminal-Bench 4.1 与 Harbor 评测体系](#terminal-bench-41-与-harbor-评测体系)
+- [SWE-bench Lite 批量评测体系（已归档参考）](#swe-bench-lite-批量评测体系已归档参考)
+  - [统一评测协议](#统一评测协议)
+  - [SWE-bench Lite 批量评测与单题试跑](#swe-bench-lite-批量评测与单题试跑)
 
 ---
 
 ## 复现入口
 
-在仓库根目录执行（离线依赖同步后即可无网复现）：
+在仓库根目录执行以下命令，可在无外网环境下完整复现静态检查、核心 Demo 与离线回归套件：
 
 ```powershell
 uv sync --locked --extra web
@@ -24,21 +30,125 @@ uv run --locked --extra web ruff check .
 uv run --locked --extra web mypy src/stellarweaver
 ```
 
-前端类型与构建检查：
+前端 TypeScript 类型检查：
 
 ```powershell
 Push-Location frontend; npm exec -- tsc --noEmit; Pop-Location
 ```
 
-> 本地工具边界与安全夹具复现命令见 [SECURITY.md](SECURITY.md#本地工具边界评测)。
+> 本地工具安全边界与固定安全夹具复现命令见 [SECURITY.md](SECURITY.md#本地工具边界评测)。注意在受限容器/沙箱内跑 `pytest` 时，需确保工作区外临时目录与 Git 路径可读；本机 Windows 环境默认 `D:\Git\cmd` 不在受限沙箱 PATH 时，可前置加入 PATH 后运行。
 
 ---
 
-## 统一评测协议
+## Terminal-Bench 4.1 与 Harbor 评测体系
+
+Terminal-Bench 4.1 是 StellarWeaver 当前的核心迭代与能力标尺基准。工程上完全复用官方 `harbor==0.25.0` 的任务容器生命周期与官方 Verifier，**不自造题面解析器、容器编排或独立评分器**，从而确保分数与官方排行榜（Claude Code / Ante 等）100% 同口径。
+
+### 1. 架构与执行全流程
+
+```mermaid
+flowchart LR
+    CLI["harbor run --config &lt;yaml&gt;"] --> Lock["生成作业根 lock.json<br/>(TrialLock 计划清单)"]
+    Lock --> Agent["StellarWeaverHarborAgent<br/>(继承 Harbor BaseAgent)"]
+    Agent --> Build["build_terminal_agent()<br/>terminal-minimal 单 bash 工具"]
+    Build --> Loop["Agent 主循环<br/>512k 上下文 + 流式容错 + 可选复核提醒"]
+    Loop <-->|"TerminalExecutor → docker exec"| Box["Harbor 持久 Docker 容器<br/>(支持 apt / 后台 daemon 保活)"]
+    Loop --> Archive["短路径持久化 logs_dir/sw/<br/>session.sqlite3 + manifest.json + trial-report.json"]
+    Box --> Verifier["官方独立 Verifier<br/>verifier/reward.txt + ctrf.json + result.json"]
+    Archive --> Agg["collect_harbor_job_reports()<br/>严格 TrialLock 分母 + v2 用量溯源"]
+    Verifier --> Agg
+```
+
+关键模块职责：
+- **Harbor 原生适配器（[terminal_bench.py](../src/stellarweaver/evals/terminal_bench.py)）**：`StellarWeaverHarborAgent` 原生继承 `harbor.agents.base.BaseAgent`，声明 `AgentCapabilities(reasoning_effort=True)`，负责解析凭证（`extra_env` → `.env` → `DEEPSEEK_API_KEY`）、冻结清单指纹（`config_sha256`、`tools_sha256`、`code_sha`，无 `git` 时回退读取 `.git/HEAD`）、装配运行时并在结束时回填 Harbor `AgentContext`。
+- **容器专用单 `bash` 运行时（[terminal.py](../src/stellarweaver/tools/terminal.py) + `build_terminal_agent()`）**：仅注册 1 个 `bash` 工具，将命令委托给 Harbor `BaseEnvironment.exec()`。使用 `PolicyEngine("benchmark", allow_terminal_container=True)`，关闭宿主机专用 `ChangesManager` / `RepoMap` / `InstructionLoader` / `run_linter` / `delegate_exploration`，保持极简 Preamble 与 **97%+** Prefix Cache 命中率。
+- **短路径归档与超时取消传播**：会话与 SQLite 统一落在 `<trial>/agent/sw/`（缩短路径避免 Windows `MAX_PATH`）；即使触发 Harbor 外层超时 `asyncio.CancelledError`，仍先完整落盘 `trial-report.json` 与 `AgentContext` 再重新 `raise`，确保 Harbor 正确记录 `AgentTimeoutError` 且不错失真实已消耗用量。
+
+### 2. Harbor YAML 配置与运行时环境变量详解
+
+以标准 19 题配置 [harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml) 与 5 题冒烟配置 [harbor-tb41-smoke5.yaml](../deploy/harbor-tb41-smoke5.yaml) 为例，各字段含义如下：
+
+| 配置字段 / 环境变量 | 典型值 | 工程作用与注意事项 |
+| :--- | :--- | :--- |
+| `jobs_dir` | `.validation/tb41-fast19` | Harbor 作业输出根目录（已 `.gitignore`），内含作业根 `lock.json`、作业级 `result.json` 与逐题 `<trial>/` 子目录。 |
+| `n_attempts` | `1`（`pass@1`） | 每道题运行次数；正式榜单通常 `5`，低成本快速迭代与 A/B 推荐使用 `1`。 |
+| `n_concurrent_trials` | `1` 或 `2` | 并发 trial 数。本机 Docker 内存约 **7.5 GiB**，多容器/重编译题建议 `1`，纯 CPU 轻量跑可酌情调至 `2`。 |
+| `environment.type` | `docker` | 使用 Harbor 本地 Docker 环境驱动任务镜像。 |
+| `environment.delete` | `true`（多题） / `false`（复跑） | 每题结束后是否自动清理容器与镜像。跑 19 题/63 题务必设为 `true` 防止 7.5 GiB Docker 磁盘与内存打满；仅小批 2–5 题频繁复跑调试时设 `false`。 |
+| `datasets[].name` / `version` | `terminal-bench/terminal-bench` · `"4.1.0"` | 指定拉取 Harbor Hub 上冻结的 Terminal-Bench 4.1.0 官方任务定义与官方 Verifier。 |
+| `datasets[].task_names` | `terminal-bench/<slug>` 列表 | 显式枚举待测题号，严禁中途随意增删以保证同分母对齐。 |
+| `agents[].name` | `stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent` | Harbor 动态加载的 Agent 类入口。 |
+| `agents[].model_name` | `deepseek/deepseek-flash` | 传入 Harbor 模型标识；`_strip_provider_prefix()` 会剥离前缀映射为 `model="deepseek-flash"`（DeepSeek-V4.1-Flash-1017）。 |
+| `agents[].kwargs.reasoning_effort` | `max`（可选 `low \| high \| max`） | 对齐 Harbor Hub 上同模型高分基线的思考强度。 |
+| `agents[].kwargs.completion_evidence_reminder` | `true` / `false`（默认 `false`） | **交卷前通用复核提醒开关**。开启后，当模型首次准备无工具交卷且剩余预算充足时，最多追加 1 条仅引用公开题面的通用复核提示，让模型用原任务剩余预算补测并修掉漏网 Bug；压缩时由 `protect_initial_user` 保护初始题面不丢失，并按事件 `seq` 统计 `CancelledError`-safe 的 `post_reminder_*` 增量耗时与调用数。 |
+| `agents[].kwargs.stream` | `true`（默认 `true`） | 控制是否启用流式传输与流式断连精细计账。 |
+| `agents[].kwargs.env_file` | 可选 `.env` 路径 | 指定凭证文件；不传时依次回退 `extra_env`、`cwd/.env` 与 `DEEPSEEK_API_KEY`。 |
+| `PYTHONUTF8=1` | 必备环境变量 | 避免 Windows 中文编码导致 Harbor / Verifier 读写日志或补丁时抛 `UnicodeDecodeError`。 |
+| `LITELLM_LOCAL_MODEL_COST_MAP=True` | 必备环境变量 | 禁止 Harbor 内嵌的 LiteLLM 启动时访问外网拉取远端价目表导致启动卡顿或离线失败。 |
+
+### 3. `long_horizon_deepseek_flash(harness_profile="terminal-minimal")` 冻结参数
+
+代码位于 [config.py](../src/stellarweaver/config.py#L204-L284)，专用于 40–120 分钟长程终端任务：
+
+| 维度 | 参数 | 冻结值 | 设计依据 |
+| :--- | :--- | :--- | :--- |
+| **模型与思考** | `provider` / `model` / `thinking` / `reasoning_effort` | `deepseek` / `deepseek-flash` / `enabled` / `max` | 对应线上 `DeepSeek-V4.1-Flash-1017` 最大推理深度。 |
+| **窗口与生成** | `context_window_tokens` / `max_output_tokens` | `512,000` / `65,536` | 经实测 API 探针确认的 512k 窗口与 64k 单次输出上限，避免长思考/大脚本生成被过早截断。 |
+| **网络超时与重试** | `request_timeout_seconds` / `RetryConfig` | `240s` / `max_retries=5`（退避 `1s–60s`） | 覆盖 1017 ~40s 首字延迟与跨国长程流式瞬态断连。 |
+| **总运行预算** | `max_model_calls` / `max_tool_calls` / `max_wall_seconds` | `None` / `300` / `3600s` | 适配 Harbor 长程任务，主要受 Harbor trial 超时与 300 次工具调用硬顶约束。 |
+| **Token 总上限** | `max_input_tokens_total` / `max_output_tokens_total` | `80,000,000` / `2,000,000` | 输入 80M、输出由最初 `600K → 1M → 2M`，防止重思考超长题误撞输出上限。 |
+| **命令执行** | `default_timeout_seconds` / `max_timeout_seconds` / 流截断 | `120s` / `1800s` / `1 MiB/stream` | 支持大型 C++/Rust 编译、模型训练与压测，Prompt 显式提示长命令传大超时。 |
+| **上下文压缩** | `trigger_ratio` / `target_ratio` / `recent_complete_rounds` / `fresh_tool_rounds` | `0.80` / `0.55` / `6` / `2` | 开启 `calibrated_context_budget=True`、`sticky_context_checkpoint=True`、`protect_fresh_tool_output=True`，压缩后仍保持 97%+ 前缀缓存。 |
+| **长程容错** | 截断续写 / 失败引导 / 复读检测 | `max_length_continuations=3` · 软/硬失败阈值 `3/6` · `stream_repetition_detection=True`（上限 `2`） | `length` 安全丢弃半截工具调用并续写；软引导贴附于 `tool` 尾部不打断 `reasoning_content`；监控推理复读并重连。 |
+| **极简裁剪（关闭）** | `development_tools`、`issue_navigation`、`include_linter`、`subagent_exploration`、`patch_staging`、`task_evidence`、`budget_guidance`、`import_aware_repomap`、`soft_test_failure_reminder` | 全部 `False` | `terminal-minimal` 仅留 `bash`、并发/预算校准/粘性压缩/容错主干与 `pipeline_metrics=True`。 |
+
+### 4. 裁决分类、严格 `TrialLock` 分母与 v2 用量溯源契约
+
+离线汇总由 `collect_harbor_job_reports(job_dir)`、`aggregate_trial_reports(reports)` 与 `render_markdown_summary(reports)` 完成（均位于 [terminal_bench.py](../src/stellarweaver/evals/terminal_bench.py)）：
+
+1. **Verdict 优先级分类（`_classify_harbor_verdict`）**：
+   - `reward_valid` 依据 Harbor `error_policy.policy_for()`（离线回退 `_REWARD_VALID_EXCEPTIONS`，允许 `AgentTimeoutError` 等记录有效得分）。
+   - 优先级：**① `reward_valid and reward >= 1.0` → `passed`**（即便带超时异常但官方已给满分仍计通过，并保留异常名）；**② `AgentTimeoutError` / `VerifierTimeoutError` → `timeout`**；**③ `reward_valid and reward < 1.0` → `failed`**；**④ 其余 → `unscored`**。
+2. **严格 `TrialLock` 分母契约**：
+   - 作业根 `lock.json`（Harbor `TrialLock`）唯一定义计划分母：Pass 1 对计划条目与 `<trial>/lock.json` 执行完整等价匹配，校验 `task_digest`、`agent_name`、`model_name`、`kwargs`、`environment` 与 `verifier`；仅当子 `lock.json` 缺失时走 Pass 2 无歧义字段兼容回退。
+   - 若 `lock.json` 损坏，则强制 `planned_denominator_verifiable = False`、`resolved_rate = None`（绝不虚报通过率）。
+   - 磁盘上多出的额外试验标为 `planned = False`、`receipt_status = "unplanned"`，**保留审计但排除出主通过率与主用量统计**；Harbor 全局 `n_pending_trials` 仅作作业级 `job_pending_trials` 展示。
+3. **`verifier/ctrf.json` 子测试诊断**：若存在，解析 `results.summary` 提取 `total` / `passed` / `failed` / `skipped`，用于区分「差一点（如 `59/60`、`95/97`）」与「方向性失败」。
+4. **v2 逐字段用量溯源与 WAL 只读回读**：
+   - `_summarize_usage_events()` 通过 `input_estimated` 与 `output_estimated` 独立把输入/输出归类为 `reported` / `estimated` / `unknown`，分别输出 `input_usage_complete`、`output_usage_complete` 与 `cache_usage_complete`。**`cache_hit_ratio` 仅基于经确认的 `reported_cached_input_tokens / reported_input_tokens` 计算**。
+   - **零字节断连不虚扣**：流式请求 `chunk_count == 0` 且无部分流时，输出预算记 `0`；仅中途断连按已收字符保守估算并记入 `failed_estimated_*`（彻底与 `reported_*` 剥离）。
+   - 缺少 v2 字段的旧收据通过限域 WAL 只读快照安全回读 `sw/session.sqlite3` 补齐实报用量；不可证实部分显式记为 `unknown` 或 `legacy_mixed_unverified`。
+5. **`verification_status` 语义**：命令去重键 `[tool_name, argv ?? command, cwd]` 修复 `bash` 键碰撞问题；`terminal-minimal` 模式下普通 `bash` 不再把任意 `exit_code=0` 判为已验证（无显式 `CompletionProof` 时如实记为 `not_run`）。
+6. **计价口径（`_estimate_deepseek_cost_usd`）**：按 DeepSeek API 公开标准价折算美元（命中 `$0.006/1M`、未命中 `$0.30/1M`、输出 `$1.20/1M`）；工作日 `18:00–次日 09:00`、`12:00–14:00` 与周末/法定节假日谷期实际账单享受 **50% 折扣**。
+
+### 5. Harbor 启动与离线复算命令
+
+```powershell
+# 1. 启动 Terminal-Bench 4.1（以 19 题标准子集配置为例，推荐在谷期窗口运行）
+$env:PYTHONUTF8 = "1"
+$env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
+.\.venv\Scripts\harbor.exe run --config deploy/harbor-tb41-fast19.yaml --env-file .env
+
+# 2. 离线汇总作业目录（严格 TrialLock 分母 + v2 实报用量 + ctrf.json 摘要）
+uv run --locked --offline python -c "
+from pathlib import Path
+from stellarweaver.evals.terminal_bench import collect_harbor_job_reports, render_markdown_summary
+reports = collect_harbor_job_reports(Path('.validation/tb41-fast19/<job_timestamp>'))
+print(render_markdown_summary(reports))
+"
+```
+
+---
+
+## SWE-bench Lite 批量评测体系（已归档参考）
+
+> **状态说明**：SWE-bench Lite 已完成全量 `dev` 23 题验证并正式收官归档（见 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)），后续不再推进 `test` 300 题或消融实验。以下保留其批量评测器与契约校验架构说明，作为工程资产与离线复算参考。
+
+### 统一评测协议
 
 统一契约（[swebench_contract.py](../src/stellarweaver/evals/swebench_contract.py)）约束所有 SWE-bench Lite 离线汇总、配对对照与工作台实验看板发布。
 
-### 离线报告、看板发布与配对命令
+#### 离线报告、看板发布与配对命令
 
 ```powershell
 # 1. 将实验目录汇总为标准契约报告，并发布到工作台「实验记录」目录（无需重启容器）
@@ -53,34 +163,35 @@ uv run --locked --offline python -m stellarweaver.evals.swebench_contract compar
   --vary config_sha256 --vary prompt_sha256 --vary tools_sha256
 ```
 
-### 数据契约与身份绑定
+#### 数据契约与身份绑定
 
 - 任何已发布报告由四层对象构成：**Manifest**（数据集修订/SHA-256、题目顺序、模型、预算、窗口、代码指纹）、**Attempt**（候选补丁、状态、用量与耗时）、**Score**（独立官方评分器在断网容器中的裁决）与 **Evidence**（摘要哈希、日志与验证制品）。
 - 评分记录强绑定 `instance_id`、`attempt_id`、`patch_sha256`、`scorer_sha256`、`image`、`grader_version` 与 `raw_report_sha256`，任一哈希不匹配即拒绝复用或汇总。
 - 公开输入（`task.json`）与隐藏评分字段（`scorer.json`）在 `prepare` 阶段物理隔离；Agent 仅读取公开题面与基线仓库。
 
-### 分母、计量与配对规则
+#### 分母、计量与配对规则
 
 - **计划题数即分母**：`resolved_rate = resolved / planned`；未运行、超时、超预算、空补丁、环境错误与评分失败全部保留在分母中，禁止剔除后重算。
 - **配对对照**：仅比较双方在相同数据集修订、模型、窗口、预算与评分条件下**同时具有独立判定**的题号，其余题号记录排除原因；允许变化的自变量必须通过 `--vary` 显式声明。
 - **成本与缓存计量**：总输入 token 包含缓存命中与未命中；报告单独记录 `cached_input_tokens` 以便核算真实 Prefix Cache 命中率与谷期成本。
 
----
+### SWE-bench Lite 批量评测与单题试跑
 
-## SWE-bench Lite 批量评测与单题试跑
-
-### 批量评测入口（`stellarweaver.evals.swebench`）
+#### 批量评测入口（`stellarweaver.evals.swebench`）
 
 批量入口固定 SWE-bench Lite 上游修订 `b0dde1093fe417d83b7184254edf8199c1f0dff5`，校验 `dev`（23 题）和 `test`（300 题）的 Parquet SHA-256 与题号。
 
-- **冻结窗口与预算**：`prepare` 默认冻结 `200,000` token 窗口（兼容旧清单回退 `100,000`），默认不限模型调用次数，每题默认 `max_tool_calls=50`、`max_wall_seconds=360`、`max_input_tokens_total=320,000`、`max_output_tokens_total=16,000`，均可在 `prepare` 阶段自定义冻结（DeepSeek Thinking 推荐 `--max-tool-calls 80 --max-wall-seconds 600 --max-input-tokens-total 3000000 --max-output-tokens-total 64000`，对照两组须保持一致）。
+- **五阶段流水线**：`prepare`（冻结题面与预算）→ `run`（运行 Agent 产出候选）→ `export`（生成标准 `predictions.jsonl`）→ `evaluate`（调用官方 `swebench` 评分器在断网容器中裁决）→ `report`（汇总单批结果）。
+- **冻结窗口与预算**：`prepare` 默认冻结 `200,000` token 窗口（兼容旧清单回退 `100,000`），默认不限模型调用次数，每题默认 `max_tool_calls=50`、`max_wall_seconds=360`、`max_input_tokens_total=320,000`、`max_output_tokens_total=16,000`，均可在 `prepare` 阶段通过 CLI 覆盖冻结（DeepSeek Thinking 推荐 `--max-tool-calls 80 --max-wall-seconds 600 --max-input-tokens-total 3000000 --max-output-tokens-total 64000`，并支持 `--reasoning-effort low|high|max`）。
 - **执行配方（`--recipes`）**：按题号或 `owner/repo` 指定 `image`（本地镜像 `sha256:...`）、`pytest_args`、可选 `dependencies`（`--assets` 下的只读依赖目录，容器内通过 `site.addsitedir("/deps")` 加载含 `.pth` 在内的依赖）和 `grader_image`（官方评分镜像 `repo@sha256:...`）。
 - **一键预设与单因素消融**：`run` 支持 `--harness-profile baseline|full`（默认 `baseline` 全关；`full` 开启全部已交付 Harness 能力与 14 项流水线开关，含 `run_tests` 细粒度过滤、`run_python_snippet`、`git_log`/`git_show`、`apply_patch`、只读并发、上下文三项优化与子 Agent 探索），并支持在预设上用 `--no-<开关>` 或显式开关覆盖。展开后的完整配置与 `config_sha256` 冻结写入 `run-settings.json` 防漂移。
-- **Windows 兼容与官方镜像复用**：基线检出统一传 `-c core.longpaths=true` 避免深层测试路径报错；补丁校验临时目录使用短路径系统 temp 并开启容错清理避免 `MAX_PATH` 异常；评分器以 `python -I -X utf8` 启动修复中文 Windows 下非 ASCII 测试补丁编码问题，并支持 `evaluate --instance-id` 定向重评。
+- **Windows 兼容与官方镜像复用**：基线检出统一传 `-c core.longpaths=true -c core.autocrlf=false` 避免深层路径与 CRLF 污染；补丁校验临时目录使用短路径系统 temp 并开启容错清理避免 `MAX_PATH` 异常；评分器以 `python -I -X utf8` 启动修复中文 Windows 下非 ASCII 测试补丁编码问题，并支持 `evaluate --instance-id` 定向重评。
 - **按仓库分批评测助手（[swebench_eval_helper.py](../scripts/swebench_eval_helper.py)）**：支持直接复用 Docker Hub 官方预构建 SWE-bench 镜像，评测数据与产物统一存放在已 `.gitignore` 忽略的 `SWEBenchLite_Eval/` 目录中：
   - `prepare-recipes --repo <owner/repo>`：按仓库拉取官方镜像（带 180s 超时 4 次重试）并生成 `recipes.json`；
   - `prefetch-assets`：带 5 次重试与 `HEAD` 完整性校验预拉取基线提交；
   - `prune-images --report <合同报告>`：带防误删守卫（仅在 `not_evaluated=0` 且 `evaluation_error=0` 时清理本批镜像，避免本地磁盘膨胀）。
+
+#### 完整批处理参考命令
 
 ```powershell
 $swRun = 'SWEBenchLite_Eval/runs/dev-full-marshmallow'
@@ -117,64 +228,4 @@ uv run --locked python scripts/swebench_eval_helper.py prune-images `
   --recipes $swRecipes --report .validation/workbench-experiment/reports/dev-full-marshmallow.json
 ```
 
-### SWE-bench Lite 实测与官方评分记录
-
-#### 1. 2026-11-24 ~ 25 全量 `dev` 23 题 Full Harness 实测（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
-
-> 完整 23 题逐题明细、官方镜像报错堆栈、6 道有效失败题轨迹与 Gold Patch 对比归因，见专题报告 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)。
-
-按 6 个仓库分批执行（预算冻结：`--context-window-tokens 200000 --max-tool-calls 80 --max-wall-seconds 600 --max-input-tokens-total 3000000 --max-output-tokens-total 64000`），全部 6 批合同报告已发布至工作台看板：
-
-| 批次 | 仓库 | 计划题数 | 官方原始成绩 | 上游镜像异常 | 有效镜像成绩 | 工作台报告 |
-| --- | --- | :---: | :---: | :---: | :---: | --- |
-| Batch 1 | `marshmallow-code/marshmallow` | 2 | **2 / 2 (100%)** | 0 | **2 / 2 (100%)** | [dev-full-marshmallow.json](../.validation/workbench-experiment/reports/dev-full-marshmallow.json) |
-| Batch 2 | `pydicom/pydicom` | 5 | **2 / 5 (40.0%)** | 2（pytest 8.3.5 破坏 nose `setup`） | **2 / 3 (66.7%)** | [dev-full-pydicom.json](../.validation/workbench-experiment/reports/dev-full-pydicom.json) |
-| Batch 3 | `pylint-dev/astroid` | 5 | **3 / 5 (60.0%)** | 0 | **3 / 5 (60.0%)** | [dev-full-astroid.json](../.validation/workbench-experiment/reports/dev-full-astroid.json) |
-| Batch 4 | `pvlib/pvlib-python` | 5 | **0 / 5 (0%)** | 5（NumPy 2.0 移除 `np.Inf` + 离线失败） | —（0 有效） | [dev-full-pvlib.json](../.validation/workbench-experiment/reports/dev-full-pvlib.json) |
-| Batch 5 | `sqlfluff/sqlfluff` | 5 | **2 / 5 (40.0%)** | 0 | **2 / 5 (40.0%)** | [dev-full-sqlfluff.json](../.validation/workbench-experiment/reports/dev-full-sqlfluff.json) |
-| Batch 6 | `pyvista/pyvista` | 1 | **0 / 1 (0%)** | 1（缺 `libGL.so.1` + 离线失败） | —（0 有效） | [dev-full-pyvista.json](../.validation/workbench-experiment/reports/dev-full-pyvista.json) |
-| **合计** | **全量 `dev`** | **23** | **9 / 23 (39.1%)** | **8（34.8%）** | **9 / 15 (60.0%)** | 有效口径 Wilson 95% CI `[35.7%, 80.2%]` |
-
-- **端到端稳定性**：**23/23 题全部 `model finished` 并产出合法 `valid_patch`**（0 空补丁、0 非法补丁、0 超时、0 Harness 误杀硬中断）；`pydicom-1413` 核心 `FAIL_TO_PASS` 实际已 **3/3 全过**，仅挂在官方镜像 `pytest 8.3.5` 的 2 个 nose `setup` 回归测试。
-- **精确用量与成本**（由 23 份 `session.sqlite3` 精确汇总，DeepSeek-Flash 闲时定价：命中 ¥0.02/1M、未命中 ¥1.00/1M、输出 ¥4.00/1M）：
-  - 总输入 `19,913,835`（~19.91M）、缓存命中 `17,258,493`（**86.67%** 命中率）、总输出 `386,007`（~0.39M）；
-  - 闲时实测总费用 **¥4.54**（均摊 **¥0.20 / 题**）；单题中位耗时 `148.7s`（均值 `194.5s`，总计 `74.6` 分钟）、中位轮次 `18` 轮。
-- **沉淀的 P0 工程修复项**：① `edit_file` 兼容 Windows CRLF 行尾（消除 `astroid-1196` 连续 8 次 `EDIT_NOT_FOUND` 绕路）；② 修复 `swebench.py` 将 `model.failed` 混入缓存统计导致重试题丢失 `cached_input_tokens` 的问题。
-
-#### 2. 2026-11-24 三题冒烟实测（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
-
-已发布至工作台看板（[full-3tasks-20261124-v2.json](../.validation/workbench-experiment/reports/full-3tasks-20261124-v2.json)、[full-astroid-20261124.json](../.validation/workbench-experiment/reports/full-astroid-20261124.json)），独立官方评分器 `swebench 5.0.2` 裁决结果如下：
-
-| 题号 | 运行终态 | 候选状态 | 官方评分 | 模型 / 工具调用 | 总输入（缓存命中率） | 总输出 | 耗时 | 谷期实测成本 |
-| --- | --- | --- | :---: | :---: | :---: | ---: | ---: | :---: |
-| `marshmallow-code__marshmallow-1359` | `completed` | `valid_patch` | **`resolved`** | 26 / 37 | 1,168,939（**89.5%**） | 19,329 | 170s | ¥0.22 |
-| `pydicom__pydicom-1694` | `completed` | `valid_patch` | **`resolved`** | 14 / 21 | 452,881（**82.6%**） | 6,920 | 148s | ¥0.11 |
-| `pylint-dev__astroid-1333` | `completed` | `valid_patch` | `unresolved` | 32 / 44 | 2,440,849（**89.5%**） | 35,045 | 301s | ¥0.44 |
-
-- **实测观察**：3 题全部干净 `completed` 并产出可应用的 `valid_patch`（0 环境故障、0 评分异常）；DeepSeek 实测 Prefix Cache 命中率达 **82.6%–89.5%**（均值 **88.7%**）；`astroid-1333` 所有 45 项 `PASS_TO_PASS` 通过，未过项为模型改了 `astroid/manager.py` 而非金标准 `astroid/modutils.py`。
-
-#### 3. 2026-11-20 历史 Phase 2 基线试跑（旧 100k 窗口 · 无 Harness 增强）
-
-- `marshmallow-code__marshmallow-1359`：`valid_patch` → **`resolved`**
-- `pydicom__pydicom-1694`：`valid_patch` → **`resolved`**
-- `pylint-dev__astroid-1333`：触及旧预算上限，未生成补丁（`not_evaluated`）
-
-> 单题复现闸门试跑脚本（`stellarweaver.evals.swebench_pilot`）保留用于 `marshmallow-1359` 的历史复现对照，后续正式评测统一以 `stellarweaver.evals.swebench` 为准。
-
----
-
-## SWE-bench Lite 实验设计与对照规划
-
-### 架构与数据边界
-
-- **执行架构**：Agent 运行器、可见测试容器与官方独立评分器物理隔离；评分阶段仅读取 `predictions.jsonl` 与冻结 `scorer.json`。
-- **工作台看板**：Web「实验记录」以只读方式加载 `.validation/workbench-experiment/reports/*.json`，展示汇总指标、单题终态、用量与两份报告的严格配对差异。
-
-### 阶段目标与基准迁移规划
-
-| 阶段 | 数据集与范围 | 状态与目标 |
-| --- | --- | --- |
-| **SWE-bench `dev` 全量闭环（已完成）** | `dev`（23 题，`--harness-profile full`） | 已完成 6 仓库分批实跑与官方评分：**9/23 原始（39.1%）、9/15 有效镜像（60.0%）**，实测均摊 **¥0.20/题**。详见 [SWEBenchLiteEval.md](SWEBenchLiteEval.md)。 |
-| **Phase 1–3a 改造与 TB 4.1 5 题冒烟（已完成）** | Harbor `0.25.0` · `terminal-bench/terminal-bench@4.1.0`（5 题显式 CPU，[harbor-tb41-smoke5.yaml](../deploy/harbor-tb41-smoke5.yaml)） | 已完成 Phase 1（CRLF / `run_linter` / 软提醒 / 缓存统计）、Phase 2（512k/64k 长程预设 / `length` 续写 / 双级失败引导 / 复读检测）与 Phase 3a（`terminal-minimal` 单 `bash` + Harbor 原生适配 + 真实评分合并与短路径归档）。5 题 CPU 冒烟实测 **2/5（40.0%）**、Prefix Cache **96.38%**、谷期 ¥13.37（同 5 题 Harbor Hub 一手对照：Claude Code **28.0% [7/25]**、Ante 0.3.5 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）；基于 610 次 `bash` 零编辑摩擦决定跳过 Phase 3b，并修复零字节断连虚扣输出预算 Bug。详见 [TerminalBench4Eval.md](TerminalBench4Eval.md)。 |
-| **Terminal-Bench 4.1 63 题全量（下一步）** | `terminal-bench/terminal-bench@4.1.0`（63 题无 GPU 版，谷期窗口） | 预计谷期总费 ¥140–¥170（`n_concurrent_trials=2`），对标 Mini-SWE-agent（31.8%）、Claude Code（38.5%）与 Ante（40.9%）；如需进一步压降单题标准价，可重点评估长程 `bash` 输出截断长度与上下文压缩阈值。 |
-| **SWE-bench Lite 正式集与消融（按需）** | `test`（300 题） | ① `baseline`（全关）vs `full`（全开）正式基线；② 单因素消融（`--no-development-tools`、`--no-issue-navigation`、`--no-subagent-exploration`、`--no-sticky-context-checkpoint`、`--repair-controller off|feedback|enforce`）。 |
+> 单题复现闸门脚本 `stellarweaver.evals.swebench_pilot` 保留用于历史 `marshmallow-1359` 复现对照；23 题 `dev` 实测汇总、3 题冒烟及 Phase 2 历史基线均已完整归档至 [SWEBenchLiteEval.md](SWEBenchLiteEval.md#附录历史试跑与阶段基线归档迁移自-evaluationmd)。

@@ -22,11 +22,14 @@
 
 ### 当前进展
 
-CLI M0–M5、工作台 G0–G11、Harness M0–M10、N 阶段（Batch 1–3）与上下文三项优化，以及 **Harness Phase 1–3a**（CRLF 自动兼容、`run_linter` 降级、软收敛提醒、长程预设、`length` 安全续写、双级失败引导、流式复读检测与 Harbor 原生 `terminal-minimal` 适配）均已完成实现与验收（**668 项离线回归全绿**）。已完成两项真实基准实测：
-- **SWE-bench Lite `dev` 全量 23 题**（`full` · DeepSeek Flash Thinking High · 200k）：23/23 产出合法补丁，原始通过 **9/23（39.1%）**，剔除 8 题上游镜像损坏后有效通过 **9/15（60.0%）**，Prefix Cache 86.67%、闲时均摊 **¥0.20 / 题**。
-- **Terminal-Bench 4.1 5 题 CPU 冒烟**（`terminal-minimal` · DeepSeek Flash `max` · 512k）：官方通过 **2/5（40.0%）**（`kv-live-surgery` 6/6、`payments-pipeline-fix` 3/3），`0` 超时、`0` 异常，Prefix Cache 高达 **96.38%**，谷期总费 **¥13.37**（同 5 题一手对照：Claude Code 5 次试验均值 **28.0% [7/25]**；Ante 0.3.5 同为 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）。
+CLI M0–M5、工作台 G0–G11、Harness M0–M10、N 阶段（Batch 1–3）与上下文三项优化，以及 **Harness Phase 1–3a、Web Compose 开关同步、TB 4.1 遥测溯源与交卷前复核提醒** 均已完成实现、验收并合入 `master`（**676+ 项离线回归全绿**）。已完成基准实测与下一步聚焦如下：
+- **Terminal-Bench 4.1 5 题 CPU 冒烟 & 4-Trial 开关对照**（`terminal-minimal` · DeepSeek Flash `max` · 512k）：
+  - 5 题 CPU 冒烟官方通过 **2/5（40.0%）**（`kv-live-surgery` 6/6、`payments-pipeline-fix` 3/3），`0` 超时、`0` 异常；经 WAL 只读重建真实实报 Prefix Cache 为 **97.58%**、标准价合计 **`$3.094`**（同 5 题一手对照：Claude Code 5 次试验均值 **28.0% [7/25]**；Ante 0.3.5 同为 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）。
+  - `completion_evidence_reminder` 4-Trial 开关对照（`vf2` + `wal` × 关/开）：实证开启交卷前 1 次通用复核提醒后，成功拦截 `vf2` 首次交卷前遗留的 `_core.c` 大图与 `graph.py` 自环 2 个必挂 Bug 并自修至 **`60/60`**，4-trial 缓存命中率 **`97.97%`**（总标准价 `$2.166` / 谷期 ~¥7.5）；同步将长程输出上限放宽至 **`2,000,000`**。
+  - **下一步重点**：按 [harbor-tb41-fast19.yaml](deploy/harbor-tb41-fast19.yaml) 跑通 `fast-agent` 19 题公开标准子集（+ 已有 4 题 = **23 题双栏覆盖**），详见 [TB 4.1 23 题基准档案](docs/TB4.1Subset23.md)。
+- **SWE-bench Lite `dev` 全量 23 题（已收官归档）**（`full` · DeepSeek Flash Thinking High · 200k）：23/23 产出合法补丁，原始通过 **9/23（39.1%）**，剔除 8 题上游镜像损坏后有效通过 **9/15（60.0%）**，Prefix Cache 86.67%、闲时均摊 **¥0.20 / 题**；不再推进 `test` 300 题。
 
-[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系与计划](docs/EVALUATION.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [Terminal-Bench 4.1 冒烟报告](docs/TerminalBench4Eval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
+[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
 
 ## 工作原理
 
@@ -242,21 +245,23 @@ uv run --locked stellarweaver resume SESSION_ID --provider deepseek --env-file .
 
 ## 评测与开发
 
-### SWE-bench Lite 批量评测
+### Terminal-Bench 4.1 与 SWE-bench Lite 评测
 
-批量适配器将数据集修订、题号、基线提交和执行配方冻结成清单。Agent 根据公开题面和基线生成候选，可见验证在隔离容器中执行。独立评分器读取候选与官方测试资料，检查补丁应用和评分结果。已有候选可以导入、重新评分或导出为 `predictions.jsonl`，历史运行也可离线汇总。工作台的实验看板按已发布制品展示验证、独立评分、用量及可配对结果。
+Terminal-Bench 4.1 通过 Harbor 原生 `BaseAgent` 与 `terminal-minimal` 单 `bash` 持久容器执行，自动以严格 `TrialLock` 分母合并官方 Verifier 评分、`ctrf.json` 诊断与 v2 逐字段实报用量。历史 SWE-bench Lite 批量适配器冻结数据集修订、题号、基线提交与配方并生成看板契约，现已于 `dev` 23 题收官归档。
 
 ```powershell
+# 查看 Terminal-Bench 4.1 19 题标准子集冻结配置 / SWE-bench 批量命令行帮助
+Get-Content deploy/harbor-tb41-fast19.yaml
 uv run --locked --offline python -m stellarweaver.evals.swebench --help
 ```
 
 | 范围 | 已记录的进度 |
 | --- | --- |
-| SWE-bench Lite `dev`（23 题） | 已完成全量 23 题 `full` 实跑（按 6 仓库分批复用官方镜像）：23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题。 |
-| Terminal-Bench 4.1 冒烟（5 题 CPU） | 已通过 Harbor `0.25.0` 完成 5 题跨领域纯 CPU 冒烟（`terminal-minimal` 单 `bash` + DeepSeek Flash `max`）：官方通过 **2/5（40.0%）**，Prefix Cache **96.38%**，谷期总费 ¥13.37；基于 610 次 `bash` 零编辑摩擦决定暂不实施 Phase 3b。 |
-| 后续全量与消融 | 视谷期窗口推进 Terminal-Bench 4.1 63 题无 GPU 全量跑榜，并单独完成 Web Compose 环境变量透传与重建。 |
+| Terminal-Bench 4.1 冒烟 & 4-Trial A/B | 5 题纯 CPU 冒烟官方通过 **2/5（40.0%）**（WAL 实报缓存 **97.58%**、标准价 `$3.094`）；4-trial `completion_evidence_reminder` 对照将 `vf2` 修至 `60/60`（缓存 **97.97%**）；Web Compose 7 项开关透传与严格 `TrialLock`/v2 溯源已合并 `master`。 |
+| 下一步：TB 4.1 19+4=23 题覆盖 | 使用 [harbor-tb41-fast19.yaml](deploy/harbor-tb41-fast19.yaml) 在谷期跑通 `fast-agent` 19 题标准子集（约 ¥25–¥35），与已有 4 题专项构成双栏 23 题同基座对照（不混分母）。 |
+| SWE-bench Lite `dev`（23 题，已归档） | 全量 `dev` 23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题；不再推进 `test` 300 题。 |
 
-[评测命令与试跑记录](docs/EVALUATION.md#swe-bench-lite-批量评测与单题试跑) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [Terminal-Bench 4.1 冒烟报告](docs/TerminalBench4Eval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
+[评测体系技术指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ### 回归测试与效果验证
 
@@ -298,6 +303,6 @@ StellarWeaver/
 | [架构与调用链](docs/ARCHITECTURE.md) | 工作台架构、共享运行时、模型、工具、隔离与交付流程。 |
 | [数据库与持久化](docs/DATABASE.md) | PostgreSQL 与 SQLite 的结构、职责、迁移和恢复。 |
 | [工具授权与安全](docs/SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与本地安全夹具。 |
-| [评测体系与实验计划](docs/EVALUATION.md) · [SWE-bench dev 23 题](docs/SWEBenchLiteEval.md) · [TB 4.1 冒烟](docs/TerminalBench4Eval.md) | 复现入口、统一评测协议、SWE-bench Lite 与 Terminal-Bench 4.1 实测归因报告。 |
-| [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [演进路线图](docs/StellarWeaver_Harness_Roadmap.md) · [后续路线图](docs/ROADMAP.md) | M0–M10、N 阶段及 Phase 1–4 长程演进的验收核对与后续计划。 |
+| [评测体系与运行器指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B](docs/TerminalBench4Eval.md) · [SWE-bench dev（已归档）](docs/SWEBenchLiteEval.md) | 复现入口、Harbor TB 4.1 与 SWE-bench Lite 双评测器参数流程、19+4=23 题标杆对照及历史归因报告。 |
+| [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [演进路线图](docs/StellarWeaver_Harness_Roadmap.md) · [后续路线图](docs/ROADMAP.md) | M0–M10、N 阶段及 Phase 1–4 至 TB 4.1 演进的完整历史验收、采纳核对与后续计划。 |
 | [历史归档索引](docs/archive/README.md) | 已完成规划方案（含 M0–M10 总方案与 N 阶段方案）、历史阶段进度与外部工作流对照。 |

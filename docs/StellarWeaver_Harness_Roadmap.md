@@ -1,8 +1,30 @@
 # StellarWeaver Harness 多阶段演进与长程评测改造方案
 
 > **适用对象**：可直接作为开发规格说明书交给 Coding Agent（如 Neon / Claude Code / Codex）按阶段实施。  
-> **基线依据**：[lyx0902/StellarWeaver](https://github.com/lyx0902/StellarWeaver)（commit `2648242e`）源码审查 + [SWEBenchLiteEval.md](https://github.com/lyx0902/StellarWeaver/blob/master/docs/SWEBenchLiteEval.md) 23 题实测归因 + `DeepSeek-V4.1-Flash-1017` 主流 Harness 对照数据。  
-> **版本修订**：2026-11-25 已按仓库真实源码架构与安全契约完成逐行核对与修订。
+> **基线依据**：[lyx0902/StellarWeaver](https://github.com/lyx0902/StellarWeaver)（commit `2648242e`）源码审查 + [SWEBenchLiteEval.md](SWEBenchLiteEval.md) 23 题实测归因 + `DeepSeek-V4.1-Flash-1017` 主流 Harness 对照数据。  
+> **版本修订**：2026-11-25 完成源码对齐修订；**2026-11-26 按实际 Git 提交（至 `d4d2795`）补齐采纳状态标注与 Phase 4 后增量落地项**。
+
+---
+
+## 0. 原规划落地状态总览（截至 2026-11-26 · commit `d4d2795`）
+
+| 阶段 / 任务 | 原规划内容 | 实际采纳状态 | 对应提交 | 说明与实际决策 |
+|---|---|---|---|---|
+| **Task 1.1** | `edit_file` 与 `staging` LF/CRLF 兼容 + `autocrlf=false` | **已落地** | `82d2f5c` (`4172913`) | 匹配切片长度与写回风格严格保持原文件行尾，消除 Windows 换行摩擦 |
+| **Task 1.2** | `run_linter` 零开销降级与 `include_linter` 开关 | **已落地** | `82d2f5c` (`4172913`) | 容器无 `ruff` 返结构化跳过且无 Traceback；已知无 `ruff` 镜像直接隐藏 |
+| **Task 1.3** | 未解决测试失败轻量软提醒 `soft_test_failure_reminder` | **已落地** | `82d2f5c` (`4172913`) | 按编辑指纹追踪未修复失败，无 `completion_gate` 时最多提醒 1 次；TB 4.1 延伸为 `completion_evidence_reminder` |
+| **Task 1.4** | 修复 `swebench.py` 缓存命中统计误判 `incomplete` | **已落地** | `82d2f5c` (`4172913`) | 仅聚合 `model.completed`，后进一步升级为 TB 4.1 逐字段 v2 用量溯源 |
+| **Task 2.1** | 解禁上限、CLI `--reasoning-effort` 与 `long_horizon` 预设 | **已落地（微调）** | `8a73c5c` (`2f26de8`) → `4cb30fe` | 探针实测后固化 512k/64k；`max_output_tokens_total` 由规划 `600K` 实战调优演进至 **`600K → 1M → 2M`** |
+| **Task 2.2** | `stop_reason == "length"` 安全续写恢复 | **已落地** | `8a73c5c` (`2f26de8`) | 校验/丢弃半截 `tool_calls`，纯思考截断不写空 `assistant` 消息并注入续写指令 |
+| **Task 2.3** | 两级重复失败策略（软引导 3 / 硬熔断 6） | **已落地** | `8a73c5c` (`2f26de8`) | 软引导贴附于 `tool` 尾部不打断 Prefix Cache；严格保留 `ask`/`auto` 拒批即停 |
+| **Task 2.4** | `reasoning_content` 流式推理复读检测与重连 | **已落地** | `8a73c5c` (`2f26de8`) | 在 `ChatCompletionAccumulator.feed()` 内监控并抛可重试中断（单轮上限 2 次） |
+| **Task 3.1** | 宿主机非交互环境变量与 `max_timeout_seconds<=1800` | **已落地** | `195a0f8` (`5511aab`) | 完整保留宿主机进程组 / Windows Job Object 强清理契约 |
+| **Task 3.2 (a)** | 命名 Profile `swe-python` 与 `terminal-minimal` 单 `bash` MVP | **已落地** | `195a0f8` (`5511aab`) | 关闭宿主机专用及 0 调用工具，维持极端简洁 Preamble |
+| **Task 3.2 (b)** | Phase 3b 扩展至 4 工具（容器版 `read`/`edit`/`write_file`） | **决策跳过** | `fa8fde4` | 5 题冒烟 **610 次 `bash` 零编辑摩擦失败**、实报缓存 **97.58%**，决定不增加额外工具复杂度 |
+| **Task 3.3 (a)** | Harbor `0.25.0` 原生适配（`StellarWeaverHarborAgent`） | **已落地** | `195a0f8`..`fa8fde4` | 对齐真实 `BaseAgent` 能力声明、官方 `reward_valid` 合并、`CancelledError` 与短路径归档 |
+| **Task 3.3 (b)** | 轻量 `pty` 交互执行增强 | **决策跳过** | `fa8fde4` | 实测非交互 `DEBIAN_FRONTEND` + 单 `bash` 未出现阻塞需求，暂不引入 |
+| **Task 4.1–4.2** | 谷期 5 题 CPU 冒烟验证与成本/缓存闸门 | **已落地** | `fa8fde4` | **2/5 (40.0%)**（`kv` 14.98×、`payments` 3/3），WAL 实报缓存 **97.58%**、标准 `$3.094` |
+| **Task 4.3** | 后续跑榜规划（原计划直接 63 题全量 / 15–20 题 A/B） | **已调整落地** | `d4d2795` | 优先采用 **[fast-agent 19 题公开标准子集 + 4 题补充 = 23 题](TB4.1Subset23.md)** 低成本方案（谷期 ¥25–¥35），按需再跑 63 题全量 |
 
 ## 1. 背景校准：实测基线与高分 Harness 差距总览
 
@@ -49,11 +71,11 @@
 
 ## 3. 分阶段实施路线图（可直接按阶段派发给 Agent 执行）
 
-### Phase 1：消除实测摩擦与“草率提交”（预计 0.5–1 天，P0/P1）
+### Phase 1：消除实测摩擦与“草率提交”（预计 0.5–1 天，P0/P1）— **[已落地 `82d2f5c`]**
 
 **阶段目标**：彻底修掉 SWE-bench Lite `dev` 实测暴露的确定性工具 Bug 与验证收敛缺口，不改变现有核心协议与缓存前缀稳定性。
 
-#### Task 1.1：`edit_file` 与 `staging`（`stage_patch`/`apply_patch`）的 LF/CRLF 自动兼容
+#### Task 1.1：`edit_file` 与 `staging`（`stage_patch`/`apply_patch`）的 LF/CRLF 自动兼容 **[已落地]**
 * **目标文件**：`src/stellarweaver/tools/files.py`、`src/stellarweaver/tools/staging.py`、`src/stellarweaver/evals/swebench_pilot.py`、`scripts/swebench_eval_helper.py`
 * **具体改动**：
   1. 在 `prepare_edit_file`（L378–397）中，检测原文件行尾类型（纯 CRLF、纯 LF 或混合）。
@@ -63,14 +85,14 @@
   5. 在 `scripts/swebench_eval_helper.py`（`prefetch-assets`）和 `src/stellarweaver/evals/swebench_pilot.py`（`checkout()`）中均显式传 `-c core.autocrlf=false` 与 `-c core.longpaths=true`。
 * **单测要求**：在 `tests/` 补充纯 LF、纯 CRLF、混合行尾、多处编辑（`MultiEditFileArgs`，复用工具名 `edit_file`）、`apply_patch` CRLF 保持与哈希一致以及 `EDIT_AMBIGUOUS` / `EDIT_OVERLAPPING` 回归测试。
 
-#### Task 1.2：`run_linter` 零开销优雅降级与按环境显式开关
+#### Task 1.2：`run_linter` 零开销优雅降级与按环境显式开关 **[已落地]**
 * **目标文件**：`src/stellarweaver/tools/development.py`、`src/stellarweaver/runtime/service.py`、`src/stellarweaver/evals/swebench.py`、`src/stellarweaver/config.py`
 * **具体改动**：
   1. **容器内优雅降级（消除 Traceback）**：在 `tools/development.py` 的 `_WORKER`（L74–76）中，执行 `run_linter` 前先检查 `importlib.util.find_spec("ruff")`；缺失时干净打印结构化提示 `"ruff is not installed in this environment; skip linting"` 并以退出码 `0` 返回（附带结构化标记 `skipped=True`），不再拉起 `runpy.run_module("ruff")` 吐 Python Traceback。
   2. **按环境显式隐藏（省去 Tool Schema Token 且零额外启动开销）**：为 `register_development_tools(registry, *, include_linter: bool = True)` 增加显式开关（由 `HarnessConfig` 或调用方传入）；**不在宿主机同步 `attach_harness()` 中调用宿主机 `find_spec("ruff")`，也不每题额外起 `docker run` 探活**。在 `evals/swebench.py` 复用官方 SWE-bench 镜像（或 recipe 未声明 linter 可用）时直接传 `include_linter=False` 跳过注册 `run_linter`。
 * **单测要求**：验证 `include_linter=False` 时 `ToolRegistry` 不暴露 `run_linter`；Mock 容器无 `ruff` 时 `_WORKER` 执行 `run_linter` 返回结构化跳过结果且无 Traceback。
 
-#### Task 1.3：未解决测试失败的轻量软提醒（Soft Convergence Guard）
+#### Task 1.3：未解决测试失败的轻量软提醒（Soft Convergence Guard）**[已落地]**
 * **目标文件**：`src/stellarweaver/runtime/loop.py`、`src/stellarweaver/runtime/task_evidence.py`、`src/stellarweaver/config.py`
 * **具体改动**：
   1. 在 `HarnessConfig` 新增布尔开关 `soft_test_failure_reminder: bool = True`（独立于重型 `completion_gate`）；确保开启该开关时 `loop.py`（L233–237）亦会初始化轻量追踪器（不强制耦合 `task_evidence` 注入）。
@@ -79,7 +101,7 @@
   4. 在 `Agent._drive()`（L1642）即将返回 `("completed", "model finished", reply.text)` 前：若 `self.completion_check is None`、开关开启、且当前编辑版本存在未解决失败测试集合非空，**最多拦截 1 次**，向对话注入一条简短 `user` 提示，列出未解决的失败测试项与退出码，要求模型确认失败原因、排查是否遗漏边界或需求误读后再决定结束。
 * **单测要求**：使用 `FakeProvider` 构造 3 组单测：① `run_visible_tests` 失败 → `run_tests` 局部通过 → 模型试图结束 → 收到软提醒并继续修复；② 最多只拦截 1 次防死循环；③ 编辑前复现失败 → 编辑代码 → 测试通过 → 不触发误拦截。
 
-#### Task 1.4：修复 `swebench.py` 缓存命中统计误判 `incomplete`
+#### Task 1.4：修复 `swebench.py` 缓存命中统计误判 `incomplete` **[已落地]**
 * **目标文件**：`src/stellarweaver/evals/swebench.py`（L672–706）
 * **具体改动**：
   1. 汇总 `cached_input_tokens` 与判断是否 `incomplete` 时，仅过滤并统计 `event.type == "model.completed"` 事件（忽略中途重试的 `model.failed` 事件），并在报告中单独保留 `failed_model_calls` 计数。
@@ -90,11 +112,11 @@
 
 ---
 
-### Phase 2：解除短程天花板 & 补齐 1017 长程容错（预计 1–2 天，P0）
+### Phase 2：解除短程天花板 & 补齐 1017 长程容错（预计 1–2 天，P0）— **[已落地 `8a73c5c`]**
 
 **阶段目标**：将 StellarWeaver 从“适合 10 分钟、20 轮的 Lite 短题”升级为“能稳定跑完 40–120 分钟、30M–50M tokens 的 TB 4.1 / SWE-bench Pro V2 长程任务”。
 
-#### Task 2.1：解禁硬上限校验、补齐 CLI 参数并新增 `long_horizon` 配置预设
+#### Task 2.1：解禁硬上限校验、补齐 CLI 参数并新增 `long_horizon` 配置预设 **[已落地·上限微调至 2M]**
 * **目标文件**：`src/stellarweaver/config.py`、`src/stellarweaver/runtime/loop.py`、`src/stellarweaver/evals/swebench.py`
 * **具体改动**：
   1. `RetryConfig.max_retries` 将校验上限从 `le=2` 放宽至 `le=8`；同步更新 `Agent.__init__`（L146）中的 `if not 0 <= max_retries <= 2` 为 `0 <= max_retries <= 8`（`max_delay_seconds` 上限放宽至 `le=120`）。
@@ -108,7 +130,7 @@
      * `LimitsConfig`：`max_model_calls = None`、`max_tool_calls = 300`、`max_wall_seconds = 3600`（Harbor 任务中服从原生 timeout）、`max_input_tokens_total = 80_000_000`、`max_output_tokens_total = 600_000`
      * `RetryConfig`：`max_retries = 5`
 
-#### Task 2.2：`stop_reason == "length"` 安全续写恢复（防输出截断白丢分）
+#### Task 2.2：`stop_reason == "length"` 安全续写恢复（防输出截断白丢分）**[已落地]**
 * **目标文件**：`src/stellarweaver/runtime/loop.py`
 * **具体改动**：
   1. 在 `_drive()`（L1624）中，当 `reply.stop_reason in {"length", "max_tokens"}` 时，不再立即设置 `initial_stop = ("failed", ...)`；增加单任务续写上限（如 `max_length_continuations = 3`）。
@@ -119,7 +141,7 @@
   3. 仅当连续触发截断超过 `max_length_continuations` 时才判为 `failed`。
 * **单测要求**：用 `FakeProvider` 覆盖 3 种 `length` 场景（纯文本截断续写、带半截非法 JSON `tool_calls` 拦截不执行、纯思考空文本截断不写空 `assistant` 消息）。
 
-#### Task 2.3：统一重复失败策略（软引导 + 高阈值熔断）与安全边界保持
+#### Task 2.3：统一重复失败策略（软引导 + 高阈值熔断）与安全边界保持 **[已落地]**
 * **目标文件**：`src/stellarweaver/runtime/loop.py`、`src/stellarweaver/runtime/repair.py`
 * **具体改动**：
   1. 收敛 `loop.py`（L597–628）中并存的 `self._repair.observe()` 与 `self._failure_repeats` 两套重复失败计数，统一到清晰的两级阈值（可配置）：
@@ -127,7 +149,7 @@
      * **硬熔断阈值（默认 `6`）**：连续相同指纹失败达第 6 次再终止任务，防止真正卡死烧钱。
   2. `_stop_on_denied_tool` 仅在 `policy.preset == "benchmark"` 下允许配置为 `False`（返回结构化拒绝结果给模型自行调整）；**严格保留 CLI/Web 交互模式（`ask` / `auto`）下用户显式拒绝审批立即停止的安全契约与现有单测**。
 
-#### Task 2.4：`DeepSeek-V4.1-Flash-1017` 流式推理复读循环检测
+#### Task 2.4：`DeepSeek-V4.1-Flash-1017` 流式推理复读循环检测 **[已落地]**
 * **目标文件**：`src/stellarweaver/providers/streaming.py`、`src/stellarweaver/providers/openai_compatible.py`
 * **具体改动**：
   1. 鉴于当前 `OpenAICompatibleChatProvider.stream()`（L375–378）仅向 `loop.py` 产出 `text.delta`，而 `reasoning_content` 在 `ChatCompletionAccumulator.feed(chunk)` 内静默累加，**将低开销滑动窗口复读检测器直接内置在 `ChatCompletionAccumulator.feed()` 中**。为避免误杀 `content` 中正常生成的重复代码结构、测试样例或大表格，**检测器默认仅监控 `reasoning_content`**，并采用高保守阈值（达到最小缓冲长度后，连续 ≥ 15–20 次高度重复短语/短行才触发，精准匹配 [deepseek-harness #11943](https://github.com/deepseek-ai/deepseek-harness/discussions/11943) 记录的思考阶段复读模式）。
@@ -138,11 +160,11 @@
 
 ---
 
-### Phase 3：Terminal-Bench 4.1 持久容器执行与极简 Profile（预计 2–3 天，P1）
+### Phase 3：Terminal-Bench 4.1 持久容器执行与极简 Profile（预计 2–3 天，P1）— **[Phase 3a 已落地 `195a0f8`；Phase 3b / PTY 决策跳过]**
 
 **阶段目标**：补齐跨领域终端执行短板，参考 [Ante](https://github.com/AntigmaLabs/ante) 与 [Pi](https://github.com/phuryn/bug-hunt-bench/blob/main/results/run-notes.md) 的架构设计，让 StellarWeaver 在 TB 4.1（非 Python 占比 70%+）上跑出第一梯队成绩，同时**不削弱宿主机 CLI/Web 的安全隔离边界**。
 
-#### Task 3.1：宿主机 `tools/commands.py` 非交互环境与超时放宽（严守清理契约）
+#### Task 3.1：宿主机 `tools/commands.py` 非交互环境与超时放宽（严守清理契约）**[已落地]**
 * **目标文件**：`src/stellarweaver/tools/commands.py`、`src/stellarweaver/config.py`
 * **具体改动**：
   1. **非交互环境变量默认注入**：在 `controlled_environment()`（L59–85）中默认注入（允许 `environment_overrides` 覆盖）：
@@ -153,7 +175,7 @@
   2. **放宽单命令超时上限**：在 `ExecutionConfig` 中支持按 Profile 放宽 `max_timeout_seconds`（从默认 `300` 放宽至 `1800`，即 30 分钟），并在命令工具描述中提示模型对编译、大包安装、ML 训练显式传更大的 `timeout_seconds`。
   3. **架构约束**：**不修改宿主机 `execute_command` 的进程组 / Windows Job Object 强清理契约**（不在宿主机加 `keep_background`，以免破坏进程收敛与跨平台测试）。需要跨调用保活的后台守护进程（HTTP/DB/Worker daemon）仅在 Task 3.3 的 Harbor 持久任务容器（`docker exec`）中运行与存活。
 
-#### Task 3.2：引入命名 Harness Profile（`swe-python` vs 容器专用 `terminal-minimal`）
+#### Task 3.2：引入命名 Harness Profile（`swe-python` vs 容器专用 `terminal-minimal`）**[3a 已落地；3b 决策跳过]**
 * **目标文件**：`src/stellarweaver/config.py`、`src/stellarweaver/tools/registry.py`、`src/stellarweaver/tools/terminal.py`（新建，容器专用）
 * **具体改动**：
   1. 将 `HarnessConfig` 的 19 个零散开关收敛为可复用的命名 Profile，同时保留单项覆盖能力：
@@ -164,7 +186,7 @@
      * 保留 `parallel_read_tools`、`sticky_context_checkpoint`、`calibrated_context_budget`、`repair_controller="feedback"`。
   2. 同步在运行 `manifest.json` 中完整记录所用 Profile 名、工具清单与 Preamble Token 大小，方便后续做严格的 A/B 对比。
 
-#### Task 3.3：接入 Harbor 原生 Agent 适配接口（Terminal-Bench 4.1）
+#### Task 3.3：接入 Harbor 原生 Agent 适配接口（Terminal-Bench 4.1）**[适配器已落地；PTY 决策跳过]**
 * **目标文件**：`src/stellarweaver/evals/terminal_bench.py`（新建）
 * **具体改动**：
   1. **优先对接 Harbor 原生 Agent 适配接口（禁止重复造轮子）**：Phase 3 开工前先检查所安装 Harbor 版本的原生 Agent 接口，在 `evals/terminal_bench.py` 中仅实现轻量 Agent 包装类，把命令执行直接委托给 Harbor 传入的持久任务容器 `exec` 接口——**不手写 `docker run`、任务目录解析（`instruction.md` / `task.toml`）或 verifier 容器编排**，既大幅减省维护成本，又保证与官方榜单 100% 同口径；同时与现有一次性 `--rm --read-only` 快照的 `DockerRunner` 彻底解耦，天然支持容器内 `apt-get`、`/etc` 修改与后台 daemon 服务保活。
@@ -173,7 +195,7 @@
 
 ---
 
-### Phase 4：谷期正式跑榜与 A/B 验收（1 天开发 + 1 个谷期窗口运行）
+### Phase 4：谷期正式跑榜与 A/B 验收（1 天开发 + 1 个谷期窗口运行）— **[5 题冒烟已落地 `fa8fde4`；全量调整为 19+4=23 题方案]**
 
 1. **谷期窗口与成本闸门**（依据 [DeepSeek Pricing](https://api-docs.deepseek.com/quick_start/pricing/)）：
    * **谷期时段**：北京时间工作日 `18:00–次日 09:00` 及 `12:00–14:00`，或**周末/法定节假日全天**（半价：人民币 `¥0.02 / ¥1.00 / ¥4.00` 每百万 Token；美元 `$0.003 / $0.15 / $0.60` 每百万 Token）。
@@ -203,3 +225,22 @@
    * `mypy src/stellarweaver`
    * `pytest`（包含本次新增的回归单测）
 4. **文档同步**：每个 Phase 完成后同步更新 `docs/ARCHITECTURE.md`（新增 Profile 与容错机制说明）以及最终评测报告 `docs/TerminalBench4Eval.md`。
+
+---
+
+## Phase 4 后增量落地项（原方案外实战新增）
+
+在 2026-11-25 跑完 Phase 4 冒烟后，基于真实长程试验与源码审查暴露的问题，又陆续落地了以下 4 项原路线图未列出的工程改造，现已全部合并至 `master`：
+
+1. **流式零字节断连记账修复与 `max_output_tokens_total` 调优（`506f2de` · `4cb30fe`）**：
+   - 修复 `payments-pipeline-fix` 6 次零字节断连（`chunk_count == 0` 且无部分流）被 `Agent._request_model()` 按 `65,536` 满额虚扣输出预算的 Bug（零字节断连记为 `0`，仅中途断连按已收字符估算），并在 [test_harness_phase3.py](../tests/unit/test_harness_phase3.py) 补齐回归单测。
+   - 将 `long_horizon_deepseek_flash()` 的 `max_output_tokens_total` 从原计划 `600K` 先上调至 `1M`，后在 `4cb30fe` 进一步放宽至 **`2,000,000`** 防止重思考超长题误撞上限。
+2. **Web Compose 7 项 `SW_WEB_*` 环境变量同步透传（`86dbd1c`）**：
+   - 将 Phase 1–2 的核心容错开关（`SW_WEB_INCLUDE_LINTER`、`SW_WEB_SOFT_TEST_FAILURE_REMINDER`、`SW_WEB_MAX_LENGTH_CONTINUATIONS`、`SW_WEB_STREAM_REPETITION_DETECTION`、`SW_WEB_REPEATED_FAILURE_SOFT_THRESHOLD`、`SW_WEB_REPEATED_FAILURE_HARD_THRESHOLD`、`SW_WEB_MAX_RETRIES`）打通至 Web 配置解析、`deploy/compose.g5.yaml`、[USAGE.md](USAGE.md#harness-增强开关速查) 与 [test_web_execution_config.py](../tests/unit/test_web_execution_config.py)，并完成本机 Compose `--build` 重部署验收。
+3. **`verification_status` 语义修复、严格 `TrialLock` 分母、`ctrf.json` 诊断与 v2 逐字段用量溯源（`c1da3b4` / `e0db0b2`）**：
+   - 修复 `loop.py` 命令去重键未兼容 `command` 导致 `bash` 碰撞覆盖失败状态的 Bug，并在 `terminal-minimal` 下将无显式 `CompletionProof` 的终态严格记为 `verification_status="not_run"`。
+   - `collect_harbor_job_reports()` 改为严苛匹配作业根 `lock.json` 的 Harbor `TrialLock`（识别损坏锁、排除 `unplanned` 额外收据出主分母、分离 `job_pending_trials`），并可选解析 `verifier/ctrf.json` 子测试通过数。
+   - `Agent._account_usage()` 补齐 `output_estimated`，按输入/输出独立划分 `reported` / `estimated` / `unknown`，支持限域 WAL 只读快照安全回读历史 SQLite（不可证实部分严格标为 `unknown` 或 `legacy_mixed_unverified`），详见 [test_tb41_telemetry_and_verdict.py](../tests/unit/test_tb41_telemetry_and_verdict.py)。
+4. **`completion_evidence_reminder` 交卷前通用复核与 4-Trial A/B 实证（`d4d2795` / `55d66f6`）**：
+   - 在 `terminal-minimal` 新增默认关闭的 `completion_evidence_reminder`（首次无工具交卷且预算充足时追加 1 条仅引用公开题面的复核提示，压缩时由 `protect_initial_user` 保护初始题面，并用 `seq` 统计 `CancelledError`-safe 的 `post_reminder_*` 增量消耗）。
+   - 在 `vf2-speedup-networkx` + `wal-recovery-ordering` 上完成 4-trial 谷期 A/B：实验组在 `vf2` 提醒后成功揪出 `_core.c` 大图与 `graph.py` 自环 2 项漏网 Bug 修至 `60/60`，4-trial 缓存命中率达 **`97.97%`**。据此形成下一步执行 **[fast-agent 19 题公开标准子集 + 4 题补充 = 23 题方案](TB4.1Subset23.md)** 并默认开启 `completion_evidence_reminder: true`。

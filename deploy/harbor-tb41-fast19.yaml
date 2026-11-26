@@ -1,0 +1,41 @@
+# Pinned Harbor 0.25.0 configuration for the 19-task fast-agent Terminal-Bench 4.1 subset.
+# Methodology: https://fast-agent.ai/benchmarks/methodology/terminal-bench-4-1-subset/
+# Usage (recommended during DeepSeek off-peak hours, Beijing 18:00-09:00 / 12:00-14:00 or weekends):
+#   $env:PYTHONUTF8 = "1"
+#   $env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
+#   .\.venv\Scripts\harbor.exe run --config deploy/harbor-tb41-fast19.yaml --env-file .env
+jobs_dir: .validation/tb41-fast19
+n_attempts: 1
+n_concurrent_trials: 1  # Safe default for ~7.5 GiB Docker memory; may try 2 for lightweight CPU runs.
+environment:
+  type: docker
+  delete: true  # Remove containers/images after each trial completes to avoid exhausting 7.5 GiB Docker resources.
+agents:
+  - name: stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent
+    model_name: deepseek/deepseek-flash
+    kwargs:
+      reasoning_effort: max
+      completion_evidence_reminder: true
+datasets:
+  - name: terminal-bench/terminal-bench
+    version: "4.1.0"
+    task_names:
+      - terminal-bench/atrx-vep-crispr
+      - terminal-bench/cad-model
+      - terminal-bench/cargo-flight-dispatch
+      - terminal-bench/fin-saccr-rwa
+      - terminal-bench/gsea-proteomics
+      - terminal-bench/hof-topology-interpenetration
+      - terminal-bench/html-js-filter
+      - terminal-bench/mvcc-lsm-compaction
+      - terminal-bench/photonic-waveguide-routing
+      - terminal-bench/production-planning
+      - terminal-bench/react-lead-form
+      - terminal-bench/satb-audio-transcription
+      - terminal-bench/session-window-debug
+      - terminal-bench/sound-change-cascade
+      - terminal-bench/telecom-entity-resolution
+      - terminal-bench/vba-userform-port
+      - terminal-bench/vllm-deepseek-streaming
+      - terminal-bench/vpp-loss-divergence
+      - terminal-bench/wal-recovery-ordering

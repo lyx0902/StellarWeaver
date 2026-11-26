@@ -249,25 +249,68 @@ ImportError: libGL.so.1: cannot open shared object file: No such file or directo
 
 ## 6. 下一步改进清单（Action Items）与基准迁移建议
 
-### 6.1 按优先级排序的工程改造清单
+### 6.1 按优先级排序的工程改造清单（含落地核对）
 
-| 优先级 | 改造项 | 对应代码文件 | 实测依据与预期收益 |
-|---|---|---|---|
-| **P0 必改** | **`edit_file` 行尾自动兼容（LF ↔ CRLF）+ 本地预取锁定 `core.autocrlf=false`** | `src/stellarweaver/tools/files.py`<br>`scripts/swebench_eval_helper.py` | 消除 `astroid-1196`（8 次失败）和 `astroid-1978`（2 次失败）的 `EDIT_NOT_FOUND` 摩擦；写回时保留文件原始行尾不污染 diff |
-| **P0 必改** | **修复 `swebench.py` 缓存命中统计误判 `incomplete`** | `src/stellarweaver/evals/swebench.py#L672-L706` | 当前 `requests` 混入了 `model.failed`，导致单次网络重试（`pydicom-1413`、`astroid-1196/1978`）即丢弃全题 `cached_input_tokens`；改为仅对 `model.completed` 汇总缓存命中 |
-| **P1 建议** | **探测容器工具可用性，动态隐藏或降级 `run_linter`** | `src/stellarweaver/tools/development.py`<br>`src/stellarweaver/evals/swebench.py` | 本轮中官方容器均无 `ruff`，每次 `run_linter` 均报 Traceback；在不可用环境中禁用或返回结构化提示，避免浪费轮次与污染上下文 |
-| **P1 建议** | **增加软性收敛复核（未解决测试失败提醒）** | `src/stellarweaver/runtime/loop.py`<br>`src/stellarweaver/runtime/task_evidence.py` | `astroid-1268`、`sqlfluff-1517/1625/1763` 在最终提交前均有未解释的 `run_visible_tests` / `run_tests` 失败；在 `completion_gate=false` 下可考虑轻量注入一次「存在失败测试」提示（避免硬卡死） |
-| **P2 观察** | **评估 `reasoning_effort: max` 在复杂推理题上的收益** | `src/stellarweaver/config.py` / CLI 参数 | 6 道有效失败题全部源自推理/需求判断而非 Harness 阻断；可在新基准上做 `high` vs `max` 的 A/B 对照（重点关注耗时与输出成本增幅） |
-| **P2 观察** | **观察 `delegate_exploration` 在大型仓库中的触发率** | `src/stellarweaver/runtime/exploration.py`<br>`src/stellarweaver/runtime/loop.py` | 本轮 0/23 触发；无需在小型仓库强行诱导，待切到多文件/大型仓库基准（如 SWE-bench Pro / Terminal-Bench）后再观测其实际 ROI |
+> **核对说明（2026-11-26）**：下表 6 项由本次 `dev` 23 题归因沉淀的改造项均已随 Phase 1–3 与 TB 4.1 演进完成验证或按场景落地；SWE-bench Lite 本身不再推进 `test` 300 题或复跑调参，已于 `dev` 23 题收官归档。
 
-### 6.2 基准迁移建议与最小验收检查项
+| 优先级 | 改造项 | 对应代码文件 | 实测依据与预期收益 | 落地状态与提交 |
+|---|---|---|---|---|
+| **P0 必改** | **`edit_file` 行尾自动兼容（LF ↔ CRLF）+ 本地预取锁定 `core.autocrlf=false`** | `src/stellarweaver/tools/files.py`<br>`src/stellarweaver/tools/staging.py`<br>`scripts/swebench_eval_helper.py` | 消除 `astroid-1196`（8 次失败）和 `astroid-1978`（2 次失败）的 `EDIT_NOT_FOUND` 摩擦；写回时保留文件原始行尾不污染 diff | **已落地**（Phase 1，`82d2f5c` / `4172913`） |
+| **P0 必改** | **修复 `swebench.py` 缓存命中统计误判 `incomplete`** | `src/stellarweaver/evals/swebench.py` | 原 `requests` 混入 `model.failed` 导致重试题丢失 `cached_input_tokens`；改为仅对 `model.completed` 汇总缓存命中并单列失败重试计数 | **已落地**（Phase 1，`82d2f5c` / `4172913`；TB 4.1 进一步升级为逐字段 v2 溯源 `c1da3b4`） |
+| **P1 建议** | **探测容器工具可用性，动态隐藏或降级 `run_linter`** | `src/stellarweaver/tools/development.py`<br>`src/stellarweaver/evals/swebench.py`<br>`src/stellarweaver/config.py` | 官方容器均无 `ruff` 导致每次 `run_linter` 报 Traceback；新增 `include_linter` 开关（无 `ruff` 镜像直接隐藏）及容器内无 Traceback 结构化跳过降级 | **已落地**（Phase 1，`82d2f5c` / `4172913`） |
+| **P1 建议** | **增加软性收敛复核（未解决测试失败提醒）** | `src/stellarweaver/runtime/loop.py`<br>`src/stellarweaver/runtime/task_evidence.py` | 在无硬性 `completion_gate` 下于最终提交前最多注入 1 次轻提醒（列出当前编辑指纹下未通过测试），避免带未解释失败草率交卷 | **已落地**（Phase 1 `soft_test_failure_reminder` `82d2f5c`；并在 TB 4.1 延伸为通用 `completion_evidence_reminder` `d4d2795`） |
+| **P2 观察** | **评估 `reasoning_effort: max` 在复杂推理题上的收益** | `src/stellarweaver/config.py`<br>`src/stellarweaver/evals/swebench.py` | 6 道有效失败题全部源自推理/需求判断而非 Harness 阻断；`prepare` CLI 补齐 `--reasoning-effort max` 并冻结 `long_horizon_deepseek_flash()` | **已落地**（Phase 2 `8a73c5c` 并在 TB 4.1 全面启用 `max`；SWE-bench Lite 已归档不再复跑） |
+| **P2 观察** | **观察 `delegate_exploration` 在大型仓库中的触发率** | `src/stellarweaver/runtime/exploration.py`<br>`src/stellarweaver/config.py` | `dev` 23 题 `0/23` 触发，继续保留给 Web / `swe-python`；而在面向单容器终端的 `terminal-minimal` Profile 中显式禁用以精简 Preamble 并保住 97%+ Prefix Cache | **已验证并按场景取舍**（`195a0f8` `terminal-minimal` 禁用，Web/`swe-python` 保留） |
 
-鉴于 SWE-bench Lite `dev` 集 34.8% 的官方镜像已腐化且样本量仅 23 题，建议下一阶段直接迁移至**容器环境更干净、且已有 DeepSeek-V4.1-Flash-1017 公开对照基线**的基准（例如 **Terminal-Bench 4.1 63 题无 GPU 版** 或 **SWE-bench Pro V2 HARD-51**）。
+### 6.2 基准迁移决定与历史收官归档
 
-在正式启动下一阶段全量评测前，建议执行以下 **5 项最小验收检查（Pre-flight Checklist）**：
+鉴于 SWE-bench Lite `dev` 集 **34.8%（8/23）** 的官方镜像存在依赖腐化（NumPy 2.0、`pytest 8.3.5`、`libGL.so.1`）且多道失败题耦合私有方法白盒测试，项目组决定**不再推进 SWE-bench Lite 正式集（`test` 300 题）或进一步消融**，并将全面评测与迭代重点正式迁移至容器干净、具备同模型可审计榜单的 **Terminal-Bench 4.1**（`fast-agent` 19 题公开标准子集 + 4 题多容器/高难专项 = 23 题覆盖）：
 
-1. **P0 修复落地并过单测**：合入 `edit_file` CRLF 兼容修复与 `swebench.py` 缓存统计修复，`ruff check .`、`mypy src/stellarweaver` 与相关单元测试全绿。
-2. **容器环境 3 题冒烟测试**：在新基准中随机抽 3 题（覆盖不同基础镜像），先验证空补丁 / 原始仓库在官方镜像内能正常启动 `pytest`（排除类似 NumPy 2.0 / pytest 8 / 缺 `libGL.so.1` 的上游镜像坏件）。
-3. **开发工具链探活**：确认新基准容器内 `python`、`pytest`、`git` 路径及 `run_linter` 行为正常，无高频无意义 Traceback。
-4. **Windows 路径与编码双保险**：确认评分器以 `-X utf8` 启动、补丁校验临时目录走短路径系统 temp、本地 git 资产库以 `core.longpaths=true` + `core.autocrlf=false` 预拉取。
-5. **预算与对照锁定**：在 `manifest.json` 中显式冻结与 1017 公开基线可比的 `reasoning_effort`、`context_window_tokens`、`max_wall_seconds` 与 `max_tool_calls`，并启用按批次自动清理镜像守卫（`prune-images --report`）。
+- Terminal-Bench 4.1 5 题 CPU 冒烟与 4-trial A/B 实测：[TerminalBench4Eval.md](TerminalBench4Eval.md)
+- Terminal-Bench 4.1 23 题基准档案与同模型标杆对照：[TB4.1Subset23.md](TB4.1Subset23.md)
+- SWE-bench Lite 批量评测器架构与命令存档：[EVALUATION.md](EVALUATION.md#swe-bench-lite-批量评测体系已归档参考)
+
+---
+
+## 附录：历史试跑与阶段基线归档（迁移自 EVALUATION.md）
+
+> 以下记录原位于 `docs/EVALUATION.md`，现随 SWE-bench Lite 评测收官统一归档于本报告末尾，便于查阅完整演进历史。
+
+### A.1 2026-11-24 ~ 25 全量 `dev` 23 题 Full Harness 实测汇总（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
+
+按 6 个仓库分批执行（预算冻结：`--context-window-tokens 200000 --max-tool-calls 80 --max-wall-seconds 600 --max-input-tokens-total 3000000 --max-output-tokens-total 64000`），全部 6 批合同报告已发布至工作台看板：
+
+| 批次 | 仓库 | 计划题数 | 官方原始成绩 | 上游镜像异常 | 有效镜像成绩 | 工作台报告 |
+| --- | --- | :---: | :---: | :---: | :---: | --- |
+| Batch 1 | `marshmallow-code/marshmallow` | 2 | **2 / 2 (100%)** | 0 | **2 / 2 (100%)** | [dev-full-marshmallow.json](../.validation/workbench-experiment/reports/dev-full-marshmallow.json) |
+| Batch 2 | `pydicom/pydicom` | 5 | **2 / 5 (40.0%)** | 2（pytest 8.3.5 破坏 nose `setup`） | **2 / 3 (66.7%)** | [dev-full-pydicom.json](../.validation/workbench-experiment/reports/dev-full-pydicom.json) |
+| Batch 3 | `pylint-dev/astroid` | 5 | **3 / 5 (60.0%)** | 0 | **3 / 5 (60.0%)** | [dev-full-astroid.json](../.validation/workbench-experiment/reports/dev-full-astroid.json) |
+| Batch 4 | `pvlib/pvlib-python` | 5 | **0 / 5 (0%)** | 5（NumPy 2.0 移除 `np.Inf` + 离线失败） | —（0 有效） | [dev-full-pvlib.json](../.validation/workbench-experiment/reports/dev-full-pvlib.json) |
+| Batch 5 | `sqlfluff/sqlfluff` | 5 | **2 / 5 (40.0%)** | 0 | **2 / 5 (40.0%)** | [dev-full-sqlfluff.json](../.validation/workbench-experiment/reports/dev-full-sqlfluff.json) |
+| Batch 6 | `pyvista/pyvista` | 1 | **0 / 1 (0%)** | 1（缺 `libGL.so.1` + 离线失败） | —（0 有效） | [dev-full-pyvista.json](../.validation/workbench-experiment/reports/dev-full-pyvista.json) |
+| **合计** | **全量 `dev`** | **23** | **9 / 23 (39.1%)** | **8（34.8%）** | **9 / 15 (60.0%)** | 有效口径 Wilson 95% CI `[35.7%, 80.2%]` |
+
+- **端到端稳定性**：**23/23 题全部 `model finished` 并产出合法 `valid_patch`**（0 空补丁、0 非法补丁、0 超时、0 Harness 误杀硬中断）；`pydicom-1413` 核心 `FAIL_TO_PASS` 实际已 **3/3 全过**，仅挂在官方镜像 `pytest 8.3.5` 的 2 个 nose `setup` 回归测试。
+- **精确用量与成本**（由 23 份 `session.sqlite3` 精确汇总，DeepSeek-Flash 闲时定价：命中 ¥0.02/1M、未命中 ¥1.00/1M、输出 ¥4.00/1M）：
+  - 总输入 `19,913,835`（~19.91M）、缓存命中 `17,258,493`（**86.67%** 命中率）、总输出 `386,007`（~0.39M）；
+  - 闲时实测总费用 **¥4.54**（均摊 **¥0.20 / 题**）；单题中位耗时 `148.7s`（均值 `194.5s`，总计 `74.6` 分钟）、中位轮次 `18` 轮。
+
+### A.2 2026-11-24 三题冒烟实测（`--harness-profile full` · DeepSeek Flash Thinking High · 200k 窗口）
+
+已发布至工作台看板（[full-3tasks-20261124-v2.json](../.validation/workbench-experiment/reports/full-3tasks-20261124-v2.json)、[full-astroid-20261124.json](../.validation/workbench-experiment/reports/full-astroid-20261124.json)），独立官方评分器 `swebench 5.0.2` 裁决结果如下：
+
+| 题号 | 运行终态 | 候选状态 | 官方评分 | 模型 / 工具调用 | 总输入（缓存命中率） | 总输出 | 耗时 | 谷期实测成本 |
+| --- | --- | --- | :---: | :---: | :---: | ---: | ---: | :---: |
+| `marshmallow-code__marshmallow-1359` | `completed` | `valid_patch` | **`resolved`** | 26 / 37 | 1,168,939（**89.5%**） | 19,329 | 170s | ¥0.22 |
+| `pydicom__pydicom-1694` | `completed` | `valid_patch` | **`resolved`** | 14 / 21 | 452,881（**82.6%**） | 6,920 | 148s | ¥0.11 |
+| `pylint-dev__astroid-1333` | `completed` | `valid_patch` | `unresolved` | 32 / 44 | 2,440,849（**89.5%**） | 35,045 | 301s | ¥0.44 |
+
+- **实测观察**：3 题全部干净 `completed` 并产出可应用的 `valid_patch`（0 环境故障、0 评分异常）；DeepSeek 实测 Prefix Cache 命中率达 **82.6%–89.5%**（均值 **88.7%**）；`astroid-1333` 所有 45 项 `PASS_TO_PASS` 通过，未过项为模型改了 `astroid/manager.py` 而非金标准 `astroid/modutils.py`。
+
+### A.3 2026-11-20 历史 Phase 2 基线试跑（旧 100k 窗口 · 无 Harness 增强）
+
+- `marshmallow-code__marshmallow-1359`：`valid_patch` → **`resolved`**
+- `pydicom__pydicom-1694`：`valid_patch` → **`resolved`**
+- `pylint-dev__astroid-1333`：触及旧预算上限，未生成补丁（`not_evaluated`）
+
+> 单题复现闸门试跑脚本（`stellarweaver.evals.swebench_pilot`）保留用于 `marshmallow-1359` 的历史复现对照，后续官方/历史归档批量操作均以 `stellarweaver.evals.swebench` 为准。
