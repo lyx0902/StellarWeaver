@@ -486,6 +486,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         profile: Literal["terminal-minimal"] = "terminal-minimal",
         reasoning_effort: Literal["low", "high", "max"] | None = None,
         stream: bool | str = True,
+        completion_evidence_reminder: bool | str | None = None,
         **kwargs: Any,
     ) -> None:
         init_kwargs = dict(kwargs)
@@ -516,6 +517,15 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         if base_config.harness.profile != "terminal-minimal":
             base_config = base_config.model_copy(
                 update={"harness": terminal_minimal_harness()}
+            )
+        if completion_evidence_reminder is not None:
+            enabled = _parse_bool_flag(completion_evidence_reminder)
+            base_config = base_config.model_copy(
+                update={
+                    "harness": base_config.harness.model_copy(
+                        update={"completion_evidence_reminder": enabled}
+                    )
+                }
             )
         self.config = base_config
 
@@ -580,6 +590,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         started: float,
         outcome_dict: JSONDict | None,
     ) -> JSONDict:
+        ended_ns = time.monotonic_ns()
         events = store.load_events()
         run_id = _extract_outcome_run_id(outcome_dict) or store.run_id
         run_events = [e for e in events if not e.run_id or e.run_id == run_id]
@@ -633,6 +644,28 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             for e in failed_requests
             if "repetitive generation loop" in str(e.payload.get("message", "")).lower()
         )
+        reminder = next(
+            (event for event in run_events if event.type == "completion_evidence.reminded"), None
+        )
+        after_reminder = (
+            [event for event in run_events if event.seq > reminder.seq] if reminder else []
+        )
+        reminder_usage = {
+            "completion_evidence_reminders": int(reminder is not None),
+            "post_reminder_model_calls": sum(
+                event.type in {"model.completed", "model.failed"} for event in after_reminder
+            ),
+            "post_reminder_tool_calls": sum(event.type == "tool.completed" for event in after_reminder),
+            "post_reminder_wall_seconds": (
+                round((ended_ns - int(reminder.payload["monotonic_ns"])) / 1_000_000_000, 3)
+                if reminder
+                else 0.0
+            ),
+        }
+        if reminder is not None:
+            store.append_event(
+                "completion_evidence.finished", {**reminder_usage, "reminder_seq": reminder.seq}
+            )
         report: JSONDict = {
             "agent": self.name(),
             "version": self.version(),
@@ -650,6 +683,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             "outcome": outcome_dict,
             "tools_invoked": [asdict(tool) for tool in agent.results],
             **usage_summary,
+            **reminder_usage,
             "compactions": compactions,
             "length_continuations": length_continuations,
             "truncated_thinking": truncated_thinking,

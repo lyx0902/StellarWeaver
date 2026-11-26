@@ -137,6 +137,7 @@ class HarnessConfig(StrictConfig):
     protect_fresh_tool_output: bool = False
     include_linter: bool = True
     soft_test_failure_reminder: bool = False
+    completion_evidence_reminder: bool = False
     max_length_continuations: int = Field(default=0, ge=0, le=10)
     repeated_failure_soft_threshold: int = Field(default=3, ge=1, le=20)
     repeated_failure_hard_threshold: int = Field(default=3, ge=1, le=20)

@@ -383,6 +383,7 @@ class ContextManager:
         current_instructions: Sequence[Message] = (),
         current_evidence: Sequence[Message] = (),
         shrink_from: int | None = None,
+        protect_initial_user: bool = False,
     ) -> ContextProjection:
         if max_output_tokens < 1 or context_window_tokens < 1:
             raise ValueError("Output reserve and context window must be positive")
@@ -394,6 +395,11 @@ class ContextManager:
             )
 
         messages = tuple(messages)
+        initial_user = (
+            next((index for index, item in enumerate(messages) if item.role == "user"), -1)
+            if protect_initial_user
+            else -1
+        )
         system_end = next(
             (index for index, item in enumerate(messages) if item.role != "system"), len(messages)
         )
@@ -411,6 +417,9 @@ class ContextManager:
             return ContextSize(raw_bytes, calibration_factor)
 
         working = baseline.extend(messages) if baseline is not None and not force else messages
+        if initial_user >= 0 and messages[initial_user] not in working:
+            # A prior checkpoint may have summarized the task before it was protected.
+            working = messages
         working_view = model_view(working)
         before = measure(working_view)
         unchanged = ContextProjection(working_view, working, before, False, {}, -1, before, budget)
@@ -438,6 +447,7 @@ class ContextManager:
         protected = {position for group in recent for position in group.positions}
         protected.update(fresh)
         protected.add(latest_user)
+        protected.add(initial_user)
         protected.update(index for index, item in enumerate(messages) if item.role == "system")
         removable = [group for group in groups if not set(group.positions) & protected]
         omitted: set[int] = set()

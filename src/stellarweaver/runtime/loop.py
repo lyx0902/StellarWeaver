@@ -78,6 +78,14 @@ Do not read credentials, overwrite user changes, commit, publish, or connect acc
 Stop if permission is blocked. Report changes, real checks and remaining uncertainty.
 A successful command is evidence of that command only, not proof the entire task is solved."""
 
+COMPLETION_EVIDENCE_REMINDER = """\
+Before submitting, compare the current deliverable with the original task
+requirements. Check whether your tests cover the required behavior and any
+performance, accuracy, boundary, or concurrency conditions stated in the task.
+If a key requirement is untested or fails, use the remaining task budget to run
+a representative check, fix the implementation, and retest. When you finish,
+state any important requirement you could not verify."""
+
 
 class BudgetExceeded(Exception):
     pass
@@ -235,6 +243,7 @@ class Agent:
         self._chunk_index = 0
         self._stream_output_bytes = 0
         self._soft_reminder_sent = False
+        self._completion_evidence_reminded = False
         self._length_continuations = 0
         self._task_evidence = (
             TaskEvidence()
@@ -1132,9 +1141,10 @@ class Agent:
         force: bool = False,
         shrink: bool = False,
         previous_size: int = 0,
+        preview_message: Message | None = None,
     ) -> tuple[ModelRequest, ContextProjection]:
         refresh = getattr(self.registry, "refresh_extensions", None)
-        if refresh is not None:
+        if refresh is not None and preview_message is None:
             await refresh()
             schemas = tuple(self.registry.schemas())
         window = self.provider.capabilities().context_window_tokens
@@ -1167,6 +1177,8 @@ class Agent:
             )
             self._instruction_logged = fingerprint
         history = self.projected_history()
+        if preview_message is not None:
+            history = (*history, preview_message)
         sticky = self.harness_config.sticky_context_checkpoint
         if schemas and self.provider.capabilities().requires_reasoning_history:
             history = thinking_history(history, stable_evidence=sticky)
@@ -1289,6 +1301,8 @@ class Agent:
                 current_instructions=derived if sticky else (),
                 current_evidence=extra if sticky else (),
                 shrink_from=shrink_from,
+                # Keep the public task available after the reminder becomes the latest user message.
+                protect_initial_user=self._completion_evidence_reminded or preview_message is not None,
             )
 
         # On a server context-length error shrink once; no old tool dispatch is involved.
@@ -1312,6 +1326,14 @@ class Agent:
             raise BudgetExceeded(
                 "Server context length exceeded; required context cannot shrink safely"
             )
+        request = ModelRequest(
+            projection.messages,
+            schemas,
+            output,
+            detect_repetition=self.harness_config.stream_repetition_detection,
+        )
+        if preview_message is not None:
+            return request, projection
         if projection.compacted:
             metrics = (
                 {
@@ -1349,15 +1371,7 @@ class Agent:
             if sticky:
                 self._context_baseline = ContextBaseline(history, projection.history)
         self._instruction_seen = set(fingerprint)
-        return (
-            ModelRequest(
-                projection.messages,
-                schemas,
-                output,
-                detect_repetition=self.harness_config.stream_repetition_detection,
-            ),
-            projection,
-        )
+        return request, projection
 
     def projected_history(self) -> tuple[Message, ...]:
         """Current model conversation boundary; raw session messages remain complete."""
@@ -1721,6 +1735,39 @@ class Agent:
         await self._emit("convergence.reminder", {"unresolved_failures": failures})
         return True
 
+    async def _maybe_remind_completion_evidence(self, schemas: tuple[JSONDict, ...]) -> bool:
+        if (
+            not self.harness_config.completion_evidence_reminder
+            or self.harness_config.profile != "terminal-minimal"
+            or self._completion_evidence_reminded
+            or self._soft_reminder_sent
+            or self._pending_calls
+            or self._time_exhausted()
+            or self._tools_exhausted()
+        ):
+            return False
+        model_limit = self.limits.max_model_calls
+        if self.enforce_run_budget and (
+            (model_limit is not None and self._model_calls >= model_limit)
+            or self._input_tokens >= self.limits.max_input_tokens_total
+            or self._output_limit() <= 0
+        ):
+            return False
+
+        message = Message("user", COMPLETION_EVIDENCE_REMINDER)
+        try:
+            # Confirm the next prompt actually fits before journaling the reminder.
+            request, projection = await self._prepare_context(schemas, preview_message=message)
+            self._checked_request(request, projection.estimated_tokens)
+        except (BudgetExceeded, ContextBudgetExceeded):
+            return False
+
+        self._completion_evidence_reminded = True
+        self.store.append_message(message)
+        self.messages.append(message)
+        await self._emit("completion_evidence.reminded", {"monotonic_ns": time.monotonic_ns()})
+        return True
+
     @staticmethod
     def _valid_tool_calls(calls: tuple[ToolCall, ...]) -> bool:
         seen: set[str] = set()
@@ -1912,8 +1959,11 @@ class Agent:
             if reply.stop_reason == "tool_calls":
                 return self._completion("failed", "tool_calls stop without calls")
             if self.completion_check is None:
-                if await self._maybe_remind_unresolved_tests():
-                    continue
+                if not self._completion_evidence_reminded:
+                    if await self._maybe_remind_completion_evidence(schemas):
+                        continue
+                    if await self._maybe_remind_unresolved_tests():
+                        continue
                 return self._completion("completed", "model finished", reply.text)
             if not await self._check_completion():
                 status = self._completion_proofs[-1]["status"]
