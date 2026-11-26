@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import sys
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -15,8 +17,10 @@ from pydantic import ValidationError
 
 from stellarweaver.config import (
     AppConfig,
+    ContextConfig,
     ExecutionConfig,
     HarnessConfig,
+    LimitsConfig,
     ModelConfig,
     PolicyConfig,
     RetryConfig,
@@ -32,6 +36,7 @@ from stellarweaver.domain import (
     ModelStreamEvent,
     ToolCall,
 )
+from stellarweaver.evals import terminal_bench
 from stellarweaver.evals.terminal_bench import (
     HarborAgentContext,
     StellarWeaverHarborAgent,
@@ -43,6 +48,8 @@ from stellarweaver.policy import PolicyEngine
 from stellarweaver.policy.risk import assess
 from stellarweaver.providers.base import ProviderError
 from stellarweaver.providers.fake import FakeModel
+from stellarweaver.runtime import loop
+from stellarweaver.runtime.loop import Agent, CompletionProof
 from stellarweaver.runtime.service import build_agent
 from stellarweaver.session.store import SessionStore
 from stellarweaver.tools.commands import (
@@ -521,8 +528,6 @@ async def test_harbor_docker_runtime_error_timeout_classified_as_command_timeout
 async def test_harbor_trial_timeout_propagates_cancellation_and_preserves_telemetry(
     tmp_path: Path,
 ) -> None:
-    import asyncio
-
     class _SlowEnv:
         async def exec(
             self,
@@ -564,6 +569,268 @@ async def test_harbor_trial_timeout_propagates_cancellation_and_preserves_teleme
     saved = json.loads((logs_dir / "trial-report.json").read_text(encoding="utf-8"))
     assert saved["outcome"]["run_status"] == "cancelled"
     assert saved["cached_input_tokens"] == 400
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [(True, True), (False, False), ("true", True), ("off", False)],
+)
+def test_harbor_completion_evidence_parses_bool_kwargs(
+    tmp_path: Path, value: bool | str, enabled: bool
+) -> None:
+    adapter = StellarWeaverHarborAgent(tmp_path, completion_evidence_reminder=value)
+    assert adapter.config.harness.completion_evidence_reminder is enabled
+
+
+def test_harbor_completion_evidence_rejects_invalid_bool_kwargs(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid boolean flag"):
+        StellarWeaverHarborAgent(tmp_path, completion_evidence_reminder="maybe")
+
+
+async def test_harbor_completion_evidence_preserves_initial_request_and_allows_repairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1000.0
+    clock = SimpleNamespace(
+        monotonic=lambda: now,
+        monotonic_ns=lambda: int(now * 1_000_000_000),
+    )
+    monkeypatch.setattr(loop, "time", clock)
+    monkeypatch.setattr(terminal_bench, "time", clock)
+
+    baseline_model = FakeModel([AssistantReply(text="Initial submission")])
+    baseline_dir = tmp_path / "baseline"
+    baseline_adapter = StellarWeaverHarborAgent(baseline_dir, provider=baseline_model)
+    baseline = await baseline_adapter.run(
+        "Meet the published accuracy requirement", _MockHarborEnvironment(lambda _: _MockExecResult())
+    )
+    assert baseline["completion_evidence_reminders"] == 0
+    assert baseline["post_reminder_model_calls"] == baseline["post_reminder_tool_calls"] == 0
+    assert baseline["post_reminder_wall_seconds"] == 0
+    assert baseline["outcome"]["final_text"] == "Initial submission"
+
+    commands = ["run-representative-check", "apply-fix", "rerun-check"]
+
+    def respond(request: ModelRequest) -> AssistantReply:
+        nonlocal now
+        step = len(model.requests) - 1
+        if step == 0:
+            return AssistantReply(text="Initial submission")
+        assert sum(m.content == loop.COMPLETION_EVIDENCE_REMINDER for m in request.messages) == 1
+        now += 45
+        if step <= len(commands):
+            return AssistantReply(
+                tool_calls=(
+                    ToolCall(str(step), "bash", json.dumps({"command": commands[step - 1]})),
+                ),
+                stop_reason="tool_calls",
+            )
+        return AssistantReply(text="Revised submission")
+
+    model = FakeModel(respond)
+    env = _MockHarborEnvironment(lambda _: _MockExecResult(stdout="ok"))
+    logs_dir = tmp_path / "treatment"
+    adapter = StellarWeaverHarborAgent(
+        logs_dir, provider=model, completion_evidence_reminder="true"
+    )
+    report = await adapter.run("Meet the published accuracy requirement", env)
+    assert asdict(model.requests[0]) == asdict(baseline_model.requests[0])
+    assert report["tools_sha256"] == baseline["tools_sha256"]
+    assert report["config_sha256"] != baseline["config_sha256"]
+    assert [call["command"] for call in env.calls] == commands
+    assert report["outcome"]["final_text"] == "Revised submission"
+    assert report["outcome"]["verification_status"] == baseline["outcome"]["verification_status"] == "not_run"
+    assert report["completion_evidence_reminders"] == 1
+    assert report["post_reminder_model_calls"] == 4
+    assert report["post_reminder_tool_calls"] == 3
+    assert report["post_reminder_wall_seconds"] == 180.0
+    manifest = json.loads((logs_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["harness"]["completion_evidence_reminder"] is True
+
+
+async def test_harbor_completion_evidence_keeps_full_task_after_context_compaction(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig(
+        model=ModelConfig(context_window_tokens=16_000, max_output_tokens=512),
+        context=ContextConfig(recent_complete_rounds=1, fresh_tool_rounds=1),
+        harness=terminal_minimal_harness(),
+    )
+    task = "Published requirements\n" + "specific requirement\n" * 100 + "Final threshold"
+    model = FakeModel(
+        [
+            AssistantReply(
+                tool_calls=(ToolCall("first", "bash", '{"command":"check"}'),),
+                stop_reason="tool_calls",
+            ),
+            AssistantReply(text="Initial submission"),
+            AssistantReply(
+                tool_calls=(ToolCall("followup", "bash", '{"command":"check-again"}'),),
+                stop_reason="tool_calls",
+            ),
+            AssistantReply(text="Revised submission"),
+        ],
+        context_window_tokens=16_000,
+    )
+    adapter = StellarWeaverHarborAgent(
+        tmp_path, config=config, provider=model, completion_evidence_reminder=True
+    )
+    env = _MockHarborEnvironment(lambda _: _MockExecResult(stdout="output " * 1_900))
+    report = await adapter.run(task, env)
+
+    assert report["outcome"]["final_text"] == "Revised submission"
+    assert len(model.requests) == 4
+    events = SessionStore.inspect(tmp_path / report["session_db_relpath"]).events
+    reminder, = (event for event in events if event.type == "completion_evidence.reminded")
+    assert any(event.type == "context.compacted" and event.seq > reminder.seq for event in events)
+    for request in model.requests[2:]:
+        assert any(message.role == "user" and message.content == task for message in request.messages)
+
+
+@pytest.mark.parametrize(
+    ("budget", "limit"),
+    [
+        ("max_model_calls", 1),
+        ("max_input_tokens_total", 10_000),
+        ("max_input_tokens_total", 10_001),  # A positive balance too small for the next prompt.
+        ("max_output_tokens_total", 8),
+        ("max_tool_calls", 1),
+        ("max_wall_seconds", 1),
+    ],
+)
+async def test_harbor_completion_evidence_checks_remaining_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, budget: str, limit: int
+) -> None:
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal")
+    limits = LimitsConfig.model_validate({**config.limits.model_dump(), budget: limit})
+    config = config.model_copy(update={"limits": limits})
+    now = 1000.0
+    monkeypatch.setattr(loop, "time", SimpleNamespace(monotonic=lambda: now))
+
+    def respond(_: ModelRequest) -> AssistantReply:
+        nonlocal now
+        if budget == "max_tool_calls" and len(model.requests) == 1:
+            return AssistantReply(
+                tool_calls=(ToolCall("check", "bash", '{"command":"check"}'),),
+                stop_reason="tool_calls",
+            )
+        if budget == "max_wall_seconds":
+            now += limit
+        return AssistantReply(
+            text="Initial submission",
+            usage={"prompt_tokens": 10_000, "completion_tokens": 8},
+        )
+
+    model = FakeModel(respond)
+    adapter = StellarWeaverHarborAgent(
+        tmp_path, config=config, provider=model, stream=False, completion_evidence_reminder=True
+    )
+    report = await adapter.run("Task", _MockHarborEnvironment(lambda _: _MockExecResult()))
+    assert report["completion_evidence_reminders"] == 0
+    assert report["post_reminder_model_calls"] == report["post_reminder_tool_calls"] == 0
+    expected_status = "budget_exceeded" if budget == "max_wall_seconds" else "completed"
+    assert report["outcome"]["run_status"] == expected_status
+    assert len(model.requests) == (2 if budget == "max_tool_calls" else 1)
+
+
+async def test_completion_check_takes_precedence_over_harbor_evidence_reminder(
+    tmp_path: Path,
+) -> None:
+    async def confirm(_remaining: float) -> CompletionProof:
+        return CompletionProof("passed", "verified", {})
+
+    config = AppConfig(harness=terminal_minimal_harness(completion_evidence_reminder=True))
+    env = _MockHarborEnvironment(lambda _: _MockExecResult())
+    with SessionStore(tmp_path, data_dir=tmp_path / "sessions") as store:
+        model = FakeModel([AssistantReply(text="Finished")])
+        agent = build_terminal_agent(config, model, store, env)
+        agent.completion_check = confirm
+        outcome = await agent.run("Task")
+        event_types = {event.type for event in store.load_events()}
+    assert len(model.requests) == 1
+    assert outcome.verification_status == "passed"
+    assert "reproduction.completed" in event_types
+    assert "completion_evidence.reminded" not in event_types
+
+
+async def test_harbor_completion_evidence_can_reach_original_budget_after_reminder(
+    tmp_path: Path,
+) -> None:
+    model = FakeModel(
+        [
+            AssistantReply(text="Initial submission"),
+            AssistantReply(
+                tool_calls=(ToolCall("check", "bash", '{"command":"check"}'),),
+                stop_reason="tool_calls",
+            ),
+        ]
+    )
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal").model_copy(
+        update={"limits": LimitsConfig(max_model_calls=2)}
+    )
+    adapter = StellarWeaverHarborAgent(
+        tmp_path, config=config, provider=model, completion_evidence_reminder=True
+    )
+    report = await adapter.run("Task", _MockHarborEnvironment(lambda _: _MockExecResult()))
+
+    assert report["outcome"]["run_status"] == "budget_exceeded"
+    assert report["outcome"]["reason"] == "max_model_calls"
+    assert report["completion_evidence_reminders"] == 1
+    assert report["post_reminder_model_calls"] == report["post_reminder_tool_calls"] == 1
+
+
+async def test_harbor_completion_evidence_telemetry_survives_cancel_without_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finish_started = asyncio.Event()
+
+    async def interrupted_finish(self: Agent, *args: Any) -> None:
+        finish_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(Agent, "_finish", interrupted_finish)
+
+    def respond(request: ModelRequest) -> AssistantReply:
+        step = len(model.requests)
+        if step in {1, 4}:
+            return AssistantReply(
+                tool_calls=(ToolCall(str(step), "bash", '{"command":"check"}'),),
+                stop_reason="tool_calls",
+            )
+        if step == 3:
+            raise ProviderError("Disconnected during follow-up", retryable=True)
+        return AssistantReply(text="Ready")
+
+    model = FakeModel(respond)
+    config = long_horizon_deepseek_flash(harness_profile="terminal-minimal").model_copy(
+        update={"retry": RetryConfig(max_retries=1, base_delay_seconds=0)}
+    )
+    adapter = StellarWeaverHarborAgent(
+        tmp_path, config=config, provider=model, stream=False, completion_evidence_reminder=True
+    )
+    env = _MockHarborEnvironment(lambda _: _MockExecResult(stdout="ok"))
+    task = asyncio.create_task(adapter.run("Task", env))
+    try:
+        await asyncio.wait_for(finish_started.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    report = json.loads((tmp_path / "trial-report.json").read_text(encoding="utf-8"))
+    assert report["outcome"]["run_status"] == "cancelled"
+    assert report["completion_evidence_reminders"] == 1
+    assert report["post_reminder_model_calls"] == 3
+    assert report["post_reminder_tool_calls"] == 1
+    assert report["post_reminder_wall_seconds"] >= 0
+    events = SessionStore.inspect(tmp_path / report["session_db_relpath"]).events
+    assert "run.completed" not in {event.type for event in events}
+    reminder, = (event for event in events if event.type == "completion_evidence.reminded")
+    assert type(reminder.payload["monotonic_ns"]) is int
+    finished, = (event for event in events if event.type == "completion_evidence.finished")
+    assert finished.payload["reminder_seq"] == reminder.seq
+    assert finished.payload["post_reminder_model_calls"] == report["post_reminder_model_calls"]
+    assert finished.payload["post_reminder_tool_calls"] == report["post_reminder_tool_calls"]
 
 
 async def test_harbor_trial_archives_sqlite_and_artifacts_under_short_sw_dir(
@@ -782,7 +1049,7 @@ async def test_streaming_zero_chunk_failure_charges_zero_output_tokens(tmp_path:
             "retry": RetryConfig(max_retries=5, base_delay_seconds=0.0, max_delay_seconds=1.0),
         }
     )
-    assert config.limits.max_output_tokens_total == 1_000_000
+    assert config.limits.max_output_tokens_total == 2_000_000
     env = _MockHarborEnvironment(lambda _rec: _MockExecResult(stdout="", stderr="", return_code=0))
     events: list[AgentEvent] = []
     with SessionStore(tmp_path, data_dir=tmp_path) as store:

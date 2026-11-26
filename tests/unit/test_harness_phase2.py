@@ -83,7 +83,7 @@ def test_long_horizon_deepseek_flash_preset() -> None:
     assert cfg.limits.max_tool_calls == 300
     assert cfg.limits.max_wall_seconds == 3600
     assert cfg.limits.max_input_tokens_total == 80_000_000
-    assert cfg.limits.max_output_tokens_total == 1_000_000
+    assert cfg.limits.max_output_tokens_total == 2_000_000
     assert cfg.retry.max_retries == 5
     assert cfg.retry.max_delay_seconds == 60.0
     assert cfg.policy.preset == "benchmark"
