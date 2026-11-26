@@ -385,6 +385,7 @@ class Agent:
         if self._recovery_report is not None:
             evidence.append({"kind": "recovery", **self._recovery_report})
         evidence.extend({"kind": "completion_check", **item} for item in self._completion_proofs)
+        is_terminal_minimal = self.harness_config.profile == "terminal-minimal"
         checks: dict[str, ToolResult] = {}
         for result in self.results:
             if (
@@ -398,11 +399,27 @@ class Agent:
                 and result.tool_name != "discover_tests"
                 and "exit_code" in result.data
             ):
-                key = json.dumps([result.data.get("argv"), result.data.get("cwd")], sort_keys=True)
-                checks[key] = result
                 evidence.append({"kind": "command", **asdict(result)})
+                if is_terminal_minimal and result.tool_name == "bash":
+                    continue
+                cmd_spec = result.data.get("argv")
+                if cmd_spec is None:
+                    cmd_spec = result.data.get("command")
+                key = json.dumps(
+                    [result.tool_name, cmd_spec, result.data.get("cwd")],
+                    sort_keys=True,
+                )
+                checks[key] = result
         verification: Literal["passed", "failed", "not_run"] = "not_run"
-        if checks:
+        if is_terminal_minimal and self._completion_proofs:
+            last_status = self._completion_proofs[-1].get("status")
+            if last_status == "passed":
+                verification = "passed"
+            elif last_status == "failed":
+                verification = "failed"
+            else:
+                verification = "not_run"
+        elif checks:
             verification = (
                 "passed"
                 if all(r.status == "ok" and r.data["exit_code"] == 0 for r in checks.values())
@@ -717,10 +734,11 @@ class Agent:
         if not isinstance(prompt, int) or isinstance(prompt, bool) or prompt < 0:
             prompt = input_estimate
             input_estimated = True
-        estimated = input_estimated
+        output_estimated = False
         if not isinstance(completion, int) or isinstance(completion, bool) or completion < 0:
             completion = output_estimate
-            estimated = True
+            output_estimated = True
+        estimated = input_estimated or output_estimated
         self._input_tokens += prompt
         self._output_tokens += completion
         if exploration is not None:
@@ -737,6 +755,7 @@ class Agent:
             "input_tokens": prompt,
             "input_estimated": input_estimated,
             "output_tokens": completion,
+            "output_estimated": output_estimated,
             "estimated": estimated,
             "usage_incomplete": incomplete and estimated,
             **breakdown,
