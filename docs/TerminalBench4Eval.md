@@ -15,7 +15,7 @@
 | **Agent 入口** | `stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent`（原生继承 `harbor.agents.base.BaseAgent`） |
 | **Harness Profile** | `terminal-minimal`（Phase 3a 单 `bash` MVP，关闭宿主机 `ChangesManager`/`RepoMap`/`InstructionLoader`/`run_linter`） |
 | **模型与思考** | `deepseek-flash`（`DeepSeek-V4.1-Flash-1017`），`thinking="enabled"`，`reasoning_effort="max"` |
-| **窗口与预算** | `context_window_tokens=512,000`、`max_output_tokens=65,536`、`max_tool_calls=300`、`max_wall_seconds=3600s`、`max_retries=5`、`max_output_tokens_total=2,000,000`（冒烟时为 `600K`，先后上调至 `1M` → `2M`） |
+| **窗口与预算** | `context_window_tokens=512,000`、`max_output_tokens=65,536`、`max_tool_calls=2000`、`max_wall_seconds=10800s`、`max_retries=5`、`max_input_tokens_total=300,000,000`、`max_output_tokens_total=3,000,000`（5 题冒烟与 4-trial A/B 实测期间为 `300` 次 / `3600s` / `80M` / `600K→2M`，跑 19 题前对标 Ante 实耗放宽） |
 | **可选实验开关** | `completion_evidence_reminder`（默认 `false`；通过 Harbor `agents[].kwargs` 切换，2026-11-26 起合入 `master`） |
 | **执行与评分** | Harbor 持久 Docker 容器（`delete: false`）+ 官方独立 Verifier；`collect_harbor_job_reports()` 严格以作业根 `lock.json`（`TrialLock`）为分母合并裁决、可选 `verifier/ctrf.json` 诊断与逐字段实报/估算/未知用量 |
 
@@ -108,7 +108,7 @@
 
 ## 6. 下一步评测路线：19 题公开子集（+ 4 题 = 23 题覆盖）与 63 题预估
 
-* **推荐配置**：[harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（内置 `long_horizon_deepseek_flash(harness_profile="terminal-minimal")` + `max_output_tokens_total=2,000,000` + `completion_evidence_reminder: true` + `delete: true` 内存清理守卫）。
-* **P0 优先执行（`fast-agent` 19 题公开标准子集，谷期 ~¥25–¥35）**：按 [TB4.1Subset23.md](TB4.1Subset23.md) 方案原样运行 19 道纯 CPU 单容器子集（预计耗时 ~6–8 小时），与本文已完成的 4 道非重叠多容器/高难专项题形成 **23 题双栏覆盖**（不混分母），同基座对标 Claude Code 与 Ante 0.3.5。
+* **推荐配置**：[harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（内置 `long_horizon_deepseek_flash(harness_profile="terminal-minimal")`：`512k/64k`、`max_wall_seconds=10800s`、`max_tool_calls=2000`、`max_input_tokens_total=300,000,000`、`max_output_tokens_total=3,000,000` + `completion_evidence_reminder: true` + `delete: true` 内存清理守卫）。
+* **P0 优先执行（`fast-agent` 19 题公开标准子集，谷期预计 ~¥42–¥55）**：按 [TB4.1Subset23.md](TB4.1Subset23.md) 方案原样运行 19 道纯 CPU 单容器子集（单并发约 `10–13h`，双并发约 `5.5–7h`），与本文已完成的 4 道非重叠多容器/高难专项题形成 **23 题双栏覆盖**（不混分母），同基座对标 Claude Code 与 Ante 0.3.5。
 * **P1 低成本消融与调优（按需）**：基于 19 题子集结果开展低成本单变量开关对照（重点评估长程 `bash` 输出截断长度、上下文压缩点），结合 `ctrf.json` 子测试得分与 Prefix Cache 曲线验证收益。
 * **P2 63 题全量复核（可选预估）**：在 19 题方案定型后按预算决定是否扩展至 63 题无 GPU 版全量 `pass@1`，按冒烟与 A/B 实测谷期题均 ¥2.0–¥2.7 估算总费约 **¥130 ～ ¥170**；本机 ~7.5 GiB Docker 内存建议 `n_concurrent_trials` 设为 `1–2`（约 `16–18 小时`，可分 2–3 个夜间谷期窗口跑完并由 `collect_harbor_job_reports()` 合并汇总）。

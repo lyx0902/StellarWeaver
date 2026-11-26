@@ -242,7 +242,7 @@ def long_horizon_deepseek_flash(
     *,
     context_window_tokens: int = 512_000,
     max_output_tokens: int = 65_536,
-    max_wall_seconds: int = 3600,
+    max_wall_seconds: int = 10800,
     policy_preset: PolicyPreset = "benchmark",
     harness_profile: Literal["swe-python", "terminal-minimal"] = "swe-python",
 ) -> AppConfig:
@@ -272,10 +272,10 @@ def long_horizon_deepseek_flash(
         ),
         limits=LimitsConfig(
             max_model_calls=None,
-            max_tool_calls=300,
+            max_tool_calls=2000,
             max_wall_seconds=max_wall_seconds,
-            max_input_tokens_total=80_000_000,
-            max_output_tokens_total=2_000_000,
+            max_input_tokens_total=300_000_000,
+            max_output_tokens_total=3_000_000,
         ),
         execution=execution,
         policy=PolicyConfig(preset=policy_preset),

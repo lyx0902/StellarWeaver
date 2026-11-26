@@ -1049,7 +1049,7 @@ async def test_streaming_zero_chunk_failure_charges_zero_output_tokens(tmp_path:
             "retry": RetryConfig(max_retries=5, base_delay_seconds=0.0, max_delay_seconds=1.0),
         }
     )
-    assert config.limits.max_output_tokens_total == 2_000_000
+    assert config.limits.max_output_tokens_total == 3_000_000
     env = _MockHarborEnvironment(lambda _rec: _MockExecResult(stdout="", stderr="", return_code=0))
     events: list[AgentEvent] = []
     with SessionStore(tmp_path, data_dir=tmp_path) as store:

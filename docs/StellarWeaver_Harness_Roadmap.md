@@ -14,7 +14,7 @@
 | **Task 1.2** | `run_linter` 零开销降级与 `include_linter` 开关 | **已落地** | `82d2f5c` (`4172913`) | 容器无 `ruff` 返结构化跳过且无 Traceback；已知无 `ruff` 镜像直接隐藏 |
 | **Task 1.3** | 未解决测试失败轻量软提醒 `soft_test_failure_reminder` | **已落地** | `82d2f5c` (`4172913`) | 按编辑指纹追踪未修复失败，无 `completion_gate` 时最多提醒 1 次；TB 4.1 延伸为 `completion_evidence_reminder` |
 | **Task 1.4** | 修复 `swebench.py` 缓存命中统计误判 `incomplete` | **已落地** | `82d2f5c` (`4172913`) | 仅聚合 `model.completed`，后进一步升级为 TB 4.1 逐字段 v2 用量溯源 |
-| **Task 2.1** | 解禁上限、CLI `--reasoning-effort` 与 `long_horizon` 预设 | **已落地（微调）** | `8a73c5c` (`2f26de8`) → `4cb30fe` | 探针实测后固化 512k/64k；`max_output_tokens_total` 由规划 `600K` 实战调优演进至 **`600K → 1M → 2M`** |
+| **Task 2.1** | 解禁上限、CLI `--reasoning-effort` 与 `long_horizon` 预设 | **已落地（后续放宽）** | `8a73c5c` → `4cb30fe` → 本次 | 探针实测固化 512k/64k；后对标 Ante 19 题实耗，总预算放宽至 **`3h / 2000 次 / 300M 输入 / 3M 输出`**（输出历经 `600K → 1M → 2M → 3M`） |
 | **Task 2.2** | `stop_reason == "length"` 安全续写恢复 | **已落地** | `8a73c5c` (`2f26de8`) | 校验/丢弃半截 `tool_calls`，纯思考截断不写空 `assistant` 消息并注入续写指令 |
 | **Task 2.3** | 两级重复失败策略（软引导 3 / 硬熔断 6） | **已落地** | `8a73c5c` (`2f26de8`) | 软引导贴附于 `tool` 尾部不打断 Prefix Cache；严格保留 `ask`/`auto` 拒批即停 |
 | **Task 2.4** | `reasoning_content` 流式推理复读检测与重连 | **已落地** | `8a73c5c` (`2f26de8`) | 在 `ChatCompletionAccumulator.feed()` 内监控并抛可重试中断（单轮上限 2 次） |
@@ -234,7 +234,7 @@
 
 1. **流式零字节断连记账修复与 `max_output_tokens_total` 调优（`506f2de` · `4cb30fe`）**：
    - 修复 `payments-pipeline-fix` 6 次零字节断连（`chunk_count == 0` 且无部分流）被 `Agent._request_model()` 按 `65,536` 满额虚扣输出预算的 Bug（零字节断连记为 `0`，仅中途断连按已收字符估算），并在 [test_harness_phase3.py](../tests/unit/test_harness_phase3.py) 补齐回归单测。
-   - 将 `long_horizon_deepseek_flash()` 的 `max_output_tokens_total` 从原计划 `600K` 先上调至 `1M`，后在 `4cb30fe` 进一步放宽至 **`2,000,000`** 防止重思考超长题误撞上限。
+   - 将 `long_horizon_deepseek_flash()` 的长程总预算随实测演进逐步放宽：输出上限由 `600K → 1M → 2M`（`4cb30fe`）进而升至 **`3,000,000`**，并依据 Harbor Hub 上 Ante 0.3.5 在 19 题子集的真实重题消耗（`vba` 141.48M 输入、`telecom` 2h50m、`photonic` 1.60M 输出）同步将墙钟放宽至 **`10800s`（3 小时）**、工具上限至 **`2000`**、总输入上限至 **`300,000,000`**（保持 `512k` 窗口）。
 2. **Web Compose 7 项 `SW_WEB_*` 环境变量同步透传（`86dbd1c`）**：
    - 将 Phase 1–2 的核心容错开关（`SW_WEB_INCLUDE_LINTER`、`SW_WEB_SOFT_TEST_FAILURE_REMINDER`、`SW_WEB_MAX_LENGTH_CONTINUATIONS`、`SW_WEB_STREAM_REPETITION_DETECTION`、`SW_WEB_REPEATED_FAILURE_SOFT_THRESHOLD`、`SW_WEB_REPEATED_FAILURE_HARD_THRESHOLD`、`SW_WEB_MAX_RETRIES`）打通至 Web 配置解析、`deploy/compose.g5.yaml`、[USAGE.md](USAGE.md#harness-增强开关速查) 与 [test_web_execution_config.py](../tests/unit/test_web_execution_config.py)，并完成本机 Compose `--build` 重部署验收。
 3. **`verification_status` 语义修复、严格 `TrialLock` 分母、`ctrf.json` 诊断与 v2 逐字段用量溯源（`c1da3b4` / `e0db0b2`）**：

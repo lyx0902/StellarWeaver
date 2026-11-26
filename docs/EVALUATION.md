@@ -95,8 +95,8 @@ flowchart LR
 | **模型与思考** | `provider` / `model` / `thinking` / `reasoning_effort` | `deepseek` / `deepseek-flash` / `enabled` / `max` | 对应线上 `DeepSeek-V4.1-Flash-1017` 最大推理深度。 |
 | **窗口与生成** | `context_window_tokens` / `max_output_tokens` | `512,000` / `65,536` | 经实测 API 探针确认的 512k 窗口与 64k 单次输出上限，避免长思考/大脚本生成被过早截断。 |
 | **网络超时与重试** | `request_timeout_seconds` / `RetryConfig` | `240s` / `max_retries=5`（退避 `1s–60s`） | 覆盖 1017 ~40s 首字延迟与跨国长程流式瞬态断连。 |
-| **总运行预算** | `max_model_calls` / `max_tool_calls` / `max_wall_seconds` | `None` / `300` / `3600s` | 适配 Harbor 长程任务，主要受 Harbor trial 超时与 300 次工具调用硬顶约束。 |
-| **Token 总上限** | `max_input_tokens_total` / `max_output_tokens_total` | `80,000,000` / `2,000,000` | 输入 80M、输出由最初 `600K → 1M → 2M`，防止重思考超长题误撞输出上限。 |
+| **总运行预算** | `max_model_calls` / `max_tool_calls` / `max_wall_seconds` | `None` / `2000` / `10800s`（3 小时） | 对标 Ante 0.3.5 / Claude Code 长程实耗（重题原生耗时 2–3 小时），解除 1h 与 300 次调用瓶颈；仍受 Harbor trial 原生超时约束。 |
+| **Token 总上限** | `max_input_tokens_total` / `max_output_tokens_total` | `300,000,000` / `3,000,000` | 对标 Ante 19 题实耗上限（`vba` 输入 141.48M、`photonic` 输出 1.60M），输出由最初 `600K → 1M → 2M → 3M` 防止长程误杀。 |
 | **命令执行** | `default_timeout_seconds` / `max_timeout_seconds` / 流截断 | `120s` / `1800s` / `1 MiB/stream` | 支持大型 C++/Rust 编译、模型训练与压测，Prompt 显式提示长命令传大超时。 |
 | **上下文压缩** | `trigger_ratio` / `target_ratio` / `recent_complete_rounds` / `fresh_tool_rounds` | `0.80` / `0.55` / `6` / `2` | 开启 `calibrated_context_budget=True`、`sticky_context_checkpoint=True`、`protect_fresh_tool_output=True`，压缩后仍保持 97%+ 前缀缓存。 |
 | **长程容错** | 截断续写 / 失败引导 / 复读检测 | `max_length_continuations=3` · 软/硬失败阈值 `3/6` · `stream_repetition_detection=True`（上限 `2`） | `length` 安全丢弃半截工具调用并续写；软引导贴附于 `tool` 尾部不打断 `reasoning_content`；监控推理复读并重连。 |
