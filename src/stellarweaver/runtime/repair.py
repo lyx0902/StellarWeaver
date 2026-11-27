@@ -116,6 +116,7 @@ class RepairController:
         target = (
             (diagnostic.get("target") if isinstance(diagnostic, dict) else None)
             or data.get("argv")
+            or data.get("command")
             or path
             or (details.get("path") if isinstance(details, dict) else None)
         )

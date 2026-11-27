@@ -37,7 +37,7 @@ uv run --offline python -m stellarweaver.demo
 | [工具安全、授权与评测](SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与 Hook、本地安全夹具。 |
 | [评测体系与运行器技术指南](EVALUATION.md) | 复现入口、Terminal-Bench 4.1（Harbor 原生评测器）全参数与溯源契约、SWE-bench Lite 批量评测与契约参考。 |
 | [TB 4.1 23 题基准档案](TB4.1Subset23.md) | `fast-agent` 19 题公开标准子集原理 + 4 题多容器/专项补充（共 23 题）逐题档案，与 Claude Code / Ante 同模型对照。 |
-| [Terminal-Bench 4.1 评测记录](TerminalBench4Eval.md) | Harbor 0.25.0 5 题纯 CPU 冒烟（2/5 = 40.0%、WAL 实报缓存 97.58%）与 `completion_evidence_reminder` 4-trial A/B 实测。 |
+| [Terminal-Bench 4.1 评测记录](TerminalBench4.1Eval.md) | Harbor 0.25.0 5 题纯 CPU 冒烟（2/5 = 40.0%、WAL 实报缓存 97.58%）与 `completion_evidence_reminder` 4-trial A/B 实测。 |
 | [SWE-bench Lite dev 23 题报告（已归档）](SWEBenchLiteEval.md) | `dev` 23 题逐题明细、上游镜像故障归因、6 道失败题归因、改进行动核对及历史试跑归档。 |
 | [Harness 多阶段演进路线图](StellarWeaver_Harness_Roadmap.md) | Phase 1–4 源码级差距定位、原规划逐项采纳状态、跳过决策与 Phase 4 后增量落地记录。 |
 | [Harness 实施与验收](HARNESS_ACCEPTANCE.md) | M0–M10、N 阶段及 Phase 1–4 至 TB 4.1 演进的完整历史实现核对与验收证据。 |

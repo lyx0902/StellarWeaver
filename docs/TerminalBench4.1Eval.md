@@ -109,6 +109,6 @@
 ## 6. 下一步评测路线：19 题公开子集（+ 4 题 = 23 题覆盖）与 63 题预估
 
 * **推荐配置**：[harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（内置 `long_horizon_deepseek_flash(harness_profile="terminal-minimal")`：`512k/64k`、`max_wall_seconds=10800s`、`max_tool_calls=2000`、`max_input_tokens_total=300,000,000`、`max_output_tokens_total=3,000,000` + `completion_evidence_reminder: true` + `delete: true` 内存清理守卫）。
-* **P0 优先执行（`fast-agent` 19 题公开标准子集，谷期预计 ~¥42–¥55）**：按 [TB4.1Subset23.md](TB4.1Subset23.md) 方案原样运行 19 道纯 CPU 单容器子集（单并发约 `10–13h`，双并发约 `5.5–7h`），与本文已完成的 4 道非重叠多容器/高难专项题形成 **23 题双栏覆盖**（不混分母），同基座对标 Claude Code 与 Ante 0.3.5。
-* **P1 低成本消融与调优（按需）**：基于 19 题子集结果开展低成本单变量开关对照（重点评估长程 `bash` 输出截断长度、上下文压缩点），结合 `ctrf.json` 子测试得分与 Prefix Cache 曲线验证收益。
-* **P2 63 题全量复核（可选预估）**：在 19 题方案定型后按预算决定是否扩展至 63 题无 GPU 版全量 `pass@1`，按冒烟与 A/B 实测谷期题均 ¥2.0–¥2.7 估算总费约 **¥130 ～ ¥170**；本机 ~7.5 GiB Docker 内存建议 `n_concurrent_trials` 设为 `1–2`（约 `16–18 小时`，可分 2–3 个夜间谷期窗口跑完并由 `collect_harbor_job_reports()` 合并汇总）。
+* **P0 优先执行（`fast-agent` 19 题公开标准子集，谷期预计 ~¥42–¥55）**：按 [TB4.1Subset23.md](TB4.1Subset23.md) 方案通过 `python -m stellarweaver.evals.terminal_bench run --config deploy/harbor-tb41-fast19.yaml --env-file .env`（自动执行 Docker 内存预检）原样运行 19 道纯 CPU 单容器子集（其中 7 题要求 `8192 MB`；16 GB 主机建议 `.wslconfig` 配 `memory=10GB` 且保持 `n_concurrent_trials: 1`，单并发约 `10–13h`），与本文已完成的 4 道非重叠多容器/高难专项题形成 **23 题双栏覆盖**（不混分母），同基座对标 Claude Code 与 Ante 0.3.5。
+* **P1 低成本消融与调优（按需）**：基于 19 题子集结果开展低成本单变量开关对照（如 `512k` vs `184k–256k` 上下文窗口、长程 `bash` 输出截断长度等），结合 `ctrf.json` 子测试得分与 Prefix Cache 曲线验证收益。
+* **P2 63 题全量复核（可选预估）**：在 19 题方案定型后按预算决定是否扩展至 63 题无 GPU 版全量 `pass@1`，按冒烟与 A/B 实测谷期题均 ¥2.0–¥2.7 估算总费约 **¥130 ～ ¥170**；保持 `n_concurrent_trials: 1`（或依单题 `task.toml` 内存需求评估并发）分 2–3 个夜间谷期窗口跑完并由 `summarize_harbor_job()` 统一汇总。

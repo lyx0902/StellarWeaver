@@ -25,11 +25,11 @@
 CLI M0–M5、工作台 G0–G11、Harness M0–M10、N 阶段（Batch 1–3）与上下文三项优化，以及 **Harness Phase 1–3a、Web Compose 开关同步、TB 4.1 遥测溯源与交卷前复核提醒** 均已完成实现、验收并合入 `master`（**676+ 项离线回归全绿**）。已完成基准实测与下一步聚焦如下：
 - **Terminal-Bench 4.1 5 题 CPU 冒烟 & 4-Trial 开关对照**（`terminal-minimal` · DeepSeek Flash `max` · 512k）：
   - 5 题 CPU 冒烟官方通过 **2/5（40.0%）**（`kv-live-surgery` 6/6、`payments-pipeline-fix` 3/3），`0` 超时、`0` 异常；经 WAL 只读重建真实实报 Prefix Cache 为 **97.58%**、标准价合计 **`$3.094`**（同 5 题一手对照：Claude Code 5 次试验均值 **28.0% [7/25]**；Ante 0.3.5 同为 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）。
-  - `completion_evidence_reminder` 4-Trial 开关对照（`vf2` + `wal` × 关/开）：实证开启交卷前 1 次通用复核提醒后，成功拦截 `vf2` 首次交卷前遗留的 `_core.c` 大图与 `graph.py` 自环 2 个必挂 Bug 并自修至 **`60/60`**，4-trial 缓存命中率 **`97.97%`**（总标准价 `$2.166` / 谷期 ~¥7.5）；并进一步对标 Harbor Hub 重题消耗将 `long_horizon` 预设放宽至 **`3h / 2000 次 / 300M 输入 / 3M 输出`**。
-  - **下一步重点**：按 [harbor-tb41-fast19.yaml](deploy/harbor-tb41-fast19.yaml) 跑通 `fast-agent` 19 题公开标准子集（+ 已有 4 题 = **23 题双栏覆盖**），详见 [TB 4.1 23 题基准档案](docs/TB4.1Subset23.md)。
+  - `completion_evidence_reminder` 4-Trial 开关对照（`vf2` + `wal` × 关/开）：实证开启交卷前 1 次通用复核提醒后，成功拦截 `vf2` 首次交卷前遗留的 `_core.c` 大图与 `graph.py` 自环 2 个必挂 Bug 并自修至 **`60/60`**，4-trial 缓存命中率 **`97.97%`**（总标准价 `$2.166` / 谷期 ~¥7.5）；对标 Harbor Hub 重题实耗将 `long_horizon` 预设放宽至 **`3h / 2000 次 / 300M 输入 / 3M 输出`**，并补齐 Docker 内存预检（`preflight`/`run`）、作业级根锁分母校验、报错去噪归一化与只读 `PrefixCacheAuditor`。
+  - **下一步重点**：通过 `python -m stellarweaver.evals.terminal_bench run --config deploy/harbor-tb41-fast19.yaml --env-file .env` 跑通 `fast-agent` 19 题公开标准子集（+ 已有 4 题 = **23 题双栏覆盖**），详见 [TB 4.1 23 题基准档案](docs/TB4.1Subset23.md)。
 - **SWE-bench Lite `dev` 全量 23 题（已收官归档）**（`full` · DeepSeek Flash Thinking High · 200k）：23/23 产出合法补丁，原始通过 **9/23（39.1%）**，剔除 8 题上游镜像损坏后有效通过 **9/15（60.0%）**，Prefix Cache 86.67%、闲时均摊 **¥0.20 / 题**；不再推进 `test` 300 题。
 
-[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
+[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4.1Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
 
 ## 工作原理
 
@@ -261,7 +261,7 @@ uv run --locked --offline python -m stellarweaver.evals.swebench --help
 | 下一步：TB 4.1 19+4=23 题覆盖 | 使用 [harbor-tb41-fast19.yaml](deploy/harbor-tb41-fast19.yaml) 在谷期跑通 `fast-agent` 19 题标准子集（单题 `3h / 2000 次 / 300M / 3M` + 512k 窗口，谷期约 ¥42–¥55），与已有 4 题专项构成双栏 23 题同基座对照（不混分母）。 |
 | SWE-bench Lite `dev`（23 题，已归档） | 全量 `dev` 23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题；不再推进 `test` 300 题。 |
 
-[评测体系技术指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
+[评测体系技术指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4.1Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ### 回归测试与效果验证
 
@@ -303,6 +303,6 @@ StellarWeaver/
 | [架构与调用链](docs/ARCHITECTURE.md) | 工作台架构、共享运行时、模型、工具、隔离与交付流程。 |
 | [数据库与持久化](docs/DATABASE.md) | PostgreSQL 与 SQLite 的结构、职责、迁移和恢复。 |
 | [工具授权与安全](docs/SECURITY.md) | 信任边界、L0–L3 风险分级、作用域授权复用、审批与本地安全夹具。 |
-| [评测体系与运行器指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B](docs/TerminalBench4Eval.md) · [SWE-bench dev（已归档）](docs/SWEBenchLiteEval.md) | 复现入口、Harbor TB 4.1 与 SWE-bench Lite 双评测器参数流程、19+4=23 题标杆对照及历史归因报告。 |
+| [评测体系与运行器指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B](docs/TerminalBench4.1Eval.md) · [SWE-bench dev（已归档）](docs/SWEBenchLiteEval.md) | 复现入口、Harbor TB 4.1 与 SWE-bench Lite 双评测器参数流程、19+4=23 题标杆对照及历史归因报告。 |
 | [Harness 实施与验收](docs/HARNESS_ACCEPTANCE.md) · [演进路线图](docs/StellarWeaver_Harness_Roadmap.md) · [后续路线图](docs/ROADMAP.md) | M0–M10、N 阶段及 Phase 1–4 至 TB 4.1 演进的完整历史验收、采纳核对与后续计划。 |
 | [历史归档索引](docs/archive/README.md) | 已完成规划方案（含 M0–M10 总方案与 N 阶段方案）、历史阶段进度与外部工作流对照。 |

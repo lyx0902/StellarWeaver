@@ -266,7 +266,7 @@ ImportError: libGL.so.1: cannot open shared object file: No such file or directo
 
 鉴于 SWE-bench Lite `dev` 集 **34.8%（8/23）** 的官方镜像存在依赖腐化（NumPy 2.0、`pytest 8.3.5`、`libGL.so.1`）且多道失败题耦合私有方法白盒测试，项目组决定**不再推进 SWE-bench Lite 正式集（`test` 300 题）或进一步消融**，并将全面评测与迭代重点正式迁移至容器干净、具备同模型可审计榜单的 **Terminal-Bench 4.1**（`fast-agent` 19 题公开标准子集 + 4 题多容器/高难专项 = 23 题覆盖）：
 
-- Terminal-Bench 4.1 5 题 CPU 冒烟与 4-trial A/B 实测：[TerminalBench4Eval.md](TerminalBench4Eval.md)
+- Terminal-Bench 4.1 5 题 CPU 冒烟与 4-trial A/B 实测：[TerminalBench4Eval.md](TerminalBench4.1Eval.md)
 - Terminal-Bench 4.1 23 题基准档案与同模型标杆对照：[TB4.1Subset23.md](TB4.1Subset23.md)
 - SWE-bench Lite 批量评测器架构与命令存档：[EVALUATION.md](EVALUATION.md#swe-bench-lite-批量评测体系已归档参考)
 

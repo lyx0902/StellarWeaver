@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import random
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,7 @@ from stellarweaver.context import (
     ContextManager,
     ContextProjection,
     ContextProtocolError,
+    PrefixCacheAuditor,
 )
 from stellarweaver.context import (
     estimate_tokens as estimate_tokens,
@@ -109,7 +111,34 @@ def stable_arguments(raw: str) -> Any:
         return raw
 
 
+_HEX_ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]{4,}\b")
+_ISO_TS_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+)
+_CLOCK_TS_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b")
+_POSIX_TMP_RE = re.compile(r"(?:/tmp|/var/tmp|/var/folders)/[^\s'\":,;)\]]+")
+_WIN_TMP_RE = re.compile(
+    r"(?:[A-Za-z]:)?(?:\\\\|\\)[^\s'\":,;)\]]*(?:\\\\|\\)Temp(?:\\\\|\\)[^\s'\":,;)\]]+",
+    re.IGNORECASE,
+)
+_PID_RE = re.compile(r"\bpid\s*[=:]\s*\d+\b", re.IGNORECASE)
+_DURATION_SEC_RE = re.compile(r"\b\d+\.\d+s\b")
+
+
+def normalize_error_text(text: str) -> str:
+    """Strip volatile runtime noise (addresses, timestamps, temp paths, PIDs) before hashing errors."""
+    cleaned = _ISO_TS_RE.sub("<TIMESTAMP>", text)
+    cleaned = _CLOCK_TS_RE.sub("<TIME>", cleaned)
+    cleaned = _HEX_ADDR_RE.sub("<HEX>", cleaned)
+    cleaned = _POSIX_TMP_RE.sub("<TMP_PATH>", cleaned)
+    cleaned = _WIN_TMP_RE.sub("<TMP_PATH>", cleaned)
+    cleaned = _PID_RE.sub("pid=<PID>", cleaned)
+    return _DURATION_SEC_RE.sub("<DUR>s", cleaned)
+
+
 def stable_failure(value: Any) -> Any:
+    if isinstance(value, str):
+        return normalize_error_text(value)
     if isinstance(value, dict):
         return {
             key: stable_failure(item)
@@ -256,6 +285,8 @@ class Agent:
         )
         self._last_evidence = ""
         self._budget_phase: tuple[str, bool] | None = None
+        self._cache_auditor = PrefixCacheAuditor()
+        self._compacted_since_last_audit = False
         self._repair = (
             RepairController(enforce=self.harness_config.repair_controller == "enforce")
             if self.harness_config.repair_controller != "off"
@@ -890,6 +921,16 @@ class Agent:
             if exploration is None:
                 self._chunk_index = 0
                 self._stream_output_bytes = 0
+                if retry_index == 0 and not request.web_search:
+                    divergence = self._cache_auditor.audit(
+                        request,
+                        model_key=json.dumps(settings, sort_keys=True, ensure_ascii=False),
+                        compacted=self._compacted_since_last_audit,
+                        request_index=request_index,
+                    )
+                    self._compacted_since_last_audit = False
+                    if divergence is not None:
+                        await self._emit("cache.prefix_diverged", divergence)
             await self._emit(
                 "model.started",
                 {
@@ -1335,6 +1376,7 @@ class Agent:
         if preview_message is not None:
             return request, projection
         if projection.compacted:
+            self._compacted_since_last_audit = True
             metrics = (
                 {
                     "calibration_factor": projection.size.factor,

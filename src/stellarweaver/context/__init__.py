@@ -1,5 +1,6 @@
 """Deterministic model-input projections; original messages remain in the journal."""
 
+from stellarweaver.context.cache_audit import PrefixCacheAuditor
 from stellarweaver.context.manager import (
     ContextBudgetExceeded,
     ContextManager,
@@ -13,5 +14,6 @@ __all__ = [
     "ContextManager",
     "ContextProjection",
     "ContextProtocolError",
+    "PrefixCacheAuditor",
     "estimate_tokens",
 ]

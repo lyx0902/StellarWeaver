@@ -3,7 +3,7 @@
 本文档是 StellarWeaver 双评测体系的工程技术参考，系统说明核心回归复现入口、**Terminal-Bench 4.1（Harbor 原生评测器）** 的执行链路与全部冻结参数，以及 **SWE-bench Lite（批量评测器与契约校验）** 的流水线设计。
 
 > **相关文档**：
-> - Terminal-Bench 4.1 实测冒烟与 A/B 报告：[TerminalBench4Eval.md](TerminalBench4Eval.md) · 23 题基准档案与同模型标杆：[TB4.1Subset23.md](TB4.1Subset23.md)
+> - Terminal-Bench 4.1 实测冒烟与 A/B 报告：[TerminalBench4Eval.md](TerminalBench4.1Eval.md) · 23 题基准档案与同模型标杆：[TB4.1Subset23.md](TB4.1Subset23.md)
 > - SWE-bench Lite `dev` 23 题报告与历史归档：[SWEBenchLiteEval.md](SWEBenchLiteEval.md) · 历史 20 题内部评测：[00_Sample_Run.md](archive/00_Sample_Run.md)
 > - Harness 各阶段功能与回归验收：[HARNESS_ACCEPTANCE.md](HARNESS_ACCEPTANCE.md)
 
@@ -109,33 +109,33 @@ flowchart LR
 1. **Verdict 优先级分类（`_classify_harbor_verdict`）**：
    - `reward_valid` 依据 Harbor `error_policy.policy_for()`（离线回退 `_REWARD_VALID_EXCEPTIONS`，允许 `AgentTimeoutError` 等记录有效得分）。
    - 优先级：**① `reward_valid and reward >= 1.0` → `passed`**（即便带超时异常但官方已给满分仍计通过，并保留异常名）；**② `AgentTimeoutError` / `VerifierTimeoutError` → `timeout`**；**③ `reward_valid and reward < 1.0` → `failed`**；**④ 其余 → `unscored`**。
-2. **严格 `TrialLock` 分母契约**：
-   - 作业根 `lock.json`（Harbor `TrialLock`）唯一定义计划分母：Pass 1 对计划条目与 `<trial>/lock.json` 执行完整等价匹配，校验 `task_digest`、`agent_name`、`model_name`、`kwargs`、`environment` 与 `verifier`；仅当子 `lock.json` 缺失时走 Pass 2 无歧义字段兼容回退。
-   - 若 `lock.json` 损坏，则强制 `planned_denominator_verifiable = False`、`resolved_rate = None`（绝不虚报通过率）。
+2. **作业级严格 `TrialLock` 分母契约（`collect_harbor_job_reports` / `summarize_harbor_job`）**：
+   - 作业根 `lock.json`（Harbor `TrialLock`）唯一定义计划分母：要求存在有效 JSON、`trials` 列表非空且每条记录具备任务身份（`task.name` / `task_name`）。Pass 1 对计划条目与 `<trial>/lock.json` 执行完整等价匹配，校验 `task_digest`、`agent_name`、`model_name`、`kwargs`、`environment` 与 `verifier`；仅当子 `lock.json` 缺失时走 Pass 2 无歧义字段兼容回退。
+   - **缺锁 / 坏锁强制降级**：`lock_status="corrupt"`（含 `trials` 为空或缺少身份字段）或 `lock_status="absent"`（缺根锁，含空目录）时，强制 `planned_denominator_verifiable = False`、`tasks = None`、`resolved_rate = None`、`batch_complete = False`，Markdown 与 JSON 由 `summarize_harbor_job()` 共享统一结果：缺锁仅汇报已观测收据数与通过数并注明计划分母与通过率未知，绝不把残缺目录当完整分母。
    - 磁盘上多出的额外试验标为 `planned = False`、`receipt_status = "unplanned"`，**保留审计但排除出主通过率与主用量统计**；Harbor 全局 `n_pending_trials` 仅作作业级 `job_pending_trials` 展示。
 3. **`verifier/ctrf.json` 子测试诊断**：若存在，解析 `results.summary` 提取 `total` / `passed` / `failed` / `skipped`，用于区分「差一点（如 `59/60`、`95/97`）」与「方向性失败」。
-4. **v2 逐字段用量溯源与 WAL 只读回读**：
+4. **v2 逐字段用量溯源、`PrefixCacheAuditor` 与报错去噪**：
    - `_summarize_usage_events()` 通过 `input_estimated` 与 `output_estimated` 独立把输入/输出归类为 `reported` / `estimated` / `unknown`，分别输出 `input_usage_complete`、`output_usage_complete` 与 `cache_usage_complete`。**`cache_hit_ratio` 仅基于经确认的 `reported_cached_input_tokens / reported_input_tokens` 计算**。
    - **零字节断连不虚扣**：流式请求 `chunk_count == 0` 且无部分流时，输出预算记 `0`；仅中途断连按已收字符保守估算并记入 `failed_estimated_*`（彻底与 `reported_*` 剥离）。
    - 缺少 v2 字段的旧收据通过限域 WAL 只读快照安全回读 `sw/session.sqlite3` 补齐实报用量；不可证实部分显式记为 `unknown` 或 `legacy_mixed_unverified`。
+   - **只读前缀分歧审计（[cache_audit.py](../src/stellarweaver/context/cache_audit.py)）**：`PrefixCacheAuditor` 在每次主循环请求发出前旁路对比 `model`、`tools` 与消息前缀（计划压缩轮不误报）；一旦发现非预期改写即记录 `cache.prefix_diverged` 事件（含首处分歧段、字符偏移与前后样本）并汇总为 `unexpected_prefix_divergences`（纯只读观测，零改写请求）。
+   - **报错去噪归一化与 `bash` 主体区分（[loop.py](../src/stellarweaver/runtime/loop.py)、[repair.py](../src/stellarweaver/runtime/repair.py)）**：`normalize_error_text()` 仅在内部重复失败签名判定时剥离十六进制地址（`0x...`）、时间戳、临时路径、PID 与小数耗时，避免同错因噪声漏触发 `3/6` 软引导/熔断；`RepairController` 同步识别 `data["command"]` 区分不同 `bash` 命令。
 5. **`verification_status` 语义**：命令去重键 `[tool_name, argv ?? command, cwd]` 修复 `bash` 键碰撞问题；`terminal-minimal` 模式下普通 `bash` 不再把任意 `exit_code=0` 判为已验证（无显式 `CompletionProof` 时如实记为 `not_run`）。
 6. **计价口径（`_estimate_deepseek_cost_usd`）**：按 DeepSeek API 公开标准价折算美元（命中 `$0.006/1M`、未命中 `$0.30/1M`、输出 `$1.20/1M`）；工作日 `18:00–次日 09:00`、`12:00–14:00` 与周末/法定节假日谷期实际账单享受 **50% 折扣**。
 
-### 5. Harbor 启动与离线复算命令
+### 5. Docker 内存预检、安全启动与离线汇总命令
+
+`fast-agent` 19 题中包含 **7 道 `8192 MB`（`8 GiB`）** 重题（`cad-model`、`hof-topology-interpenetration`、`html-js-filter`、`satb-audio-transcription`、`telecom-entity-resolution`、`vba-userform-port`、`vpp-loss-divergence`），若 Docker VM 内存低于 `8 GiB`（如 Windows WSL2 默认 `7.52 GiB`），直接开跑会在消耗模型费后才在容器或 Verifier 阶段失败。因此 16 GB 物理机建议在 `%USERPROFILE%\.wslconfig` 配置 `memory=10GB`（实测容器可用上限约 `9.48 GB` / `9.71 GiB`）并保持 `n_concurrent_trials: 1`，开跑前统一走内置预检入口：
 
 ```powershell
-# 1. 启动 Terminal-Bench 4.1（以 19 题标准子集配置为例，推荐在谷期窗口运行）
-$env:PYTHONUTF8 = "1"
-$env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
-.\.venv\Scripts\harbor.exe run --config deploy/harbor-tb41-fast19.yaml --env-file .env
+# 1. 单独执行 Docker 内存预检（校验本地 Harbor 缓存或摘要锁定清单中的 Agent + Verifier memory_mb）
+uv run --locked --offline python -m stellarweaver.evals.terminal_bench preflight --config deploy/harbor-tb41-fast19.yaml
 
-# 2. 离线汇总作业目录（严格 TrialLock 分母 + v2 实报用量 + ctrf.json 摘要）
-uv run --locked --offline python -c "
-from pathlib import Path
-from stellarweaver.evals.terminal_bench import collect_harbor_job_reports, render_markdown_summary
-reports = collect_harbor_job_reports(Path('.validation/tb41-fast19/<job_timestamp>'))
-print(render_markdown_summary(reports))
-"
+# 2. 带预检启动 Harbor（若任意单容器超 Docker VM 容量，直接退出码 2 拦截，不消耗模型费用；通过后自动注入 PYTHONUTF8 与 LITELLM_LOCAL_MODEL_COST_MAP）
+uv run --locked --offline python -m stellarweaver.evals.terminal_bench run --config deploy/harbor-tb41-fast19.yaml --env-file .env
+
+# 3. 离线统一汇总作业目录（根锁分母检查 + ctrf.json + v2 实报用量；支持 --json 输出与 Markdown 共用对象）
+uv run --locked --offline python -m stellarweaver.evals.terminal_bench summarize .validation/tb41-fast19/<job_timestamp>
 ```
 
 ---

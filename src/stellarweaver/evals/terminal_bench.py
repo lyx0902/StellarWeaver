@@ -6,14 +6,19 @@ Does NOT orchestrate `docker run` containers or implement task verifiers.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import importlib
 import importlib.metadata
 import json
 import os
+import shutil
+import subprocess
+import sys
 import time
-from collections.abc import Sequence
+import tomllib
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -644,6 +649,9 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             for e in failed_requests
             if "repetitive generation loop" in str(e.payload.get("message", "")).lower()
         )
+        unexpected_prefix_divergences = sum(
+            1 for e in run_events if e.type == "cache.prefix_diverged"
+        )
         reminder = next(
             (event for event in run_events if event.type == "completion_evidence.reminded"), None
         )
@@ -689,6 +697,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             "truncated_thinking": truncated_thinking,
             "soft_guidance_events": soft_guidance_events,
             "repetition_retries": repetition_retries,
+            "unexpected_prefix_divergences": unexpected_prefix_divergences,
             "wall_seconds": round(time.monotonic() - started, 3),
         }
         save(self.logs_dir / "trial-report.json", report)
@@ -900,6 +909,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "truncated_thinking": report.get("truncated_thinking"),
                     "soft_guidance_events": report.get("soft_guidance_events"),
                     "repetition_retries": report.get("repetition_retries"),
+                    "unexpected_prefix_divergences": report.get("unexpected_prefix_divergences"),
                     "cached_input_tokens": cached_input_tokens,
                     "cache_hit_ratio": report.get("cache_hit_ratio"),
                     "usage_accounting_source": report.get("usage_accounting_source"),
@@ -1357,21 +1367,35 @@ def _compatible_without_trial_lock(
     return True
 
 
-def _read_lock_file_strict(lock_path: Path) -> tuple[Literal["absent", "valid", "corrupt"], list[JSONDict]]:
+def _lock_entry_has_identity(entry: JSONDict) -> bool:
+    task_obj = entry.get("task")
+    if isinstance(task_obj, dict):
+        name = task_obj.get("name")
+        if isinstance(name, str) and name.strip():
+            return True
+    top_name = entry.get("task_name")
+    return isinstance(top_name, str) and bool(top_name.strip())
+
+
+def _read_lock_file_strict(
+    lock_path: Path,
+) -> tuple[Literal["absent", "valid", "corrupt"], list[JSONDict], str | None]:
     if not lock_path.exists():
-        return "absent", []
+        return "absent", [], "job root lock.json is missing"
     if not lock_path.is_file():
-        return "corrupt", []
+        return "corrupt", [], "job root lock.json is not a regular file"
     try:
         loaded = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return "corrupt", []
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return "corrupt", [], f"invalid JSON in lock.json ({type(exc).__name__})"
     if not isinstance(loaded, dict):
-        return "corrupt", []
+        return "corrupt", [], "lock.json root must be a JSON object"
     trials = loaded.get("trials")
-    if not isinstance(trials, list) or any(not isinstance(item, dict) for item in trials):
-        return "corrupt", []
-    return "valid", list(trials)
+    if not isinstance(trials, list) or len(trials) == 0:
+        return "corrupt", [], "lock.json trials list is missing or empty"
+    if any(not isinstance(item, dict) or not _lock_entry_has_identity(item) for item in trials):
+        return "corrupt", [], "lock.json contains a trial entry without valid task identity"
+    return "valid", list(trials), None
 
 
 def _read_optional_lock_dict(lock_path: Path) -> tuple[bool, bool, JSONDict]:
@@ -1409,12 +1433,13 @@ def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
         and ((child / "result.json").is_file() or (child / "agent" / "trial-report.json").is_file())
     ]
 
-    lock_status, planned_entries = _read_lock_file_strict(root / "lock.json")
+    lock_status, planned_entries, lock_reason = _read_lock_file_strict(root / "lock.json")
     if lock_status == "corrupt":
         corrupt_reports: list[JSONDict] = []
         for trial_dir in trial_dirs:
             merged = dict(merge_harbor_trial(trial_dir))
             merged["lock_status"] = "corrupt"
+            merged["lock_reason"] = lock_reason
             merged["planned"] = None
             merged["receipt_status"] = "lock_unverifiable"
             merged["job_pending_trials"] = job_pending_trials
@@ -1423,6 +1448,7 @@ def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
             corrupt_reports.append(
                 {
                     "lock_status": "corrupt",
+                    "lock_reason": lock_reason,
                     "planned": None,
                     "planned_index": None,
                     "trial_dir": None,
@@ -1439,12 +1465,33 @@ def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
         return corrupt_reports
 
     if lock_status == "absent":
-        absent_reports = []
+        absent_reports: list[JSONDict] = []
         for trial_dir in trial_dirs:
             merged = dict(merge_harbor_trial(trial_dir))
             merged["lock_status"] = "absent"
+            merged["lock_reason"] = lock_reason
+            merged["planned"] = None
+            merged["receipt_status"] = "lock_absent"
             merged["job_pending_trials"] = job_pending_trials
             absent_reports.append(merged)
+        if not absent_reports:
+            absent_reports.append(
+                {
+                    "lock_status": "absent",
+                    "lock_reason": lock_reason,
+                    "planned": None,
+                    "planned_index": None,
+                    "trial_dir": None,
+                    "task_name": None,
+                    "verdict": "unscored",
+                    "resolved": None,
+                    "reward": None,
+                    "reward_valid": False,
+                    "receipt_status": "lock_absent",
+                    "job_pending_trials": job_pending_trials,
+                    "outcome": {"input_tokens": 0, "output_tokens": 0},
+                }
+            )
         return absent_reports
 
     planned_items = [
@@ -1557,10 +1604,29 @@ def _float_or_none(value: Any) -> float | None:
     return None
 
 
+def _is_sentinel_report(item: JSONDict) -> bool:
+    return (
+        item.get("trial_dir") is None
+        and item.get("task_name") is None
+        and item.get("receipt_status") in {"lock_unverifiable", "lock_absent"}
+    )
+
+
 def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     """Aggregate planned Terminal-Bench trials cleanly, excluding `unplanned` receipts from metrics."""
     lock_corrupt = any(item.get("lock_status") == "corrupt" for item in reports)
-    planned_reports = [item for item in reports if item.get("planned") is not False]
+    lock_absent = (not lock_corrupt) and any(item.get("lock_status") == "absent" for item in reports)
+    lock_status: Literal["valid", "absent", "corrupt"] = (
+        "corrupt" if lock_corrupt else ("absent" if lock_absent else "valid")
+    )
+    planned_denominator_verifiable = lock_status == "valid"
+    lock_reason = next(
+        (str(reason) for item in reports if isinstance(reason := item.get("lock_reason"), str) and reason),
+        None,
+    )
+    planned_reports = [
+        item for item in reports if item.get("planned") is not False and not _is_sentinel_report(item)
+    ]
     unplanned_reports = [item for item in reports if item.get("planned") is False]
 
     pending_values = [
@@ -1570,17 +1636,29 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     ]
     job_pending_trials = pending_values[0] if pending_values else None
 
-    total = len(planned_reports)
+    total_planned = len(planned_reports) if planned_denominator_verifiable else None
     counts = {"passed": 0, "failed": 0, "timeout": 0, "unscored": 0}
     missing_receipt = 0
+    observed_receipts = 0
+    unexpected_prefix_divergences = 0
     for item in planned_reports:
         counts[_item_verdict(item)] += 1
         if item.get("receipt_status") == "missing_receipt":
             missing_receipt += 1
+        elif item.get("receipt_status") != "not_started":
+            observed_receipts += 1
+            unexpected_prefix_divergences += _int_or_zero(item.get("unexpected_prefix_divergences"))
 
     resolved = counts["passed"]
     resolved_rate: float | None = (
-        None if lock_corrupt else (round(resolved / total, 4) if total else 0.0)
+        (round(resolved / total_planned, 4) if total_planned else 0.0)
+        if planned_denominator_verifiable and total_planned is not None
+        else None
+    )
+    batch_complete = (
+        planned_denominator_verifiable
+        and missing_receipt == 0
+        and job_pending_trials in {None, 0}
     )
 
     total_reported_input = 0
@@ -1709,9 +1787,12 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     )
 
     return {
-        "tasks": total,
-        "planned_denominator_verifiable": not lock_corrupt,
-        "lock_status": "corrupt" if lock_corrupt else "valid",
+        "tasks": total_planned,
+        "observed_receipts": observed_receipts,
+        "batch_complete": batch_complete,
+        "planned_denominator_verifiable": planned_denominator_verifiable,
+        "lock_status": lock_status,
+        "lock_reason": lock_reason,
         "passed": counts["passed"],
         "failed": counts["failed"],
         "timeout": counts["timeout"],
@@ -1721,6 +1802,7 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
         "job_pending_trials": job_pending_trials,
         "resolved": resolved,
         "resolved_rate": resolved_rate,
+        "unexpected_prefix_divergences": unexpected_prefix_divergences,
         "input_usage_complete": all_input_complete and has_executed_verified,
         "output_usage_complete": all_output_complete and has_executed_verified,
         "cache_usage_complete": all_cache_complete and reported_cached_trials > 0,
@@ -1751,62 +1833,633 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     }
 
 
-def render_markdown_summary(reports: Sequence[JSONDict]) -> str:
-    """Render a compact Markdown summary table compatible with docs/TerminalBench4Eval.md."""
-    agg = aggregate_trial_reports(reports)
-    cached_val = agg["total_reported_cached_input_tokens"]
-    if cached_val is None and agg["legacy_mixed_trials"] > 0 and agg["total_reported_input_tokens"] == 0:
-        cached_val = agg["total_cached_input_tokens"]
+def render_markdown_summary(reports: Sequence[JSONDict], *, agg: JSONDict | None = None) -> str:
+    """Render a compact Markdown summary table compatible with docs/TerminalBench4.1Eval.md."""
+    summary = agg if agg is not None else aggregate_trial_reports(reports)
+    cached_val = summary["total_reported_cached_input_tokens"]
+    if (
+        cached_val is None
+        and summary["legacy_mixed_trials"] > 0
+        and summary["total_reported_input_tokens"] == 0
+    ):
+        cached_val = summary["total_cached_input_tokens"]
     cached_text = str(cached_val) if cached_val is not None else "incomplete"
-    ratio_val = agg["cache_hit_ratio"]
+    ratio_val = summary["cache_hit_ratio"]
     ratio_text = f"{ratio_val * 100:.2f}%" if ratio_val is not None else "incomplete"
-    resolved_line = (
-        f"{agg['passed']} (unverifiable)"
-        if agg["resolved_rate"] is None
-        else f"{agg['passed']} ({agg['resolved_rate'] * 100:.1f}%)"
+    lock_status = summary.get("lock_status", "valid")
+    if lock_status == "corrupt":
+        denominator_label = "unverifiable (corrupt lock.json)"
+        resolved_line = f"{summary['passed']} (unverifiable)"
+    elif lock_status == "absent":
+        denominator_label = "unverifiable (missing lock.json)"
+        resolved_line = f"{summary['passed']} observed (rate unknown; missing lock.json)"
+    else:
+        denominator_label = "valid"
+        resolved_line = (
+            f"{summary['passed']} (unverifiable)"
+            if summary["resolved_rate"] is None
+            else f"{summary['passed']} ({summary['resolved_rate'] * 100:.1f}%)"
+        )
+    tasks_text = "unknown" if summary["tasks"] is None else str(summary["tasks"])
+    observed_text = (
+        f"{summary['observed_receipts']} / {summary['tasks']}"
+        if summary["tasks"] is not None
+        else str(summary["observed_receipts"])
     )
     reported_cost_text = (
-        f"${agg['total_reported_estimated_cost_usd']:.4f}"
-        if agg["total_reported_estimated_cost_usd"] is not None
+        f"${summary['total_reported_estimated_cost_usd']:.4f}"
+        if summary["total_reported_estimated_cost_usd"] is not None
         else "incomplete"
     )
     lines = [
         "| Metric | Value |",
         "| --- | --- |",
-        f"| Planned Denominator | {'valid' if agg['planned_denominator_verifiable'] else 'unverifiable (corrupt lock.json)'} |",
-        f"| Tasks | {agg['tasks']} |",
-        f"| Resolved (Passed) | {resolved_line} |",
-        f"| Failed | {agg['failed']} |",
-        f"| Timeout | {agg['timeout']} |",
-        f"| Unscored | {agg['unscored']} |",
-        f"| Missing Receipt | {agg['missing_receipt']} |",
-        f"| Unplanned | {agg['unplanned']} |",
+        f"| Planned Denominator | {denominator_label} |",
     ]
-    if agg["job_pending_trials"] is not None:
-        lines.append(f"| Job Pending Trials | {agg['job_pending_trials']} |")
+    if summary.get("lock_reason"):
+        lines.append(f"| Lock Reason | {summary['lock_reason']} |")
     lines.extend(
         [
-            f"| Reported Input Tokens | {agg['total_reported_input_tokens']:,} |",
-            f"| Cached Input Tokens | {cached_text} |",
-            f"| Cache Hit Ratio | {ratio_text} |",
-            f"| Reported Output Tokens | {agg['total_reported_output_tokens']:,} |",
-            f"| Reported Estimated Cost (USD) | {reported_cost_text} |",
-            f"| Failed Estimated Input Tokens | {agg['total_failed_estimated_input_tokens']:,} |",
-            f"| Failed Estimated Output Tokens | {agg['total_failed_estimated_output_tokens']:,} |",
-            f"| Failed Estimated Cost (USD) | ${agg['total_failed_estimated_cost_usd']:.4f} |",
+            f"| Tasks | {tasks_text} |",
+            f"| Observed Receipts | {observed_text} |",
+            f"| Batch Complete | {'yes' if summary['batch_complete'] else 'no'} |",
+            f"| Resolved (Passed) | {resolved_line} |",
+            f"| Failed | {summary['failed']} |",
+            f"| Timeout | {summary['timeout']} |",
+            f"| Unscored | {summary['unscored']} |",
+            f"| Missing Receipt | {summary['missing_receipt']} |",
+            f"| Unplanned | {summary['unplanned']} |",
         ]
     )
-    if agg["total_unknown_input_tokens"] > 0:
-        lines.append(f"| Unknown Input Tokens | {agg['total_unknown_input_tokens']:,} |")
-    if agg["total_unknown_output_tokens"] > 0:
-        lines.append(f"| Unknown Output Tokens | {agg['total_unknown_output_tokens']:,} |")
-    if agg["legacy_mixed_trials"] > 0:
-        lines.append(f"| Legacy Mixed Trials | {agg['legacy_mixed_trials']} |")
-        lines.append(f"| Legacy Mixed Input Tokens | {agg['total_legacy_mixed_input_tokens']:,} |")
-        lines.append(f"| Legacy Mixed Output Tokens | {agg['total_legacy_mixed_output_tokens']:,} |")
-        lines.append(f"| Legacy Mixed Cost (USD) | ${agg['total_legacy_mixed_cost_usd']:.4f} |")
-    if agg["total_post_compaction_uncached_input_tokens"] > 0:
+    if summary["job_pending_trials"] is not None:
+        lines.append(f"| Job Pending Trials | {summary['job_pending_trials']} |")
+    if summary.get("unexpected_prefix_divergences"):
         lines.append(
-            f"| Post-Compaction Uncached Input Tokens | {agg['total_post_compaction_uncached_input_tokens']:,} |"
+            f"| Unexpected Prefix Divergences | {summary['unexpected_prefix_divergences']} |"
+        )
+    lines.extend(
+        [
+            f"| Reported Input Tokens | {summary['total_reported_input_tokens']:,} |",
+            f"| Cached Input Tokens | {cached_text} |",
+            f"| Cache Hit Ratio | {ratio_text} |",
+            f"| Reported Output Tokens | {summary['total_reported_output_tokens']:,} |",
+            f"| Reported Estimated Cost (USD) | {reported_cost_text} |",
+            f"| Failed Estimated Input Tokens | {summary['total_failed_estimated_input_tokens']:,} |",
+            f"| Failed Estimated Output Tokens | {summary['total_failed_estimated_output_tokens']:,} |",
+            f"| Failed Estimated Cost (USD) | ${summary['total_failed_estimated_cost_usd']:.4f} |",
+        ]
+    )
+    if summary["total_unknown_input_tokens"] > 0:
+        lines.append(f"| Unknown Input Tokens | {summary['total_unknown_input_tokens']:,} |")
+    if summary["total_unknown_output_tokens"] > 0:
+        lines.append(f"| Unknown Output Tokens | {summary['total_unknown_output_tokens']:,} |")
+    if summary["legacy_mixed_trials"] > 0:
+        lines.append(f"| Legacy Mixed Trials | {summary['legacy_mixed_trials']} |")
+        lines.append(
+            f"| Legacy Mixed Input Tokens | {summary['total_legacy_mixed_input_tokens']:,} |"
+        )
+        lines.append(
+            f"| Legacy Mixed Output Tokens | {summary['total_legacy_mixed_output_tokens']:,} |"
+        )
+        lines.append(f"| Legacy Mixed Cost (USD) | ${summary['total_legacy_mixed_cost_usd']:.4f} |")
+    if summary["total_post_compaction_uncached_input_tokens"] > 0:
+        lines.append(
+            f"| Post-Compaction Uncached Input Tokens | {summary['total_post_compaction_uncached_input_tokens']:,} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def summarize_harbor_job(job_dir: Path) -> JSONDict:
+    """Collect, aggregate, and render a Harbor job directory from one unified root-lock summary."""
+    reports = collect_harbor_job_reports(job_dir)
+    summary = aggregate_trial_reports(reports)
+    return {
+        "job_dir": str(job_dir),
+        "lock_status": summary["lock_status"],
+        "lock_reason": summary["lock_reason"],
+        "planned_denominator_verifiable": summary["planned_denominator_verifiable"],
+        "batch_complete": summary["batch_complete"],
+        "summary": summary,
+        "markdown": render_markdown_summary(reports, agg=summary),
+        "trials": reports,
+    }
+
+
+FAST19_RESOURCE_MANIFEST: dict[str, JSONDict] = {
+    "terminal-bench/atrx-vep-crispr": {
+        "digest": "sha256:81050619444198001d1b40ff2415d4043283433c8d4efd70e8e160af99f57620",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/cad-model": {
+        "digest": "sha256:75264fb8e309eda38c1f25c31d8757385caa944a9a44252d7ec59d448f5e7eae",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/cargo-flight-dispatch": {
+        "digest": "sha256:a5ee048cbb791bbebc7e71652f26faf4438bf86c9ca2f231a50ba859a7e423ed",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/fin-saccr-rwa": {
+        "digest": "sha256:38095e449bc3eccc2bdc0b61c0899f0d6dad547d3705951c054d9d65ba732e74",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/gsea-proteomics": {
+        "digest": "sha256:e35f61b7e319fa7eaabaf52636dd2ec0b102bd16e69a13665d1c19d92b7b510e",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/hof-topology-interpenetration": {
+        "digest": "sha256:46353b47672f2ac6c7e3cbf66a9cddc78c92d63e6bf4c5ffe1baca67c1c08bd0",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/html-js-filter": {
+        "digest": "sha256:7dbe36e64d4fdf1d8206bad74aa3fffefd66a01b3508b983bc8156f09d642ff1",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/mvcc-lsm-compaction": {
+        "digest": "sha256:a72c20ba467d6cd8e855ca0cfb00512dc53464ea02d26042e9eb4adc1cb276ce",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/photonic-waveguide-routing": {
+        "digest": "sha256:a4801300795de243b36566833ed1f6ea5bbbbeb9645db0c9ed91dde36bb9444c",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/production-planning": {
+        "digest": "sha256:7f7237a15a5a8a677a9ddee8d13e5c1576839f3a06202c45f745d1ffada447da",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/react-lead-form": {
+        "digest": "sha256:1127f3bf27b4b15441623eb07a28e4f4007f8115f8764e4289d10f1bcd894779",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/satb-audio-transcription": {
+        "digest": "sha256:134c71221d0ee432bd8c9235242f4727ca55a1cc960adb34538dd8f07f2e9adc",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/session-window-debug": {
+        "digest": "sha256:2f1a6389c24ab58d0ca4765031fe7c8799ba31284f0af9c7fcd203ad652bfa45",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/sound-change-cascade": {
+        "digest": "sha256:65d43e3fe13768e8983f31bf7b9d265d1a15c4d6a721e5cff469c39cbebf2367",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/telecom-entity-resolution": {
+        "digest": "sha256:fd037ff5d13efd33dceb4f23f621122ff1f1b0dda8fe9d75dfe5e3164a9e7e20",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/vba-userform-port": {
+        "digest": "sha256:bb2c3e8769cb334b52b69b0cb0dcf964e10cf13eb1d0c2f15d74e407e62be651",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/vllm-deepseek-streaming": {
+        "digest": "sha256:5b64c30e3d43e6b138351df02858d09f795f6af4cc48f80d25113fe46f7c499b",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/vpp-loss-divergence": {
+        "digest": "sha256:8c4071ec1b7ff23009b572515d7eb4f10216d3b5c8b9c3c955f9274413b16109",
+        "agent_memory_mb": 8192,
+        "verifier_memory_mb": 8192,
+        "verifier_mode": "separate",
+    },
+    "terminal-bench/wal-recovery-ordering": {
+        "digest": "sha256:79ba48ef2fcf2a9f06243b66ae332eafa93b929a2475a2c6203e71708b41c6e5",
+        "agent_memory_mb": 4096,
+        "verifier_memory_mb": 4096,
+        "verifier_mode": "separate",
+    },
+}
+
+
+def _normalize_digest(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower().removeprefix("sha256:")
+    return f"sha256:{cleaned}" if cleaned else None
+
+
+def get_docker_mem_total_bytes() -> int:
+    """Query local Docker engine MemTotal in bytes via `docker info`."""
+    try:
+        proc = subprocess.run(
+            ["docker", "info", "--format", "{{.MemTotal}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Docker CLI unavailable: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"docker info failed (exit {proc.returncode}): {detail}")
+    raw = proc.stdout.strip()
+    try:
+        mem_bytes = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Unexpected MemTotal output from docker info: {raw!r}") from exc
+    if mem_bytes <= 0:
+        raise RuntimeError(f"Docker MemTotal must be positive, got {mem_bytes}")
+    return mem_bytes
+
+
+def _extract_toml_memory_spec(toml_path: Path, *, digest_hex: str) -> JSONDict:
+    parsed = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    env_cfg = _as_dict(parsed.get("environment"))
+    ver_cfg = _as_dict(parsed.get("verifier"))
+    ver_env = _as_dict(ver_cfg.get("environment"))
+    ver_mode = str(ver_cfg.get("environment_mode") or "shared")
+    agent_mb = env_cfg.get("memory_mb")
+    verifier_mb = ver_env.get("memory_mb") if ver_mode == "separate" else agent_mb
+    return {
+        "status": "verified",
+        "source": "local_cache",
+        "digest": f"sha256:{digest_hex}",
+        "agent_memory_mb": int(agent_mb) if type(agent_mb) is int else None,
+        "verifier_memory_mb": int(verifier_mb) if type(verifier_mb) is int else None,
+        "verifier_mode": ver_mode,
+        "toml_path": str(toml_path),
+    }
+
+
+def resolve_task_memory_spec(
+    task_name: str,
+    *,
+    expected_digest: str | None = None,
+    cache_root: Path | None = None,
+    manifest: Mapping[str, JSONDict] | None = None,
+) -> JSONDict:
+    """Resolve Agent & Verifier memory requirements from local Harbor cache or digest-verified manifest."""
+    normalized_expected = _normalize_digest(expected_digest)
+    cache_base = (
+        cache_root
+        if cache_root is not None
+        else Path.home() / ".cache" / "harbor" / "tasks" / "packages"
+    )
+    parts = [part for part in task_name.strip().split("/") if part]
+    if len(parts) == 2:
+        org, slug = parts
+        task_cache_dir = cache_base / org / slug
+        if task_cache_dir.is_dir():
+            if normalized_expected is not None:
+                digest_hex = normalized_expected.removeprefix("sha256:")
+                candidate = task_cache_dir / digest_hex / "task.toml"
+                if candidate.is_file():
+                    return _extract_toml_memory_spec(candidate, digest_hex=digest_hex)
+            else:
+                cached_tomls = sorted(task_cache_dir.glob("*/task.toml"))
+                if cached_tomls:
+                    latest = cached_tomls[-1]
+                    return _extract_toml_memory_spec(latest, digest_hex=latest.parent.name)
+
+    resource_manifest = FAST19_RESOURCE_MANIFEST if manifest is None else manifest
+    entry = resource_manifest.get(task_name)
+    if entry is not None:
+        manifest_digest = _normalize_digest(
+            str(entry["digest"]) if entry.get("digest") is not None else None
+        )
+        if (
+            normalized_expected is not None
+            and manifest_digest is not None
+            and normalized_expected != manifest_digest
+        ):
+            return {
+                "status": "unverified",
+                "reason": "digest_mismatch",
+                "expected_digest": normalized_expected,
+                "manifest_digest": manifest_digest,
+                "agent_memory_mb": None,
+                "verifier_memory_mb": None,
+                "verifier_mode": None,
+            }
+        agent_mb = entry.get("agent_memory_mb")
+        ver_mb = entry.get("verifier_memory_mb")
+        return {
+            "status": "verified",
+            "source": "pinned_manifest",
+            "digest": manifest_digest,
+            "agent_memory_mb": int(agent_mb) if type(agent_mb) is int else None,
+            "verifier_memory_mb": int(ver_mb) if type(ver_mb) is int else None,
+            "verifier_mode": str(entry.get("verifier_mode") or "separate"),
+        }
+
+    return {
+        "status": "unverified",
+        "reason": "metadata_unavailable",
+        "expected_digest": normalized_expected,
+        "agent_memory_mb": None,
+        "verifier_memory_mb": None,
+        "verifier_mode": None,
+    }
+
+
+def _load_yaml_dict(config_path: Path) -> JSONDict:
+    yaml_mod = importlib.import_module("yaml")
+    loaded = yaml_mod.safe_load(config_path.read_text(encoding="utf-8"))
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _extract_selected_tasks(job_cfg: JSONDict) -> list[tuple[str, str | None]]:
+    selected: list[tuple[str, str | None]] = []
+    for ds in job_cfg.get("datasets") or []:
+        if not isinstance(ds, dict):
+            continue
+        for raw_name in ds.get("task_names") or []:
+            if isinstance(raw_name, str) and raw_name.strip():
+                selected.append((raw_name.strip(), None))
+    for task_entry in job_cfg.get("tasks") or []:
+        if not isinstance(task_entry, dict):
+            continue
+        name = task_entry.get("name")
+        digest_val = task_entry.get("digest")
+        if isinstance(name, str) and name.strip():
+            selected.append(
+                (name.strip(), str(digest_val) if isinstance(digest_val, str) else None)
+            )
+    return selected
+
+
+def run_docker_memory_preflight(
+    config_path: Path,
+    *,
+    docker_mem_bytes_fn: Callable[[], int] = get_docker_mem_total_bytes,
+    cache_root: Path | None = None,
+    manifest: Mapping[str, JSONDict] | None = None,
+    task_digests: Mapping[str, str] | None = None,
+    headroom_warning_mb: int = 1024,
+) -> JSONDict:
+    """Validate Docker VM MemTotal against every selected task's Agent & Verifier memory requirements."""
+    cfg_path = Path(config_path)
+    job_cfg = _load_yaml_dict(cfg_path)
+    env_cfg = _as_dict(job_cfg.get("environment"))
+    env_type = str(env_cfg.get("type") or "docker")
+    n_concurrent = int(job_cfg.get("n_concurrent_trials") or 1)
+    selected_tasks = _extract_selected_tasks(job_cfg)
+
+    if env_type != "docker":
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": f"environment.type={env_type!r} does not use local Docker",
+            "config_path": str(cfg_path),
+            "tasks_checked": len(selected_tasks),
+            "docker_reachable": None,
+            "docker_mem_bytes": None,
+            "docker_mem_gib": None,
+            "n_concurrent_trials": n_concurrent,
+            "exceeded": [],
+            "unverified": [],
+            "warnings": [],
+        }
+
+    try:
+        docker_mem_bytes = docker_mem_bytes_fn()
+    except Exception as exc:
+        return {
+            "ok": False,
+            "skipped": False,
+            "config_path": str(cfg_path),
+            "tasks_checked": len(selected_tasks),
+            "docker_reachable": False,
+            "error": str(exc),
+            "docker_mem_bytes": None,
+            "docker_mem_gib": None,
+            "n_concurrent_trials": n_concurrent,
+            "exceeded": [],
+            "unverified": [],
+            "warnings": [],
+        }
+
+    available_mb = round(docker_mem_bytes / (1024 * 1024), 1)
+    docker_mem_gib = round(docker_mem_bytes / (1024**3), 2)
+    exceeded: list[JSONDict] = []
+    unverified: list[JSONDict] = []
+    warnings: list[str] = []
+    max_required_mb = 0
+
+    for task_name, inline_digest in selected_tasks:
+        expected_digest = (
+            task_digests.get(task_name) if task_digests is not None else inline_digest
+        )
+        spec = resolve_task_memory_spec(
+            task_name,
+            expected_digest=expected_digest,
+            cache_root=cache_root,
+            manifest=manifest,
+        )
+        if spec.get("status") != "verified":
+            unverified.append(
+                {
+                    "task": task_name,
+                    "reason": spec.get("reason", "unknown"),
+                }
+            )
+            continue
+        agent_mb = spec.get("agent_memory_mb")
+        ver_mb = spec.get("verifier_memory_mb")
+        sides: list[str] = []
+        side_reqs: list[int] = []
+        if type(agent_mb) is int:
+            side_reqs.append(agent_mb)
+            if agent_mb * 1024 * 1024 > docker_mem_bytes:
+                sides.append("agent")
+        if type(ver_mb) is int:
+            side_reqs.append(ver_mb)
+            if ver_mb * 1024 * 1024 > docker_mem_bytes:
+                sides.append("verifier")
+        task_max_mb = max(side_reqs) if side_reqs else 0
+        if task_max_mb > max_required_mb:
+            max_required_mb = task_max_mb
+        if sides:
+            exceeded.append(
+                {
+                    "task": task_name,
+                    "sides": sides,
+                    "agent_memory_mb": agent_mb,
+                    "verifier_memory_mb": ver_mb,
+                    "required_mb": task_max_mb,
+                    "available_mb": available_mb,
+                    "source": spec.get("source"),
+                }
+            )
+
+    if not exceeded and max_required_mb > 0:
+        headroom_mb = available_mb - max_required_mb
+        if headroom_mb < headroom_warning_mb:
+            warnings.append(
+                f"Low Docker memory headroom: peak container {max_required_mb} MiB vs Docker VM "
+                f"{available_mb:.1f} MiB (headroom {headroom_mb:.1f} MiB < {headroom_warning_mb} MiB)."
+            )
+        if n_concurrent > 1 and n_concurrent * max_required_mb * 1024 * 1024 > docker_mem_bytes:
+            warnings.append(
+                f"Concurrency warning: n_concurrent_trials={n_concurrent} with {max_required_mb} MiB "
+                f"tasks can demand {n_concurrent * max_required_mb} MiB > Docker VM {available_mb:.1f} MiB."
+            )
+
+    return {
+        "ok": len(exceeded) == 0,
+        "skipped": False,
+        "config_path": str(cfg_path),
+        "tasks_checked": len(selected_tasks),
+        "docker_reachable": True,
+        "docker_mem_bytes": docker_mem_bytes,
+        "docker_mem_gib": docker_mem_gib,
+        "docker_mem_mb": available_mb,
+        "max_required_mb": max_required_mb,
+        "n_concurrent_trials": n_concurrent,
+        "exceeded": exceeded,
+        "unverified": unverified,
+        "warnings": warnings,
+    }
+
+
+def format_preflight_report(report: JSONDict) -> str:
+    if report.get("skipped"):
+        return f"Preflight skipped: {report.get('reason')}"
+    if not report.get("docker_reachable"):
+        return f"PREFLIGHT FAILED: Docker unreachable ({report.get('error')})"
+    lines = [
+        (
+            f"Docker VM Memory: {report['docker_mem_gib']} GiB "
+            f"({report['docker_mem_mb']} MiB) | Tasks checked: {report['tasks_checked']} | "
+            f"Peak container spec: {report['max_required_mb']} MiB | "
+            f"n_concurrent_trials: {report['n_concurrent_trials']}"
+        )
+    ]
+    exceeded = report.get("exceeded") or []
+    if exceeded:
+        lines.append(
+            f"PREFLIGHT FAILED: {len(exceeded)} task(s) exceed available Docker VM memory:"
+        )
+        for item in exceeded:
+            lines.append(
+                f"  - {item['task']} ({', '.join(item['sides'])}): requires {item['required_mb']} MiB > "
+                f"Docker {item['available_mb']} MiB [{item['source']}]"
+            )
+    else:
+        lines.append("PREFLIGHT PASSED: every verified task fits inside Docker VM memory.")
+    for item in report.get("unverified") or []:
+        lines.append(f"WARNING [unverified task metadata]: {item['task']} ({item['reason']})")
+    for warn in report.get("warnings") or []:
+        lines.append(f"WARNING: {warn}")
+    return "\n".join(lines)
+
+
+def _resolve_harbor_executable(harbor_bin: str | None = None) -> str:
+    if harbor_bin:
+        return harbor_bin
+    sibling = Path(sys.executable).resolve().with_name(
+        "harbor.exe" if os.name == "nt" else "harbor"
+    )
+    if sibling.is_file():
+        return str(sibling)
+    found = shutil.which("harbor")
+    return found or str(sibling)
+
+
+def launch_harbor_with_preflight(
+    config_path: Path,
+    *,
+    env_file: Path | None = None,
+    harbor_bin: str | None = None,
+    extra_args: Sequence[str] = (),
+    preflight_fn: Callable[[Path], JSONDict] = run_docker_memory_preflight,
+    runner_fn: Callable[..., Any] = subprocess.run,
+) -> int:
+    """Run Docker memory preflight before invoking Harbor; abort with code 2 if preflight fails."""
+    report = preflight_fn(Path(config_path))
+    print(format_preflight_report(report))
+    if not report.get("ok"):
+        return 2
+    cmd = [_resolve_harbor_executable(harbor_bin), "run", "--config", str(config_path)]
+    if env_file is not None:
+        cmd.extend(["--env-file", str(env_file)])
+    cmd.extend(extra_args)
+    env = dict(os.environ)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    completed = runner_fn(cmd, env=env, check=False)
+    return int(getattr(completed, "returncode", 0))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m stellarweaver.evals.terminal_bench",
+        description="Terminal-Bench 4.1 Harbor preflight, launcher, and root-lock summarizer.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    pre = sub.add_parser("preflight", help="Check Docker VM memory against selected task specs.")
+    pre.add_argument("--config", required=True, type=Path, help="Harbor YAML configuration path.")
+    pre.add_argument("--json", action="store_true", help="Emit structured JSON report.")
+
+    run_p = sub.add_parser("run", help="Run Docker memory preflight, then launch Harbor.")
+    run_p.add_argument("--config", required=True, type=Path, help="Harbor YAML configuration path.")
+    run_p.add_argument("--env-file", type=Path, default=None, help="Optional .env file path.")
+    run_p.add_argument("--harbor-bin", default=None, help="Optional path to harbor executable.")
+    run_p.add_argument("extra_args", nargs="*", help="Additional arguments passed to harbor run.")
+
+    sum_p = sub.add_parser("summarize", help="Summarize a Harbor job directory.")
+    sum_p.add_argument("job_dir", type=Path, help="Harbor job directory containing lock.json / trials.")
+    sum_p.add_argument("--json", action="store_true", help="Emit unified JSON summary & trials.")
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.command == "preflight":
+        report = run_docker_memory_preflight(args.config)
+        print(
+            json.dumps(report, indent=2, ensure_ascii=False)
+            if args.json
+            else format_preflight_report(report)
+        )
+        return 0 if report.get("ok") else 2
+    if args.command == "run":
+        return launch_harbor_with_preflight(
+            args.config,
+            env_file=args.env_file,
+            harbor_bin=args.harbor_bin,
+            extra_args=args.extra_args,
+        )
+    if args.command == "summarize":
+        summary = summarize_harbor_job(args.job_dir)
+        if args.json:
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
+        else:
+            print(summary["markdown"], end="")
+        return 0 if summary["planned_denominator_verifiable"] else 2
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

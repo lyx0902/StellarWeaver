@@ -3,7 +3,7 @@
 > **定位**：低成本、高信度的 Terminal-Bench 4.1 正式评测方案——以第三方公开 **19 题纯 CPU 单容器子集**为主栏（杜绝 cherry-pick 质疑），并列展示我方已完成的 **4 道多容器/高难专项题**作为补充栏，合计覆盖 **23 道不重复的 TB 4.1 题目**。  
 > **冻结配置**：[harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（开启 `completion_evidence_reminder: true` 与 `delete: true`）  
 > **基准与基座**：Harbor `0.25.0` · `terminal-bench/terminal-bench@4.1.0` · `DeepSeek-V4.1-Flash-1017`（`reasoning_effort="max"`）  
-> **关联文档**：[评测体系技术指南](EVALUATION.md#terminal-bench-41-与-harbor-评测体系) · [5 题冒烟与 A/B 实测报告](TerminalBench4Eval.md)
+> **关联文档**：[评测体系技术指南](EVALUATION.md#terminal-bench-41-与-harbor-评测体系) · [5 题冒烟与 A/B 实测报告](TerminalBench4.1Eval.md)
 
 ---
 
@@ -98,22 +98,21 @@
 
 ---
 
-## 6. 19 题标准子集开跑与汇总命令
+## 6. 19 题标准子集开跑前检查、启动与汇总命令
 
-已冻结配置 [harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（内置 `completion_evidence_reminder: true` 与 `delete: true` 内存清理守卫；后端 `long_horizon_deepseek_flash()` 已对标 Ante 实耗校准为 `512k` 窗口、`10800s`（3 小时）、`max_tool_calls=2000`、`max_input_tokens_total=300,000,000`、`max_output_tokens_total=3,000,000`）。推荐在北京时间工作日谷期（`18:00–次日 09:00` / `12:00–14:00`）或周末运行：
+已冻结配置 [harbor-tb41-fast19.yaml](../deploy/harbor-tb41-fast19.yaml)（内置 `completion_evidence_reminder: true` 与 `delete: true` 内存清理守卫；后端 `long_horizon_deepseek_flash()` 已对标 Ante 实耗校准为 `512k` 窗口、`10800s`（3 小时）、`max_tool_calls=2000`、`max_input_tokens_total=300,000,000`、`max_output_tokens_total=3,000,000`）。
+
+> **Docker 内存前置条件（16 GB 物理机必看）**：19 题中包含 **7 道 `8192 MB`（`8 GiB`）** 重题（`cad-model`、`hof-topology-interpenetration`、`html-js-filter`、`satb-audio-transcription`、`telecom-entity-resolution`、`vba-userform-port`、`vpp-loss-divergence`），其余 12 题为 `4096 MB`（`4 GiB`），且全部采用 `separate` Verifier。Windows 默认 WSL2 仅分得 ~7.52 GiB，须在 `%USERPROFILE%\.wslconfig` 配置 `memory=10GB`（实测容器可用上限达 `9.48 GB` / `9.71 GiB`）并保持 `n_concurrent_trials: 1`；另 `vba`/`vpp` 声明 `15–20 GiB` 磁盘，请确保 Docker 盘留足 30–40 GiB 空间。
+
+推荐在北京时间工作日谷期（`18:00–次日 09:00` / `12:00–14:00`）或周末，通过内置预检入口运行：
 
 ```powershell
-# 1. 启动 19 题标准子集（单并发约 10–13h，512k 窗口预计谷期费用 ¥42–¥55；全价时段需翻倍）
-$env:PYTHONUTF8 = "1"
-$env:LITELLM_LOCAL_MODEL_COST_MAP = "True"
-.\.venv\Scripts\harbor.exe run --config deploy/harbor-tb41-fast19.yaml --env-file .env
+# 1. 只读内存预检（确认本机 Docker 容量可满足全部 19 题 Agent 与 Verifier 需求）
+uv run --locked --offline python -m stellarweaver.evals.terminal_bench preflight --config deploy/harbor-tb41-fast19.yaml
 
-# 2. 跑完后严格按 TrialLock 合并裁决、ctrf.json 与 v2 实报用量
-uv run --locked --offline python -c "
-from pathlib import Path
-from stellarweaver.evals.terminal_bench import collect_harbor_job_reports, render_markdown_summary
-job_dirs = sorted(Path('.validation/tb41-fast19').iterdir())
-reports = collect_harbor_job_reports(job_dirs[-1])
-print(render_markdown_summary(reports))
-"
+# 2. 预检放行并启动 19 题标准子集（单并发约 10–13h，512k 窗口预计谷期费用 ¥42–¥55；全价时段需翻倍）
+uv run --locked --offline python -m stellarweaver.evals.terminal_bench run --config deploy/harbor-tb41-fast19.yaml --env-file .env
+
+# 3. 跑完后统一按作业根 lock.json 汇总裁决、ctrf.json 与 v2 实报用量
+uv run --locked --offline python -m stellarweaver.evals.terminal_bench summarize .validation/tb41-fast19/<job_timestamp>
 ```

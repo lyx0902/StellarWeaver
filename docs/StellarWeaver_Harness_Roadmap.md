@@ -191,7 +191,7 @@
 * **具体改动**：
   1. **优先对接 Harbor 原生 Agent 适配接口（禁止重复造轮子）**：Phase 3 开工前先检查所安装 Harbor 版本的原生 Agent 接口，在 `evals/terminal_bench.py` 中仅实现轻量 Agent 包装类，把命令执行直接委托给 Harbor 传入的持久任务容器 `exec` 接口——**不手写 `docker run`、任务目录解析（`instruction.md` / `task.toml`）或 verifier 容器编排**，既大幅减省维护成本，又保证与官方榜单 100% 同口径；同时与现有一次性 `--rm --read-only` 快照的 `DockerRunner` 彻底解耦，天然支持容器内 `apt-get`、`/etc` 修改与后台 daemon 服务保活。
   2. **按需增强轻量 PTY**：若 5 题冒烟中出现交互式 CLI 阻塞，再在容器执行层补一个基于 `pty` 模块的轻量交互模式。
-  3. 接入 `terminal-minimal` + `long_horizon` 配置，记录与 `SWEBenchLiteEval.md` 同口径的每题指标（`resolved`、`duration`、`turns`、`tool_calls`、`input/cache_hit/output tokens`、实际费用、触发压缩/续写/软提醒/复读重试次数），并自动生成 `docs/TerminalBench4Eval.md` 所需的 JSON/CSV 汇总。
+  3. 接入 `terminal-minimal` + `long_horizon` 配置，记录与 `SWEBenchLiteEval.md` 同口径的每题指标（`resolved`、`duration`、`turns`、`tool_calls`、`input/cache_hit/output tokens`、实际费用、触发压缩/续写/软提醒/复读重试次数），并自动生成 `TerminalBench4.1Eval.md` 所需的 JSON/CSV 汇总。
 
 ---
 
@@ -224,7 +224,7 @@
    * `ruff check .`
    * `mypy src/stellarweaver`
    * `pytest`（包含本次新增的回归单测）
-4. **文档同步**：每个 Phase 完成后同步更新 `docs/ARCHITECTURE.md`（新增 Profile 与容错机制说明）以及最终评测报告 `docs/TerminalBench4Eval.md`。
+4. **文档同步**：每个 Phase 完成后同步更新 `docs/ARCHITECTURE.md`（新增 Profile 与容错机制说明）以及最终评测报告 `TerminalBench4.1Eval.md`。
 
 ---
 
@@ -244,3 +244,9 @@
 4. **`completion_evidence_reminder` 交卷前通用复核与 4-Trial A/B 实证（`d4d2795` / `55d66f6`）**：
    - 在 `terminal-minimal` 新增默认关闭的 `completion_evidence_reminder`（首次无工具交卷且预算充足时追加 1 条仅引用公开题面的复核提示，压缩时由 `protect_initial_user` 保护初始题面，并用 `seq` 统计 `CancelledError`-safe 的 `post_reminder_*` 增量消耗）。
    - 在 `vf2-speedup-networkx` + `wal-recovery-ordering` 上完成 4-trial 谷期 A/B：实验组在 `vf2` 提醒后成功揪出 `_core.c` 大图与 `graph.py` 自环 2 项漏网 Bug 修至 `60/60`，4-trial 缓存命中率达 **`97.97%`**。据此形成下一步执行 **[fast-agent 19 题公开标准子集 + 4 题补充 = 23 题方案](TB4.1Subset23.md)** 并默认开启 `completion_evidence_reminder: true`。
+5. **`fast19` 开跑前 4 项工程加固（2026-11-27，结合 `RuoCun` 源码对照与 Harbor 资源审计）**：
+   - **作业级根锁分母校验 & `summarize_harbor_job()`**：收紧 `lock.json` 空 `trials`/缺身份条目检测，`absent`/`corrupt` 均阻断有效通过率并统一 JSON/Markdown 汇总。
+   - **Docker 内存预检与安全启动入口（`preflight` / `run`）**：内置 `FAST19_RESOURCE_MANIFEST`（7 题 `8192 MB` + 12 题 `4096 MB`）并优先校验本地缓存 `task.toml`，单容器超 Docker VM 容量时直接以退出码 `2` 拦截，避免跑出半途 OOM 废题；宿主机 `.wslconfig` 同步调至可供给 `9.48 GB`（`9.71 GiB`）容器上限。
+   - **报错去噪归一化与 `bash` 键修复**：[loop.py](../src/stellarweaver/runtime/loop.py) `normalize_error_text()` 剥离十六进制地址、时间戳、临时路径、PID 与小数耗时噪声；[repair.py](../src/stellarweaver/runtime/repair.py) 兼容 `data["command"]` 消除单 `bash` 模式键碰撞。
+   - **只读旁路 `PrefixCacheAuditor`**：在 [cache_audit.py](../src/stellarweaver/context/cache_audit.py) 逐轮核查非压缩前缀分歧并记录字符偏移与样本，不改动任何请求字节。
+   - **评测后延迟项归入 Backlog**：`ArchiveRead` SQLite 原文回查、`fork_agent` 父前缀共享子代理、工作台托管后台 Shell 与带证据校验记忆均延后至 19 题评测完成后推进，见 [ROADMAP.md](ROADMAP.md#评测完成后的延迟实现项post-eval-backlog)。

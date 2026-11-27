@@ -974,6 +974,13 @@ def test_merge_harbor_job_verdicts_priority_and_summary(tmp_path: Path) -> None:
         agent_report=make_agent(500, 200, 50, 0.005),
     )
 
+    (job_dir / "lock.json").write_text(
+        json.dumps(
+            {"trials": [{"task": {"name": name}} for name in ("task-a", "task-b", "task-c", "task-d")]}
+        ),
+        encoding="utf-8",
+    )
+
     merged = collect_harbor_job_reports(job_dir)
     by_name = {item["trial_name"]: item for item in merged}
     assert by_name["trial-1"]["verdict"] == "passed"
