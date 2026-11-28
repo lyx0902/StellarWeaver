@@ -144,11 +144,15 @@ def _head_tail(text: str, limit: int) -> str:
     return (raw[:head] + marker + raw[-tail:]).decode("utf-8", errors="ignore")
 
 
-def _tool_output(body: JSONDict, limit: int) -> str:
+def _tool_output(body: JSONDict, limit: int, *, terminal_bash: bool = False) -> str:
     data = body.get("data")
     if isinstance(data, dict):
         stdout, stderr = data.get("stdout"), data.get("stderr")
-        if isinstance(stdout, str) and isinstance(stderr, str) and stdout and stderr:
+        if not isinstance(stdout, str):
+            stdout = ""
+        if not isinstance(stderr, str):
+            stderr = ""
+        if stdout and stderr:
             # Reserve space for both streams so a long stderr cannot hide stdout's test summary.
             labels = "stdout:\n\nstderr:\n"
             available = max(0, limit - len(labels))
@@ -161,10 +165,19 @@ def _tool_output(body: JSONDict, limit: int) -> str:
                     f"stdout:\n{_head_tail(stdout, stdout_limit)}"
                     f"\nstderr:\n{_head_tail(stderr, available - stdout_limit)}"
                 )
+        if terminal_bash and (stdout or stderr):
+            label, stream = ("stdout:\n", stdout) if stdout else ("stderr:\n", stderr)
+            if stdout and stderr:
+                return _head_tail(stderr, limit)
+            if limit <= len(label):
+                return _head_tail(stream, limit)
+            return label + _head_tail(stream, limit - len(label))
     return _head_tail(str(body.get("content", "")), limit)
 
 
 def _projected_content(body: JSONDict, limit: int, *, smart: bool) -> str:
+    if body.get("tool_message_format") == "terminal-bash":
+        return _tool_output(body, limit, terminal_bash=True)
     content = str(body.get("content", ""))
     preview = _tool_output(body, limit) if smart else _preview(content, limit)
     data = body.get("data")

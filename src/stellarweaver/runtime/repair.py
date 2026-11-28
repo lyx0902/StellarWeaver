@@ -79,6 +79,17 @@ def classify(result: ToolResult) -> str | None:
     return "UNKNOWN"
 
 
+_REPAIR_NOTE_CATEGORIES = frozenset(
+    {
+        "NO_PROGRESS",
+        "TIMEOUT",
+        "PATCH_CONFLICT",
+        "SANDBOX_OR_POLICY_DENIED",
+        "INFRASTRUCTURE_ERROR",
+    }
+)
+
+
 class RepairController:
     def __init__(self, *, enforce: bool) -> None:
         self.enforce = enforce
@@ -86,6 +97,25 @@ class RepairController:
         self.failures: Counter[tuple[str | None, str, str]] = Counter()
         self.notes: JSONDict | None = None
         self._note_subject: str | None = None
+
+    @staticmethod
+    def format_model_note(event: JSONDict | None) -> str | None:
+        """Render a concise one-shot diagnostic note when a failure warrants guidance."""
+        if not isinstance(event, dict):
+            return None
+        category = str(event.get("category") or "")
+        if not category or category == "CHECK_PASSED":
+            return None
+        repeat_count = int(event.get("repeat_count") or 0)
+        if repeat_count < 2 and category not in _REPAIR_NOTE_CATEGORIES:
+            return None
+        next_step = str(event.get("next_step") or "").strip()
+        exit_code = event.get("exit_code")
+        exit_part = f", exit_code={exit_code}" if exit_code is not None else ""
+        return (
+            f"\n[Harness repair diagnostic: category={category}, "
+            f"repeat_count={repeat_count}{exit_part}. {next_step}]"
+        )
 
     def observe(
         self, result: ToolResult, *, command: bool, hard_threshold: int = 3

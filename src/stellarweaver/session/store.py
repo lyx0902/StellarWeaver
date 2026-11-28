@@ -579,9 +579,15 @@ class SessionStore:
             )
             return self._event("tool.started", payload)
 
-    def record_result(self, assistant_id: str, result: ToolResult) -> AgentEvent:
+    def record_result(
+        self, assistant_id: str, result: ToolResult, *, model_message: Message | None = None
+    ) -> AgentEvent:
         if result.status not in {"ok", "error", "denied", "cancelled", "blocked", "unknown"}:
             raise SessionError("Invalid tool result status")
+        if model_message is not None and (
+            model_message.role != "tool" or model_message.tool_call_id != result.call_id
+        ):
+            raise SessionError("Model message does not match its tool result")
         with self.connection:
             row = self._operation(assistant_id, result.operation_id)
             if row["call_id"] != result.call_id or row["tool_name"] != result.tool_name:
@@ -612,7 +618,7 @@ class SessionStore:
                 (state, _json(asdict(result)), now(), event.seq, result.operation_id),
             )
             self._insert_message(
-                Message("tool", _json(asdict(result)), tool_call_id=result.call_id)
+                model_message or Message("tool", _json(asdict(result)), tool_call_id=result.call_id)
             )
             self._register_result_artifacts(result)
             return event

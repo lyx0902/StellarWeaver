@@ -21,11 +21,12 @@ import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from stellarweaver.cli import build_provider
 from stellarweaver.config import (
     AppConfig,
+    CompletionEvidenceReminderVersion,
     get_api_key,
     long_horizon_deepseek_flash,
     terminal_minimal_harness,
@@ -38,7 +39,13 @@ from stellarweaver.evals.swebench_pilot import digest
 from stellarweaver.policy import PolicyEngine
 from stellarweaver.providers.base import ModelProvider
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
-from stellarweaver.runtime.loop import Agent, DeltaSink, EventSink
+from stellarweaver.runtime.loop import (
+    COMPLETION_EVIDENCE_REMINDERS,
+    Agent,
+    DeltaSink,
+    EventSink,
+    resolve_completion_evidence_reminder,
+)
 from stellarweaver.session.journal import RunJournal
 from stellarweaver.session.store import SessionStore
 from stellarweaver.session.store import _readonly as _open_readonly_session_db
@@ -218,6 +225,14 @@ def _parse_bool_flag(value: bool | str) -> bool:
     if lowered in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid boolean flag value: {value!r}")
+
+
+def _parse_reminder_version(value: str) -> CompletionEvidenceReminderVersion:
+    normalized = value.strip().lower()
+    if normalized not in COMPLETION_EVIDENCE_REMINDERS:
+        valid = ", ".join(sorted(COMPLETION_EVIDENCE_REMINDERS))
+        raise ValueError(f"Invalid completion_evidence_reminder_version: {value!r} (expected one of: {valid})")
+    return cast(CompletionEvidenceReminderVersion, normalized)
 
 
 def _relative_posix(path: Path, base: Path) -> str:
@@ -492,6 +507,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         reasoning_effort: Literal["low", "high", "max"] | None = None,
         stream: bool | str = True,
         completion_evidence_reminder: bool | str | None = None,
+        completion_evidence_reminder_version: str | None = None,
         **kwargs: Any,
     ) -> None:
         init_kwargs = dict(kwargs)
@@ -523,14 +539,18 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             base_config = base_config.model_copy(
                 update={"harness": terminal_minimal_harness()}
             )
+        harness_updates: dict[str, Any] = {}
         if completion_evidence_reminder is not None:
-            enabled = _parse_bool_flag(completion_evidence_reminder)
+            harness_updates["completion_evidence_reminder"] = _parse_bool_flag(
+                completion_evidence_reminder
+            )
+        if completion_evidence_reminder_version is not None:
+            harness_updates["completion_evidence_reminder_version"] = _parse_reminder_version(
+                completion_evidence_reminder_version
+            )
+        if harness_updates:
             base_config = base_config.model_copy(
-                update={
-                    "harness": base_config.harness.model_copy(
-                        update={"completion_evidence_reminder": enabled}
-                    )
-                }
+                update={"harness": base_config.harness.model_copy(update=harness_updates)}
             )
         self.config = base_config
 
@@ -738,6 +758,9 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                 preamble_tokens = estimate_tokens(
                     {"system": agent.system_prompt, "tools": schemas}
                 )
+                reminder_version, reminder_text = resolve_completion_evidence_reminder(
+                    agent.harness_config
+                )
                 manifest_core: JSONDict = {
                     "agent": self.name(),
                     "version": self.version(),
@@ -745,6 +768,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "profile": agent.harness_config.profile,
                     "tools": tool_names,
                     "tools_sha256": tools_sha256,
+                    "system_prompt_sha256": digest(agent.system_prompt.encode("utf-8")),
                     "preamble_tokens_estimated": preamble_tokens,
                     "provider": self.config.model.provider,
                     "model": self.config.model.model,
@@ -752,9 +776,17 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     "reasoning_effort": self.config.model.reasoning_effort,
                     "context_window_tokens": self.config.model.context_window_tokens,
                     "max_output_tokens": self.config.model.max_output_tokens,
+                    "context": self.config.context.model_dump(),
+                    "retry": self.config.retry.model_dump(),
                     "limits": self.config.limits.model_dump(),
                     "execution": self.config.execution.model_dump(),
                     "harness": agent.harness_config.model_dump(),
+                    "completion_evidence_reminder_version": reminder_version,
+                    "completion_evidence_reminder_sha256": (
+                        digest(reminder_text.encode("utf-8"))
+                        if reminder_text is not None
+                        else None
+                    ),
                 }
                 config_sha256 = digest(canonical_json(manifest_core))
                 manifest: JSONDict = {

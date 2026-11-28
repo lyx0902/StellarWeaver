@@ -88,6 +88,78 @@ If a key requirement is untested or fails, use the remaining task budget to run
 a representative check, fix the implementation, and retest. When you finish,
 state any important requirement you could not verify."""
 
+COMPLETION_EVIDENCE_REMINDER_V2 = """\
+Before submitting, pick the most critical verifiable public requirements from the
+original task (formulas, scaling factors, invariants, edge conditions, or output
+contracts) and cross-check your final deliverable with an independent input,
+boundary counterexample, or simple reference check rather than only re-running
+your earlier happy-path check. If you modify a critical path, rerun that check
+before finishing. When you finish, clearly state any measurable discrepancy or
+important requirement you could not verify."""
+
+COMPLETION_EVIDENCE_REMINDERS: dict[str, str] = {
+    "v1": COMPLETION_EVIDENCE_REMINDER,
+    "v2": COMPLETION_EVIDENCE_REMINDER_V2,
+}
+
+
+def resolve_completion_evidence_reminder(
+    harness: HarnessConfig,
+) -> tuple[str | None, str | None]:
+    """Return active (version, prompt_text) when terminal-minimal reminder is enabled."""
+    if not harness.completion_evidence_reminder or harness.profile != "terminal-minimal":
+        return None, None
+    version = harness.completion_evidence_reminder_version
+    return version, COMPLETION_EVIDENCE_REMINDERS[version]
+
+
+def project_tool_message_for_model(
+    result: ToolResult,
+    *,
+    terminal_minimal: bool,
+    model_note: str | None = None,
+) -> Message:
+    """Build the model-facing tool message payload (deduplicating terminal-minimal bash)."""
+    if terminal_minimal and result.tool_name == "bash":
+        data = result.data if isinstance(result.data, dict) else {}
+        has_streams = isinstance(data.get("stdout"), str) or isinstance(data.get("stderr"), str)
+        base_content = (
+            f"exit_code={data.get('exit_code')}; timed_out={data.get('timed_out')}"
+            if has_streams
+            else result.content
+        )
+        projected_data = {key: value for key, value in data.items() if key != "command"}
+        payload: JSONDict = {
+            "call_id": result.call_id,
+            "operation_id": result.operation_id,
+            "tool_name": result.tool_name,
+            "status": result.status,
+            "content": base_content,
+            "data": projected_data,
+            "artifact_ids": list(result.artifact_ids),
+            "duration_ms": result.duration_ms,
+            "tool_message_format": "terminal-bash",
+        }
+        if model_note:
+            payload["model_note"] = model_note.strip()
+    else:
+        payload = asdict(result)
+        if model_note:
+            payload["content"] = result.content + model_note
+    return Message(
+        "tool",
+        json.dumps(payload, ensure_ascii=False),
+        tool_call_id=result.call_id,
+    )
+
+
+@dataclass(frozen=True)
+class _ToolFeedback:
+    repair_event: JSONDict | None
+    repair_stalled: bool
+    failure_reason: str | None
+    soft_guidance: str | None
+
 
 class BudgetExceeded(Exception):
     pass
@@ -261,6 +333,7 @@ class Agent:
         self._assistant_id = ""
         self._pending_calls: list[ToolCall] = []
         self._operations: dict[str, str] = {}
+        self._terminal_feedback: dict[str, tuple[_ToolFeedback, Message]] = {}
         self._cancel_requested = False
         self._model_calls = self._tool_calls = self._input_tokens = self._output_tokens = 0
         self._completion_attempts = 0
@@ -340,7 +413,24 @@ class Agent:
                     tuple(payload.get("artifact_ids", ())),
                     payload.get("duration_ms", 0),
                 )
-                await self._publish(self.store.record_result(self._assistant_id, result))
+                model_message = None
+                if self.harness_config.profile == "terminal-minimal" and result.tool_name == "bash":
+                    call = next(
+                        (call for call in self._pending_calls if call.call_id == result.call_id),
+                        None,
+                    )
+                    feedback = self._tool_feedback(call, result) if call is not None else None
+                    model_note = None
+                    if feedback is not None:
+                        model_note = feedback.soft_guidance or RepairController.format_model_note(
+                            feedback.repair_event
+                        )
+                    model_message = project_tool_message_for_model(
+                        result, terminal_minimal=True, model_note=model_note
+                    )
+                    if feedback is not None:
+                        self._terminal_feedback[result.operation_id] = (feedback, model_message)
+                await self._publish(self._record_tool_result(result, model_message))
                 await self._emit(kind, payload)
             else:
                 await self._emit(kind, payload)
@@ -380,22 +470,34 @@ class Agent:
             and self._tool_calls + self._completion_attempts >= self.limits.max_tool_calls
         )
 
-    async def _result(self, result: ToolResult, *, model_note: str | None = None) -> None:
-        event = self.store.record_result(self._assistant_id, result)
+    def _record_tool_result(
+        self, result: ToolResult, terminal_message: Message | None
+    ) -> AgentEvent:
+        if terminal_message is not None and isinstance(self.store, SessionStore):
+            return self.store.record_result(self._assistant_id, result, model_message=terminal_message)
+        return self.store.record_result(self._assistant_id, result)
+
+    async def _result(
+        self,
+        result: ToolResult,
+        *,
+        model_note: str | None = None,
+        terminal_message: Message | None = None,
+    ) -> None:
+        terminal_bash = (
+            self.harness_config.profile == "terminal-minimal" and result.tool_name == "bash"
+        )
+        model_message = terminal_message or project_tool_message_for_model(
+            result, terminal_minimal=terminal_bash, model_note=model_note
+        )
+        event = self._record_tool_result(result, model_message if terminal_bash else None)
         if self._task_evidence is not None:
             self._task_evidence.observe(result, event.seq)
         self.results.append(result)
         self._pending_calls = [
             call for call in self._pending_calls if call.call_id != result.call_id
         ]
-        payload = asdict(result)
-        if model_note:
-            payload["content"] = result.content + model_note
-        self.messages.append(
-            Message(
-                "tool", json.dumps(payload, ensure_ascii=False), tool_call_id=result.call_id
-            )
-        )
+        self.messages.append(model_message)
         await self._publish(event)
 
     async def _cancel_pending(self) -> None:
@@ -660,9 +762,7 @@ class Agent:
             assert stop is not None
         return len(pending), stop
 
-    async def _observe_tool(
-        self, call: ToolCall, result: ToolResult, stop: tuple[RunStatus, str] | None
-    ) -> tuple[RunStatus, str] | None:
+    def _tool_feedback(self, call: ToolCall, result: ToolResult) -> _ToolFeedback:
         soft_threshold = self.harness_config.repeated_failure_soft_threshold
         hard_threshold = self.harness_config.repeated_failure_hard_threshold
         repair_event: JSONDict | None = None
@@ -672,6 +772,7 @@ class Agent:
                 result, command=self.registry.is_command(call.name), hard_threshold=hard_threshold
             )
         soft_guidance: str | None = None
+        failure_reason = None
         if result.status == "error" and self._stop_on_repeated_tool_failure:
             failure_key = json.dumps(
                 [call.name, stable_arguments(call.arguments_json), stable_failure(result.data)],
@@ -682,17 +783,12 @@ class Agent:
             )
             self._last_failure = failure_key
             if self._failure_repeats >= hard_threshold:
-                reason = (
+                failure_reason = (
                     "three identical tool failures"
                     if hard_threshold == 3
                     else f"{hard_threshold} identical tool failures"
                 )
-                stop = ("failed", reason)
-            elif (
-                stop is None
-                and hard_threshold > soft_threshold
-                and self._failure_repeats >= soft_threshold
-            ):
+            elif hard_threshold > soft_threshold and self._failure_repeats >= soft_threshold:
                 suggestion = (
                     str(repair_event["next_step"])
                     if isinstance(repair_event, dict) and repair_event.get("next_step")
@@ -707,20 +803,32 @@ class Agent:
             self._last_failure = None
             self._failure_repeats = 0
 
-        await self._result(result, model_note=soft_guidance)
-        if repair_event is not None:
-            await self._emit("repair.diagnostic", repair_event)
+        return _ToolFeedback(repair_event, repair_stalled, failure_reason, soft_guidance)
+
+    async def _observe_tool(
+        self, call: ToolCall, result: ToolResult, stop: tuple[RunStatus, str] | None
+    ) -> tuple[RunStatus, str] | None:
+        persisted = self._terminal_feedback.pop(result.operation_id, None)
+        feedback, terminal_message = (
+            persisted if persisted is not None else (self._tool_feedback(call, result), None)
+        )
+        soft_guidance = feedback.soft_guidance if stop is None else None
+        if feedback.failure_reason is not None:
+            stop = ("failed", feedback.failure_reason)
+        await self._result(result, model_note=soft_guidance, terminal_message=terminal_message)
+        if feedback.repair_event is not None:
+            await self._emit("repair.diagnostic", feedback.repair_event)
         if soft_guidance is not None:
             await self._emit(
                 "repair.soft_guidance",
                 {
                     "tool": call.name,
                     "repeat_count": self._failure_repeats,
-                    "soft_threshold": soft_threshold,
-                    "hard_threshold": hard_threshold,
+                    "soft_threshold": self.harness_config.repeated_failure_soft_threshold,
+                    "hard_threshold": self.harness_config.repeated_failure_hard_threshold,
                 },
             )
-        if repair_stalled and stop is None:
+        if feedback.repair_stalled and stop is None:
             stop = ("failed", "repair controller: repeated failure without a changed candidate")
         if self._cancel_requested and stop is None:
             stop = ("cancelled", "user cancelled")
@@ -1302,7 +1410,12 @@ class Agent:
             extra = []
             if include_map and repo is not None and repo.message is not None:
                 extra.append(repo.message)
-            if include_map and self._repair is not None and self._repair.notes is not None:
+            if (
+                include_map
+                and self.harness_config.profile != "terminal-minimal"
+                and self._repair is not None
+                and self._repair.notes is not None
+            ):
                 extra.append(
                     Message(
                         "system",
@@ -1778,9 +1891,9 @@ class Agent:
         return True
 
     async def _maybe_remind_completion_evidence(self, schemas: tuple[JSONDict, ...]) -> bool:
+        reminder_version, reminder_text = resolve_completion_evidence_reminder(self.harness_config)
         if (
-            not self.harness_config.completion_evidence_reminder
-            or self.harness_config.profile != "terminal-minimal"
+            reminder_text is None
             or self._completion_evidence_reminded
             or self._soft_reminder_sent
             or self._pending_calls
@@ -1796,7 +1909,7 @@ class Agent:
         ):
             return False
 
-        message = Message("user", COMPLETION_EVIDENCE_REMINDER)
+        message = Message("user", reminder_text)
         try:
             # Confirm the next prompt actually fits before journaling the reminder.
             request, projection = await self._prepare_context(schemas, preview_message=message)
@@ -1807,7 +1920,13 @@ class Agent:
         self._completion_evidence_reminded = True
         self.store.append_message(message)
         self.messages.append(message)
-        await self._emit("completion_evidence.reminded", {"monotonic_ns": time.monotonic_ns()})
+        await self._emit(
+            "completion_evidence.reminded",
+            {
+                "version": reminder_version,
+                "monotonic_ns": time.monotonic_ns(),
+            },
+        )
         return True
 
     @staticmethod

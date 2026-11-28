@@ -9,7 +9,7 @@ n_attempts: 1
 n_concurrent_trials: 1  # Safe default for ~7.5 GiB Docker memory; may try 2 for lightweight CPU runs.
 environment:
   type: docker
-  delete: true  # Remove containers/images after each trial completes to avoid exhausting 7.5 GiB Docker resources.
+  delete: false  # Stop and remove containers after each trial (docker compose down) while keeping local Docker images on disk.
 agents:
   - name: stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent
     model_name: deepseek/deepseek-flash

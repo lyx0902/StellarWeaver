@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from itertools import count
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
+
+import pytest
 
 from stellarweaver.config import AppConfig, HarnessConfig, LimitsConfig, ModelConfig, PolicyConfig
 from stellarweaver.context import PrefixCacheAuditor
-from stellarweaver.domain import AssistantReply, Message, ModelRequest, ToolCall, ToolResult
+from stellarweaver.context.manager import _project_tool
+from stellarweaver.domain import (
+    AgentEvent,
+    AssistantReply,
+    Message,
+    ModelRequest,
+    ToolCall,
+    ToolResult,
+)
 from stellarweaver.evals.terminal_bench import (
     StellarWeaverHarborAgent,
     aggregate_trial_reports,
@@ -21,7 +35,13 @@ from stellarweaver.evals.terminal_bench import (
 )
 from stellarweaver.policy import PolicyEngine
 from stellarweaver.providers.fake import FakeModel
-from stellarweaver.runtime.loop import Agent, normalize_error_text, stable_failure
+from stellarweaver.runtime.loop import (
+    COMPLETION_EVIDENCE_REMINDER,
+    COMPLETION_EVIDENCE_REMINDER_V2,
+    Agent,
+    normalize_error_text,
+    stable_failure,
+)
 from stellarweaver.runtime.repair import RepairController
 from stellarweaver.session.store import SessionStore
 from stellarweaver.tools.registry import ToolRegistry
@@ -357,13 +377,337 @@ def test_prefix_cache_auditor_tracks_append_compaction_and_breaks() -> None:
     req3 = ModelRequest((sys_msg, Message("user", "Compacted summary"), m2), tools=tools)
     assert auditor.audit(req3, model_key="k1", compacted=True, request_index=3) is None
 
-    # Unexpected system prompt modification without compaction triggers precise diff
+    # Unexpected system prompt modification without compaction triggers summary diff without raw text
     req4 = ModelRequest((sys_mutated, Message("user", "Compacted summary"), m2), tools=tools)
     div = auditor.audit(req4, model_key="k1", compacted=False, request_index=4)
     assert div is not None
+    assert div["common_prefix_messages"] == 0
     assert div["first_diff_section"] == "system"
-    assert "SYS" in div["prev_sample"]
-    assert "SYS_MUTATED" in div["curr_sample"]
+    assert div["offset_unit"] == "chars"
+    assert div["first_diff_offset_chars"] >= 0
+    assert "prev_sha256" in div and "curr_sha256" in div
+    assert "prev_sample" not in div and "curr_sample" not in div
+    assert div["messages_shrunk"] is False
+
+    # Shrinking the message list while ALSO mutating an earlier message must report the earlier index
+    req5 = ModelRequest((sys_mutated, Message("user", "Earlier mutation")), tools=tools)
+    div2 = auditor.audit(req5, model_key="k1", compacted=False, request_index=5)
+    assert div2 is not None
+    assert div2["common_prefix_messages"] == 1
+    assert div2["first_diff_section"] == "message[1]"
+    assert div2["messages_shrunk"] is True
+
+
+class _ScriptedBashEnv:
+    def __init__(self, responses: list[TerminalExecResult]) -> None:
+        self._responses = list(responses)
+        self.commands: list[str] = []
+
+    async def exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> TerminalExecResult:
+        self.commands.append(command)
+        return self._responses.pop(0) if self._responses else TerminalExecResult("ok\n", "", 0)
+
+
+async def test_terminal_minimal_one_shot_repair_note_and_zero_feedback_divergence(
+    tmp_path: Path,
+) -> None:
+    env = _ScriptedBashEnv(
+        [
+            TerminalExecResult("", "which: no foo\n", 1),
+            TerminalExecResult("other ok\n", "", 0),
+            TerminalExecResult("", "assertion fail 1\n", 1),
+            TerminalExecResult("", "assertion fail 2\n", 1),
+            TerminalExecResult("recovered\n", "", 0),
+        ]
+    )
+    model = FakeModel(
+        [
+            AssistantReply("", (ToolCall("c1", "bash", json.dumps({"command": "which foo"})),), "tool_calls"),
+            AssistantReply("", (ToolCall("c2", "bash", json.dumps({"command": "echo other"})),), "tool_calls"),
+            AssistantReply("", (ToolCall("c3", "bash", json.dumps({"command": "pytest -q"})),), "tool_calls"),
+            AssistantReply("", (ToolCall("c4", "bash", json.dumps({"command": "pytest -q"})),), "tool_calls"),
+            AssistantReply("", (ToolCall("c5", "bash", json.dumps({"command": "echo final"})),), "tool_calls"),
+            AssistantReply("Done", stop_reason="stop"),
+        ]
+    )
+    agent = StellarWeaverHarborAgent(
+        logs_dir=tmp_path / "logs",
+        provider=model,
+        stream=False,
+    )
+    report = await agent.run("Test one-shot repair note", env)
+    assert report["unexpected_prefix_divergences"] == 0
+    for req in model.requests:
+        assert not any("Derived repair feedback" in m.content for m in req.messages if m.role == "system")
+
+    tool_by_id = {
+        m.tool_call_id: json.loads(m.content)
+        for m in model.requests[-1].messages
+        if m.role == "tool" and m.tool_call_id is not None
+    }
+    assert "model_note" not in tool_by_id["c1"]
+    assert "[Harness repair diagnostic:" in tool_by_id["c4"]["model_note"]
+    assert "model_note" not in tool_by_id["c5"]
+
+
+async def test_terminal_minimal_dedup_projection_real_registry_and_sqlite_recovery(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    state_dir = tmp_path / "state"
+    env = _ScriptedBashEnv(
+        [
+            TerminalExecResult("STDOUT_ALPHA\n", "STDERR_ALPHA\n", 1),
+            TerminalExecResult("STDOUT_BETA\n", "STDERR_BETA\n", 1),
+        ]
+    )
+    cfg = AppConfig(
+        model=ModelConfig(provider="fake", context_window_tokens=128_000),
+        limits=LimitsConfig(max_model_calls=20, max_tool_calls=20, max_wall_seconds=60),
+        policy=PolicyConfig(preset="benchmark"),
+        harness=HarnessConfig(
+            profile="terminal-minimal",
+            repair_controller="feedback",
+            repeated_failure_soft_threshold=3,
+            repeated_failure_hard_threshold=6,
+            benchmark_allow_denied_tool_continue=True,
+        ),
+    )
+    replies = [
+        AssistantReply("", (ToolCall("c1", "bash", json.dumps({"command": "UNIQUE_BASH_CMD_ONE"})),), "tool_calls"),
+        AssistantReply("", (ToolCall("c2", "bash", json.dumps({"command": "UNIQUE_BASH_CMD_ONE"})),), "tool_calls"),
+        AssistantReply("Paused after second check", stop_reason="stop"),
+    ]
+    model = FakeModel(replies)
+    with SessionStore(ws, data_dir=state_dir) as store:
+        session_id = store.session_id
+        first_commit: dict[str, str] = {}
+
+        def capture_first_commit(event: AgentEvent) -> None:
+            if event.type != "tool.completed":
+                return
+            call_id = event.payload["call_id"]
+            assert call_id not in first_commit
+            snapshot = SessionStore.inspect(session_id, workspace=ws, data_dir=state_dir)
+            messages = [m for m in snapshot.messages if m.tool_call_id == call_id]
+            assert len(messages) == 1
+            first_commit[call_id] = messages[0].content
+            raw = next(result for result in snapshot.results if result.call_id == call_id)
+            assert raw.data["command"] == "UNIQUE_BASH_CMD_ONE"
+
+        engine = PolicyEngine("benchmark", workspace=ws, allow_terminal_container=True)
+        registry = ToolRegistry(
+            ws, engine, builtins=False, command_boundary="harbor-container-exec"
+        )
+        register_terminal_tools(registry, env)
+        agent = Agent(
+            model, registry, limits=cfg.limits, harness_config=cfg.harness, store=store,
+            on_event=capture_first_commit,
+        )
+        outcome = await agent.run("Run two failing checks")
+        assert outcome.run_status == "completed"
+
+    live_tool_msgs = {
+        m.tool_call_id: m
+        for m in model.requests[-1].messages
+        if m.role == "tool" and m.tool_call_id is not None
+    }
+    c1_payload = json.loads(live_tool_msgs["c1"].content)
+    c2_payload = json.loads(live_tool_msgs["c2"].content)
+    assert "command" not in c1_payload["data"]
+    assert "STDOUT_ALPHA" not in c1_payload["content"]
+    assert c1_payload["data"]["stdout"] == "STDOUT_ALPHA\n"
+    assert c1_payload["data"]["stderr"] == "STDERR_ALPHA\n"
+    assert "[Harness repair diagnostic:" in c2_payload["model_note"]
+    assert first_commit == {call_id: message.content for call_id, message in live_tool_msgs.items()}
+
+    # Reopen SQLite and verify single deduplicated tool message row + untouched raw result + valid resume()
+    snapshot = SessionStore.inspect(session_id, workspace=ws, data_dir=state_dir)
+    persisted_c2 = [m for m in snapshot.messages if m.role == "tool" and m.tool_call_id == "c2"]
+    assert len(persisted_c2) == 1
+    assert persisted_c2[0].content == live_tool_msgs["c2"].content
+    persisted_c1 = [m for m in snapshot.messages if m.role == "tool" and m.tool_call_id == "c1"]
+    assert len(persisted_c1) == 1
+    assert persisted_c1[0].content == live_tool_msgs["c1"].content
+
+    raw_results_by_call = {res.call_id: res for res in snapshot.results}
+    assert raw_results_by_call["c2"].data["command"] == "UNIQUE_BASH_CMD_ONE"
+    assert "STDOUT_BETA" in raw_results_by_call["c2"].content
+    completed_events = [
+        e for e in snapshot.events if e.type == "tool.completed" and e.payload.get("call_id") == "c2"
+    ]
+    assert len(completed_events) == 1
+    assert completed_events[0].payload["data"]["command"] == "UNIQUE_BASH_CMD_ONE"
+
+    resume_env = _ScriptedBashEnv([TerminalExecResult("RESUMED_OK\n", "", 0)])
+    resume_model = FakeModel(
+        [
+            AssistantReply("", (ToolCall("c3", "bash", json.dumps({"command": "echo ok"})),), "tool_calls"),
+            AssistantReply("Resumed done", stop_reason="stop"),
+        ]
+    )
+    with SessionStore.open(session_id, workspace=ws, data_dir=state_dir) as reopened:
+        engine2 = PolicyEngine("benchmark", workspace=ws, allow_terminal_container=True)
+        registry2 = ToolRegistry(
+            ws, engine2, builtins=False, command_boundary="harbor-container-exec"
+        )
+        register_terminal_tools(registry2, resume_env)
+        resumed = Agent(
+            resume_model, registry2, limits=cfg.limits, harness_config=cfg.harness, store=reopened
+        )
+        resume_outcome = await resumed.resume("Continue after reopen")
+    assert resume_outcome.run_status == "completed"
+    restored = next(m for m in resume_model.requests[0].messages if m.tool_call_id == "c2")
+    assert restored.content == first_commit["c2"]
+
+
+def test_compactor_preserves_single_dual_streams_and_model_note() -> None:
+    note = "\n[Harness repair diagnostic: category=UNKNOWN, repeat_count=2, exit_code=1. Inspect output.]"
+    cases = [
+        ("stdout_only", "STDOUT_HEAD_" + ("a" * 500) + "_STDOUT_TAIL", ""),
+        ("stderr_only", "", "STDERR_HEAD_" + ("b" * 500) + "_STDERR_TAIL"),
+        (
+            "dual_stream",
+            "STDOUT_HEAD_" + ("x" * 400) + "_STDOUT_TAIL",
+            "STDERR_HEAD_" + ("y" * 400) + "_STDERR_TAIL",
+        ),
+    ]
+    for _label, out_s, err_s in cases:
+        payload = {
+            "call_id": "call-1",
+            "operation_id": "op-1",
+            "tool_name": "bash",
+            "status": "error",
+            "content": "exit_code=1; timed_out=False",
+            "model_note": note.strip(),
+            "tool_message_format": "terminal-bash",
+            "data": {"exit_code": 1, "timed_out": False, "stdout": out_s, "stderr": err_s},
+            "artifact_ids": [],
+            "duration_ms": 12,
+        }
+        msg = Message("tool", json.dumps(payload, ensure_ascii=False), tool_call_id="call-1")
+        for smart in (True, False):
+            projected = _project_tool(msg, 320, smart=smart)
+            body = json.loads(projected.content)
+            assert body["model_note"] == note.strip()
+            if out_s:
+                assert "STDOUT_HEAD_" in body["content"] or "STDOUT_TAIL" in body["content"]
+            if err_s:
+                assert "STDERR_HEAD_" in body["content"] or "STDERR_TAIL" in body["content"]
+
+
+def test_legacy_tool_compaction_keeps_plain_preview() -> None:
+    payload = {
+        "tool_name": "run_command",
+        "content": "Original tool preview. " * 30,
+        "data": {"stdout": "STREAM_ONLY", "stderr": ""},
+    }
+    msg = Message("tool", json.dumps(payload), tool_call_id="legacy")
+    projected = _project_tool(msg, 80, smart=False)
+    assert json.loads(projected.content)["content"].startswith("Original tool preview.")
+    assert "STREAM_ONLY" not in projected.content
+
+
+async def test_legacy_repair_feedback_remains_system_context(tmp_path: Path) -> None:
+    model = FakeModel([
+        AssistantReply("", (ToolCall("call", "bash", '{"command":"check"}'),), "tool_calls"),
+        AssistantReply("Done", stop_reason="stop"),
+    ])
+    policy = PolicyEngine("benchmark", workspace=tmp_path, allow_terminal_container=True)
+    registry = ToolRegistry(tmp_path, policy, builtins=False, command_boundary="harbor-container-exec")
+    register_terminal_tools(registry, _ScriptedBashEnv([TerminalExecResult("", "failed\n", 1)]))
+    with SessionStore(tmp_path, data_dir=tmp_path / "state") as store:
+        agent = Agent(
+            model, registry, harness_config=HarnessConfig(repair_controller="feedback"),
+            capture_host_changes=False, store=store,
+        )
+        outcome = await agent.run("Check original profile")
+    assert outcome.run_status == "completed"
+    messages = model.requests[-1].messages
+    assert any(m.role == "system" and m.content.startswith("Derived repair feedback.") for m in messages)
+    tool = json.loads(next(m.content for m in messages if m.role == "tool"))
+    assert "model_note" not in tool
+    assert tool["data"]["command"] == "check"
+
+
+async def test_completion_evidence_reminder_v1_v2_ab_and_manifest_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def make_scripted_replies() -> list[AssistantReply]:
+        return [
+            AssistantReply("", (ToolCall("c1", "bash", json.dumps({"command": "echo hi"})),), "tool_calls"),
+            AssistantReply("Initial claim done", stop_reason="stop"),
+            AssistantReply("Verified against independent case", stop_reason="stop"),
+        ]
+
+    runs: dict[str, tuple[FakeModel, dict[str, Any], dict[str, Any]]] = {}
+    for label, enabled, version in (
+        ("v1", True, "v1"),
+        ("v2", True, "v2"),
+        ("off", False, "v2"),
+    ):
+        env = _ScriptedBashEnv([TerminalExecResult("hi\n", "", 0)])
+        model = FakeModel(make_scripted_replies())
+        logs_dir = tmp_path / f"logs_{label}"
+        agent = StellarWeaverHarborAgent(
+            logs_dir=logs_dir,
+            provider=model,
+            stream=False,
+            completion_evidence_reminder=enabled,
+            completion_evidence_reminder_version=version,
+        )
+        # Freeze run-local metadata so full request comparison isolates the reminder text.
+        ids = count(1)
+        with monkeypatch.context() as fixed:
+            fixed.setattr("stellarweaver.session.store.uuid4", lambda ids=ids: UUID(int=next(ids)))
+            fixed.setattr("stellarweaver.tools.registry.time", SimpleNamespace(monotonic=lambda: 0.0))
+            report = await agent.run("Solve task", env)
+        manifest = json.loads((logs_dir / "manifest.json").read_text(encoding="utf-8"))
+        runs[label] = (model, report, manifest)
+
+    m_v1, r_v1, man_v1 = runs["v1"]
+    m_v2, r_v2, man_v2 = runs["v2"]
+    m_off, r_off, man_off = runs["off"]
+
+    # Before the reminder, both variants issue identical requests.
+    assert len(m_v1.requests) == len(m_v2.requests) == 3
+    assert m_v1.requests[:2] == m_v2.requests[:2]
+    assert m_v1.requests[2].messages[-1] == Message("user", COMPLETION_EVIDENCE_REMINDER)
+    assert m_v2.requests[2].messages[-1] == Message("user", COMPLETION_EVIDENCE_REMINDER_V2)
+    assert m_v1.requests[2] == replace(
+        m_v2.requests[2],
+        messages=(*m_v2.requests[2].messages[:-1], m_v1.requests[2].messages[-1]),
+    )
+    assert r_v1["completion_evidence_reminders"] == r_v2["completion_evidence_reminders"] == 1
+
+    # Fingerprints: version change updates config_sha256 without touching system/tools hashes
+    assert man_v1["system_prompt_sha256"] == man_v2["system_prompt_sha256"]
+    assert man_v1["tools_sha256"] == man_v2["tools_sha256"]
+    assert man_v1["config_sha256"] != man_v2["config_sha256"]
+    assert man_v1["completion_evidence_reminder_version"] == "v1"
+    assert man_v2["completion_evidence_reminder_version"] == "v2"
+    assert man_v1["completion_evidence_reminder_sha256"] != man_v2["completion_evidence_reminder_sha256"]
+    assert "context" in man_v1 and "retry" in man_v1
+
+    # Disabled reminder clears active version & sha even if version kwarg was supplied
+    assert r_off["completion_evidence_reminders"] == 0
+    assert len(m_off.requests) == 2
+    assert man_off["completion_evidence_reminder_version"] is None
+    assert man_off["completion_evidence_reminder_sha256"] is None
+
+    with pytest.raises(ValueError, match="completion_evidence_reminder_version"):
+        StellarWeaverHarborAgent(
+            logs_dir=tmp_path / "invalid",
+            completion_evidence_reminder_version="v99",
+        )
 
 
 async def test_harbor_agent_records_unexpected_prefix_divergences(tmp_path: Path) -> None:
