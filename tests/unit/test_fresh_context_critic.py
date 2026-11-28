@@ -921,6 +921,8 @@ def test_real_probe_ignores_caches_and_detects_workspace_and_site_packages_mutat
     site_dir.mkdir()
     (app_dir / "src" / "main.py").write_text("x = 1\n", encoding="utf-8")
     (site_dir / "pkg_mod.py").write_text("k = 2\n", encoding="utf-8")
+    (site_dir / "megatron").mkdir()
+    (site_dir / "megatron" / "core.py").write_text("m = 1\n", encoding="utf-8")
 
     # Extract Python body from _CONTAINER_PRE_PROBE_SCRIPT and run it in tmp_path.
     # Also verify non-existent usersitepackages directory is skipped without flagging missing_roots.
@@ -948,21 +950,27 @@ def test_real_probe_ignores_caches_and_detects_workspace_and_site_packages_mutat
     assert pre_meta["missing_roots"] == []
     assert pre_meta["truncated"] is False
     assert pre_meta["read_errors"] == 0
+    assert str(site_dir) in pre_meta["summary_roots"]
 
-    # Adding .pytest_cache and __pycache__ artifacts must NOT trigger mutation
+    # Adding .pytest_cache and __pycache__ (including inside site-packages package dirs) must NOT trigger mutation
     (app_dir / ".pytest_cache" / "v" / "cache").mkdir(parents=True)
     (app_dir / ".pytest_cache" / "v" / "cache" / "lastfailed").write_text("{}", encoding="utf-8")
     (app_dir / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"pyc")
+    (site_dir / "megatron" / "__pycache__").mkdir()
+    (site_dir / "megatron" / "__pycache__" / "core.cpython-312.pyc").write_bytes(b"pyc")
     assert _diff_snapshots(before, run_probe()[1]) == ()
 
-    # Mutating a deliverable or site-packages file MUST be caught
+    # Mutating a top-level or package-subdirectory site-packages file MUST be caught
     (site_dir / "pkg_mod.py").write_text("k = 999\n", encoding="utf-8")
+    (site_dir / "megatron" / "core.py").write_text("m = 999\n", encoding="utf-8")
     changed = _diff_snapshots(before, run_probe()[1])
     assert any("pkg_mod.py" in path for path in changed)
+    assert any("megatron" in path for path in changed)
 
-    # Verify _build_post_probe_script reuses the exact roots and _parse_probe_json flags truncated/read_errors
-    post_script = _build_post_probe_script([str(app_dir), str(site_dir)])
+    # Verify _build_post_probe_script reuses the exact roots and summary_roots
+    post_script = _build_post_probe_script([str(app_dir), str(site_dir)], [str(site_dir)])
     assert str(site_dir).replace("\\", "\\\\") in post_script or str(site_dir) in post_script
+    assert "summary_roots" in post_script
     trunc_snap = _parse_probe_json(
         json.dumps({"roots": ["/app"], "files": {}, "truncated": True, "read_errors": 0, "missing_roots": []}),
         return_code=0,

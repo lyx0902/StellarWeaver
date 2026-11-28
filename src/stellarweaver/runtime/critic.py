@@ -16,7 +16,7 @@ import hashlib
 import json
 import shlex
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
@@ -115,12 +115,28 @@ Instructions for final verification and repair (Trust-but-Verify):
 _PROBE_SEPARATOR = "__SW_CRITIC_SNAPSHOT_JSON__"
 
 _WALK_TREE_HELPER = """
-def walk_tree(roots):
+def walk_tree(roots, summary_roots=None):
     skip = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv"}
+    summary_set = {os.path.abspath(r) for r in (summary_roots or []) if r}
     snap = {}
     read_errors = 0
     missing_roots = []
     truncated = False
+    exact_files = 0
+    summary_files = 0
+    def _on_err(_exc):
+        nonlocal read_errors
+        read_errors += 1
+    def _file_digest(path, size):
+        nonlocal read_errors
+        if size > 262144:
+            return None
+        try:
+            with open(path, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            read_errors += 1
+            return None
     for root in roots:
         if not root or not os.path.isdir(root):
             missing_roots.append(str(root))
@@ -128,30 +144,70 @@ def walk_tree(roots):
         norm_root = os.path.abspath(root)
         if norm_root.startswith("/tmp"):
             continue
-        def _on_err(_exc):
-            nonlocal read_errors
-            read_errors += 1
+        if norm_root in summary_set:
+            try:
+                top_entries = sorted(os.listdir(norm_root))
+            except OSError:
+                read_errors += 1
+                continue
+            for entry in top_entries:
+                if entry in skip:
+                    continue
+                entry_path = os.path.join(norm_root, entry)
+                if os.path.islink(entry_path):
+                    continue
+                if os.path.isfile(entry_path):
+                    try:
+                        st = os.lstat(entry_path)
+                    except OSError:
+                        read_errors += 1
+                        continue
+                    snap[entry_path] = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, _file_digest(entry_path, st.st_size)]
+                    summary_files += 1
+                    if summary_files >= 250000:
+                        truncated = True
+                        return snap, truncated, read_errors, missing_roots
+                    continue
+                if os.path.isdir(entry_path):
+                    h = hashlib.sha256()
+                    file_count = 0
+                    total_bytes = 0
+                    for cur, dirs, files in os.walk(entry_path, onerror=_on_err):
+                        dirs[:] = sorted(d for d in dirs if d not in skip)
+                        for name in sorted(files):
+                            path = os.path.join(cur, name)
+                            if os.path.islink(path) or not os.path.isfile(path):
+                                continue
+                            try:
+                                st = os.lstat(path)
+                            except OSError:
+                                read_errors += 1
+                                continue
+                            rel = os.path.relpath(path, entry_path)
+                            h.update(f"{rel}\\0{st.st_size}\\0{st.st_mtime_ns}\\0{st.st_ctime_ns}\\0{st.st_mode}\\n".encode("utf-8", "surrogateescape"))
+                            file_count += 1
+                            total_bytes += st.st_size
+                            summary_files += 1
+                            if summary_files >= 250000:
+                                truncated = True
+                                snap[entry_path] = ["dir_digest", file_count, total_bytes, h.hexdigest()]
+                                return snap, truncated, read_errors, missing_roots
+                    snap[entry_path] = ["dir_digest", file_count, total_bytes, h.hexdigest()]
+            continue
         for cur, dirs, files in os.walk(norm_root, onerror=_on_err):
             dirs[:] = sorted(d for d in dirs if d not in skip)
             for name in sorted(files):
                 path = os.path.join(cur, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
                 try:
                     st = os.lstat(path)
                 except OSError:
                     read_errors += 1
                     continue
-                if os.path.islink(path) or not os.path.isfile(path):
-                    continue
-                digest = None
-                if st.st_size <= 262144:
-                    try:
-                        with open(path, "rb") as fh:
-                            digest = hashlib.sha256(fh.read()).hexdigest()
-                    except OSError:
-                        read_errors += 1
-                        digest = None
-                snap[path] = [st.st_size, st.st_mtime_ns, digest]
-                if len(snap) >= 4000:
+                snap[path] = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, _file_digest(path, st.st_size)]
+                exact_files += 1
+                if exact_files >= 20000:
                     truncated = True
                     return snap, truncated, read_errors, missing_roots
     return snap, truncated, read_errors, missing_roots
@@ -183,47 +239,55 @@ if not inv:
 roots = [cwd]
 if git_root and git_root not in roots:
     roots.append(git_root)
+summary_roots = []
 try:
     for sp in site.getsitepackages():
         if sp and os.path.isdir(sp) and sp not in roots:
             roots.append(sp)
+            summary_roots.append(sp)
 except Exception:
     pass
 try:
     usp = site.getusersitepackages()
     if usp and os.path.isdir(usp) and usp not in roots:
         roots.append(usp)
+        summary_roots.append(usp)
 except Exception:
     pass
 
-files, truncated, read_errors, missing_roots = walk_tree(roots)
+files, truncated, read_errors, missing_roots = walk_tree(roots, summary_roots)
 print("\\n".join(inv[:30]))
 print("__SW_CRITIC_SNAPSHOT_JSON__")
 print(json.dumps({
     "roots": roots,
+    "summary_roots": summary_roots,
     "files": files,
     "truncated": truncated,
     "read_errors": read_errors,
     "missing_roots": missing_roots,
 }, ensure_ascii=False))
-__SW_PROBE__"""
+__SW_PROBE__
+"""
 )
 
 
-def _build_post_probe_script(roots: list[str]) -> str:
+def _build_post_probe_script(roots: list[str], summary_roots: list[str] | None = None) -> str:
     return (
         "python3 - <<'__SW_POST__'\nimport hashlib, json, os\n"
         + _WALK_TREE_HELPER
         + f"\nroots = {json.dumps(roots, ensure_ascii=False)}\n"
-        + """files, truncated, read_errors, missing_roots = walk_tree(roots)
+        + f"summary_roots = {json.dumps(list(summary_roots or ()), ensure_ascii=False)}\n"
+        + """files, truncated, read_errors, missing_roots = walk_tree(roots, summary_roots)
 print(json.dumps({
     "roots": roots,
+    "summary_roots": summary_roots,
     "files": files,
     "truncated": truncated,
     "read_errors": read_errors,
     "missing_roots": missing_roots,
 }, ensure_ascii=False))
-__SW_POST__"""
+__SW_POST__
+"""
     )
 
 
@@ -502,6 +566,7 @@ class _ParsedSnapshot:
     files: dict[str, list[Any]]
     complete: bool
     reason: str | None = None
+    summary_roots: list[str] = field(default_factory=list)
 
 
 def _parse_probe_json(raw_json: str, *, return_code: int | None) -> _ParsedSnapshot:
@@ -515,20 +580,22 @@ def _parse_probe_json(raw_json: str, *, return_code: int | None) -> _ParsedSnaps
         return _ParsedSnapshot("", [], {}, False, "probe_missing_files")
     roots_raw = parsed.get("roots")
     roots = [str(item) for item in roots_raw] if isinstance(roots_raw, list) else []
+    summary_raw = parsed.get("summary_roots")
+    summary_roots = [str(item) for item in summary_raw] if isinstance(summary_raw, list) else []
     files = {str(k): list(v) for k, v in parsed["files"].items() if isinstance(v, list)}
     truncated = bool(parsed.get("truncated", False))
     read_errors = int(parsed.get("read_errors", 0) or 0)
     missing_roots = parsed.get("missing_roots")
     has_missing = isinstance(missing_roots, list) and len(missing_roots) > 0
     if not roots:
-        return _ParsedSnapshot("", roots, files, False, "probe_empty_roots")
+        return _ParsedSnapshot("", roots, files, False, "probe_empty_roots", summary_roots)
     if truncated:
-        return _ParsedSnapshot("", roots, files, False, "probe_truncated")
+        return _ParsedSnapshot("", roots, files, False, "probe_truncated", summary_roots)
     if read_errors > 0:
-        return _ParsedSnapshot("", roots, files, False, "probe_read_errors")
+        return _ParsedSnapshot("", roots, files, False, "probe_read_errors", summary_roots)
     if has_missing:
-        return _ParsedSnapshot("", roots, files, False, "probe_missing_roots")
-    return _ParsedSnapshot("", roots, files, True, None)
+        return _ParsedSnapshot("", roots, files, False, "probe_missing_roots", summary_roots)
+    return _ParsedSnapshot("", roots, files, True, None, summary_roots)
 
 
 def _parse_pre_probe_output(stdout: str, *, return_code: int | None) -> _ParsedSnapshot:
@@ -544,6 +611,7 @@ def _parse_pre_probe_output(stdout: str, *, return_code: int | None) -> _ParsedS
         parsed.files,
         parsed.complete,
         parsed.reason,
+        parsed.summary_roots,
     )
 
 
@@ -1265,7 +1333,7 @@ async def run_fresh_context_critic(
             executor,
             f"mkdir -p {shlex.quote(scratch_dir)} {shlex.quote(scratch_dir + '/pycache')}\n"
             + _CONTAINER_PRE_PROBE_SCRIPT,
-            timeout_sec=10,
+            timeout_sec=30,
         )
         pre_snap = _parse_pre_probe_output(pre_stdout, return_code=pre_rc)
         if pre_snap.complete:
@@ -1369,7 +1437,9 @@ async def run_fresh_context_critic(
     if pre_snap.complete:
         try:
             post_rc, post_stdout = await _exec_bounded(
-                executor, _build_post_probe_script(pre_snap.roots), timeout_sec=10
+                executor,
+                _build_post_probe_script(pre_snap.roots, pre_snap.summary_roots),
+                timeout_sec=30,
             )
         except asyncio.CancelledError:
             parent.store.append_event(
