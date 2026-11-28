@@ -1,0 +1,34 @@
+# Pinned Harbor 0.25.0 configuration for the TB 4.1 7-near-miss v2 rerun + 1 lightweight regression sentinel.
+# Baseline commit: 5bb1a4d (Batch 1 offline fixes + refined completion_evidence_reminder v2).
+# Reporting boundary:
+#   - Main flip denominator: 7 Round-1 near-miss tasks (reward=0 in 2026-11-27__23-05-14).
+#   - Regression sentinel (reported separately, excluded from 7-task denominator): terminal-bench/mvcc-lsm-compaction.
+# Usage:
+#   .\.venv\Scripts\python.exe -m stellarweaver.evals.terminal_bench run --config deploy/harbor-tb41-nearmiss7-v2.yaml --env-file .env
+jobs_dir: .validation/tb41-nearmiss7-v2
+n_attempts: 1
+n_concurrent_trials: 1
+environment:
+  type: docker
+  delete: false  # Stop and remove containers after each trial (docker compose down) while keeping local Docker images on disk.
+agents:
+  - name: stellarweaver.evals.terminal_bench:StellarWeaverHarborAgent
+    model_name: deepseek/deepseek-flash
+    kwargs:
+      reasoning_effort: max
+      completion_evidence_reminder: true
+      completion_evidence_reminder_version: v2
+datasets:
+  - name: terminal-bench/terminal-bench
+    version: "4.1.0"
+    task_names:
+      # --- 7 Round-1 near-miss tasks (main flip denominator) ---
+      - terminal-bench/cargo-flight-dispatch
+      - terminal-bench/fin-saccr-rwa
+      - terminal-bench/production-planning
+      - terminal-bench/session-window-debug
+      - terminal-bench/vba-userform-port
+      - terminal-bench/vpp-loss-divergence
+      - terminal-bench/wal-recovery-ordering
+      # --- 1 lightweight regression sentinel (Round-1 PASS 15/15, 11m, $0.149; reported separately) ---
+      - terminal-bench/mvcc-lsm-compaction

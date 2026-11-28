@@ -22,14 +22,15 @@
 
 ### 当前进展
 
-CLI M0–M5、工作台 G0–G11、Harness M0–M10、N 阶段（Batch 1–3）与上下文三项优化，以及 **Harness Phase 1–3a、Web Compose 开关同步、TB 4.1 遥测溯源与交卷前复核提醒** 均已完成实现、验收并合入 `master`（**676+ 项离线回归全绿**）。已完成基准实测与下一步聚焦如下：
-- **Terminal-Bench 4.1 5 题 CPU 冒烟 & 4-Trial 开关对照**（`terminal-minimal` · DeepSeek Flash `max` · 512k）：
-  - 5 题 CPU 冒烟官方通过 **2/5（40.0%）**（`kv-live-surgery` 6/6、`payments-pipeline-fix` 3/3），`0` 超时、`0` 异常；经 WAL 只读重建真实实报 Prefix Cache 为 **97.58%**、标准价合计 **`$3.094`**（同 5 题一手对照：Claude Code 5 次试验均值 **28.0% [7/25]**；Ante 0.3.5 同为 **40.0% [2/5]** 且我方题均耗时更优 `34.4m` vs `53.1m`）。
-  - `completion_evidence_reminder` 4-Trial 开关对照（`vf2` + `wal` × 关/开）：实证开启交卷前 1 次通用复核提醒后，成功拦截 `vf2` 首次交卷前遗留的 `_core.c` 大图与 `graph.py` 自环 2 个必挂 Bug 并自修至 **`60/60`**，4-trial 缓存命中率 **`97.97%`**（总标准价 `$2.166` / 谷期 ~¥7.5）；对标 Harbor Hub 重题实耗将 `long_horizon` 预设放宽至 **`3h / 2000 次 / 300M 输入 / 3M 输出`**，并补齐 Docker 内存预检（`preflight`/`run`）、作业级根锁分母校验、报错去噪归一化与只读 `PrefixCacheAuditor`。
-  - **下一步重点**：通过 `python -m stellarweaver.evals.terminal_bench run --config deploy/harbor-tb41-fast19.yaml --env-file .env` 跑通 `fast-agent` 19 题公开标准子集（+ 已有 4 题 = **23 题双栏覆盖**），详见 [TB 4.1 23 题基准档案](docs/TB4.1Subset23.md)。
+CLI M0–M5、工作台 G0–G11、Harness M0–M10、N 阶段（Batch 1–3）与上下文三项优化，以及 **Harness Phase 1–3a、Web Compose 7 开关透传、Harbor 原生评测与 Batch 1 离线工程修复** 均已完成实现、验收并合入主线（**676+ 项离线回归全绿**）。已完成基准实测与工程闭环如下：
+- **Terminal-Bench 4.1 评测与工程闭环**（`terminal-minimal` 单 `bash` · DeepSeek Flash `max` · 512k）：
+  - **多容器/高难专项与 A/B 基线**：5 题纯 CPU 冒烟官方通过 **`2/5（40.0%）`**（`kv-live-surgery` `6/6`、`payments-pipeline-fix` `3/3`，WAL 实报缓存 **`97.58%`**，标准价 `$3.094`）；在与 19 题子集不重叠的 4 道多容器/专项题中原始通过 **`2/4（50.0%）`**，优于同基座 Claude Code（`30.0%`，6/20）与 Ante（`25.0%`，1/4）。`completion_evidence_reminder` 4-Trial 开关对照成功拦截并修复 `vf2-speedup-networkx` 2 个交卷前必挂缺陷至 **`60/60`**（缓存 **`97.97%`**）。
+  - **19 题公开标准子集首轮基线与旁路审计抓虫（`0b2480c`，2026-11-27–28）**：按第三方 `fast-agent` 19 题纯 CPU 单容器子集严格原样实测，`19/19` 零异常、零 OOM、零超时出分，首轮单次 `pass@1` 基线 **`5/19（26.3%）`**（Claude Code `5/5` 稳定题 **`4/4（100%）`** 全过、`mvcc-lsm-compaction` 反超 Ante；实报缓存 **`95.38%`**，美元标准价 `$10.48` / 谷期重算 ~¥34.92）。旁路只读 `PrefixCacheAuditor` 精准定位首轮隐性缺陷：单 `bash` 模式下 `RepairController.notes` 永久驻留导致 **`1,200` 次前缀分叉**，持久化工具消息存在 **`55%` 重复字节冗余**。
+  - **Batch 1 工程修复与 7 近失 + 1 哨兵定点回归（`5bb1a4d`，2026-11-28）**：合入单事务 `terminal-minimal` 工具消息去重投影、一次性 `model_note` 诊断、摘要审计与可切换 `v1/v2` 指纹后，在 7 道首轮近失题 + 1 道哨兵 `mvcc` 上验证 **`3/8`**（近失翻盘 **`2/7`**：`production-planning` `20/20`、`wal-recovery-ordering` `97/97`；哨兵 `15/15` 零回归）。底座实测实现前缀分叉 **`397 → 0`**、工具消息单次均重 **`-57.4%`**、上下文压缩 **`5 → 2`**、未缓存输入 **`-64.9%`**、Prefix Cache 命中率 **`96.82% → 98.90%`**（多题达 `99.2%–99.4%`），在多跑 `+98` 次模型调用下标准价总费反降 **`-11.7%`**。
+  - **透明双口径汇总**：在 `fast-agent` 19 题公开子集上，跨两轮提交累计已有 **`7/19`** 道不同题目取得官方 `reward=1.0`（含 4 题非重叠多容器专项的 23 题并集累计 **`9/23`**；明确标注为**跨两轮迭代的累计解出数，不等同于同提交单次 `pass@1`**，首轮单次分母保持 `5/19` 独立不混算）。当前按路线 A 固化收益归档，后续按需在 `5bb1a4d` 谷期重跑完整 19 题刷新单次基线（预计 ~¥28–¥32），详见 [TB 4.1 23 题档案](docs/TB4.1Subset23.md) 与 [TB 4.1 评测与优化报告](docs/TerminalBench4.1Eval.md)。
 - **SWE-bench Lite `dev` 全量 23 题（已收官归档）**（`full` · DeepSeek Flash Thinking High · 200k）：23/23 产出合法补丁，原始通过 **9/23（39.1%）**，剔除 8 题上游镜像损坏后有效通过 **9/15（60.0%）**，Prefix Cache 86.67%、闲时均摊 **¥0.20 / 题**；不再推进 `test` 300 题。
 
-[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4.1Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
+[当前实现与验收](docs/HARNESS_ACCEPTANCE.md#当前实现进度核对) · [评测体系指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 评测与优化报告](docs/TerminalBench4.1Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [多阶段演进路线图](docs/StellarWeaver_Harness_Roadmap.md)
 
 ## 工作原理
 
@@ -257,11 +258,12 @@ uv run --locked --offline python -m stellarweaver.evals.swebench --help
 
 | 范围 | 已记录的进度 |
 | --- | --- |
-| Terminal-Bench 4.1 冒烟 & 4-Trial A/B | 5 题纯 CPU 冒烟官方通过 **2/5（40.0%）**（WAL 实报缓存 **97.58%**、标准价 `$3.094`）；4-trial `completion_evidence_reminder` 对照将 `vf2` 修至 `60/60`（缓存 **97.97%**）；Web Compose 7 项开关透传与严格 `TrialLock`/v2 溯源已合并 `master`。 |
-| 下一步：TB 4.1 19+4=23 题覆盖 | 使用 [harbor-tb41-fast19.yaml](deploy/harbor-tb41-fast19.yaml) 在谷期跑通 `fast-agent` 19 题标准子集（单题 `3h / 2000 次 / 300M / 3M` + 512k 窗口，谷期约 ¥42–¥55），与已有 4 题专项构成双栏 23 题同基座对照（不混分母）。 |
+| Terminal-Bench 4.1 冒烟 & 4-Trial A/B | 5 题纯 CPU 冒烟官方通过 **2/5（40.0%）**（非重叠 4 题多容器/专项 **`2/4 [50.0%]`** 优于 Ante `25%` 与 CC `30%`，WAL 实报缓存 **97.58%**、标准价 `$3.094`）；4-trial `completion_evidence_reminder` 对照将 `vf2` 修至 `60/60`（缓存 **97.97%**）；Web Compose 7 项开关透传与严格 `TrialLock`/v2 溯源已合并 `master`。 |
+| TB 4.1 `fast19` 首轮 & Batch 1 7+1 定点回归 | `fast-agent` 19 题首轮单次 `pass@1` 基线 **`5/19（26.3%）`**（19/19 零异常，谷期估计 ~¥34.92）；合入工具去重投影 + 一次性 `model_note` + `v2` 后，7 近失 + 1 哨兵回归 **`3/8`**（近失 `2/7` 翻盘、哨兵 `1/1`，缓存 **`98.90%`**、前缀偏移 **`0`**、未缓存输入 **`-64.9%`**、总费 **`-11.7%`**）。两轮跨提交累计已独立跑通 **`7/19`**（23 题并集 **`9/23`**，非同提交单次 `pass@1`）。 |
+| 下一步（路线 A） | 按需使用 [harbor-tb41-fast19.yaml](deploy/harbor-tb41-fast19.yaml) 在 `5bb1a4d` 谷期刷新完整 19 题单次基线（预计 ~¥28–¥32），或后续单测无锚定新鲜上下文审校。 |
 | SWE-bench Lite `dev`（23 题，已归档） | 全量 `dev` 23/23 产出合法补丁，官方原始 **9/23（39.1%）**，剔除 8 题上游镜像损坏后 **9/15（60.0%）**，均摊 ¥0.20/题；不再推进 `test` 300 题。 |
 
-[评测体系技术指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 冒烟与 A/B 报告](docs/TerminalBench4.1Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
+[评测体系技术指南](docs/EVALUATION.md) · [TB 4.1 23 题档案](docs/TB4.1Subset23.md) · [TB 4.1 评测与优化报告](docs/TerminalBench4.1Eval.md) · [SWE-bench dev 23 题报告](docs/SWEBenchLiteEval.md) · [历史 20 题内部评测](docs/archive/00_Sample_Run.md)
 
 ### 回归测试与效果验证
 

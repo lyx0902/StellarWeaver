@@ -50,7 +50,8 @@
   - 本文主栏 19 题：**`9 / 19`（`47.4%`）**，推理总费 `$9.21`（均摊 `$0.485/题`）
   - 本文补充 4 题：**`1 / 4`（`25.0%`）**，推理总费 `$1.86` · 23 题合计：`10 / 23`（**`43.5%`**）
 - **StellarWeaver（每题 1 次，`terminal-minimal` 单 `bash`）**：
-  - 主栏 19 题：**首轮实测 `5 / 19`（`26.3%`）**（`terminal-minimal` 单 `bash`，`19/19` 零异常完成；Harbor 美元标准价估算 `$10.48`，按已确认 token 与 DeepSeek 谷期单价重算估计约 `¥34.92`，实际账单以供应商记录为准；详见 [TerminalBench4.1Eval.md](TerminalBench4.1Eval.md#L109) 第 6 节）
+  - 主栏 19 题：**首轮实测 `5 / 19`（`26.3%`）**（`terminal-minimal` 单 `bash`，`19/19` 零异常完成；Harbor 美元标准价估算 `$10.48`，按已确认 token 与 DeepSeek 谷期单价重算估计约 `¥34.92`，实际账单以供应商记录为准；详见 [TerminalBench4.1Eval.md](TerminalBench4.1Eval.md#L111) 第 3 节）
+    - *后续工程验证（`5bb1a4d`，不混入上表 19 题主分母）*：合入 Batch 1 离线修复（工具消息去重 + 一次性修复反馈）与 `v2` 提醒后，于 2026-11-28 复跑 7 道近失题 + 1 题哨兵 `mvcc-lsm-compaction`，取得 **`3 / 8`**（近失翻盘 **`2 / 7`**：`production-planning` `20/20`、`wal-recovery-ordering` `97/97`；哨兵 `15/15` 零回归），同时前缀分叉 `397 → 0`、工具消息单次均重 `-57.4%`、压缩 `5 → 2`、未缓存输入 `-64.9%`、缓存命中率 **`96.82% → 98.90%`**、总标准价 **`-11.7%`**（详见 [TerminalBench4.1Eval.md](TerminalBench4.1Eval.md#L191) 第 4.2 节）。两轮跨提交在 19 题子集累计已独立跑通 **`7 / 19`**（含补充 4 题的 23 题并集累计 **`9 / 23`**），明确标注为跨迭代累计解出数、不混入首轮 `5 / 19` 单次 `pass@1` 分母。
   - 补充栏 4 题：冒烟原始 **`2 / 4`（`50.0%`）**（`kv-live-surgery` 6/6、`payments-pipeline-fix` 3/3），优于同批 Claude Code（30.0%）与 Ante（25.0%）；且后续开启 `completion_evidence_reminder` 的 A/B 实验已将 `vf2-speedup-networkx` 打磨通过至 `60/60`。
 
 ---

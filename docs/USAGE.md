@@ -45,7 +45,7 @@ uv run stellarweaver resume SESSION_ID --provider deepseek --env-file .env --pro
 
 `read-only` 供源码阅读。`ask` 按策略请求确认。`workspace-edit` 允许受控文件编辑，命令仍走相应授权规则。需要交互批准的操作在无 TTY 时停止。本地 stdio MCP 的发现、调用及关闭流程由[集成测试](../tests/integration/test_mcp_extensions.py)覆盖。配置字段见[示例配置](../stellarweaver.example.toml)，加载与协议边界见[架构](ARCHITECTURE.md#模型上下文与扩展)。
 
-在 Git 工作区可使用 `[execution]` 的 `backend = "docker"` 和固定本地镜像启用断网沙箱。设置 `allow_argv = true` 才会向模型公开沙箱里的通用命令工具，命令仍需授权。`[harness]` 可单独开启开发工具、Python 代码导航和修复反馈。工作台与评测的开关及验证口径见 [M5–M8 验收](HARNESS_ACCEPTANCE.md#m5-m8-沙箱与修复工具)。
+在 Git 工作区可使用 `[execution]` 的 `backend = "docker"` 和固定本地镜像启用断网沙箱。设置 `allow_argv = true` 才会向模型公开沙箱里的通用命令工具，命令仍需授权。`[harness]` 可单独开启开发工具、Python 代码导航和修复反馈。工作台与评测的开关及验证口径见 [M5–M8 验收](HARNESS_ACCEPTANCE.md#m5-m8-沙箱与修复工具2026-11-21)。
 
 需要用工作台验证 StellarWeaver 自身时，可从仓库根目录构建专用镜像。镜像包含锁定的项目依赖、pytest、pytest-asyncio 和 Ruff。执行时从任务快照读取源码，pytest 只显式加载镜像中安装的异步插件，容器保持断网。
 
