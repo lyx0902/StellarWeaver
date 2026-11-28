@@ -123,6 +123,7 @@ def register_terminal_tools(
     executor: TerminalExecutor,
     *,
     default_env: dict[str, str] | None = None,
+    description: str | None = None,
 ) -> None:
     """Register the container-only `bash` tool for `terminal-minimal` benchmark runs."""
     if registry.policy.preset != "benchmark" or not registry.policy.allow_terminal_container:
@@ -250,11 +251,15 @@ def register_terminal_tools(
 
     registry.register(
         "bash",
-        "Execute a bash command inside the persistent isolated task container. "
-        "Non-interactive defaults (DEBIAN_FRONTEND=noninteractive, GIT_TERMINAL_PROMPT=0, "
-        "PIP_NO_INPUT=1, CI=true) are pre-set. Pass a larger timeout_seconds (up to 1800) for "
-        "compilations, package installations, or long-running jobs. Background daemons started "
-        "with nohup/... & persist across calls inside the container.",
+        description
+        if description is not None
+        else (
+            "Execute a bash command inside the persistent isolated task container. "
+            "Non-interactive defaults (DEBIAN_FRONTEND=noninteractive, GIT_TERMINAL_PROMPT=0, "
+            "PIP_NO_INPUT=1, CI=true) are pre-set. Pass a larger timeout_seconds (up to 1800) for "
+            "compilations, package installations, or long-running jobs. Background daemons started "
+            "with nohup/... & persist across calls inside the container."
+        ),
         BashArgs,
         prepare_bash,
         read_only=False,

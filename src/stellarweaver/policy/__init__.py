@@ -86,6 +86,7 @@ class PolicyEngine:
         scoped_test_grants: bool = False,
         allow_benchmark_staging: bool = False,
         allow_terminal_container: bool = False,
+        allow_submit_critique: bool = False,
     ) -> None:
         if preset not in {"ask", "read-only", "workspace-edit", "auto", "benchmark"}:
             raise ValueError("Unknown policy preset")
@@ -101,6 +102,8 @@ class PolicyEngine:
             tools.add("stage_patch")
         if self.allow_terminal_container:
             tools.add("bash")
+            if allow_submit_critique:
+                tools.add("submit_critique")
         self.benchmark_tools = frozenset(tools)
         self._grants: tuple[FrozenGrant, ...] = ()
         self._session: set[str] = set()
@@ -236,6 +239,7 @@ class PolicyEngine:
                 **({"scoped_test_grants": True} if self.scoped_test_grants else {}),
                 **({"benchmark_staging": True} if "stage_patch" in self.benchmark_tools else {}),
                 **({"terminal_container": True} if self.allow_terminal_container else {}),
+                **({"submit_critique": True} if "submit_critique" in self.benchmark_tools else {}),
             }
         )
 

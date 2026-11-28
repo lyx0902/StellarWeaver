@@ -11,7 +11,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -71,6 +71,17 @@ class CompletionProof:
 
 
 CompletionCheck = Callable[[float], Awaitable[CompletionProof]]
+
+
+@dataclass(frozen=True)
+class CriticHandoff:
+    status: Literal["pass", "fail", "inconclusive", "skipped"]
+    handoff_message: str | None = None
+    summary: str = ""
+    metadata: JSONDict = field(default_factory=dict)
+
+
+CompletionCritic = Callable[["Agent", int, tuple[JSONDict, ...]], Awaitable[CriticHandoff]]
 
 SYSTEM = """You are StellarWeaver, a local coding assistant.
 Inspect relevant files before editing. Use expected_sha256 from read_file for edits.
@@ -173,14 +184,35 @@ class BudgetExceeded(Exception):
 
 
 @dataclass
-class ExplorationRequestScope:
+class ChildRequestScope:
     identity: str
     deadline: float
     context_rates: deque[float]
     finalizing: bool
+    purpose: Literal["delegate_exploration", "fresh_critic"] = "delegate_exploration"
+    phase: str | None = None
+    round_index: int | None = None
+    cache_auditor: PrefixCacheAuditor | None = None
+    compacted_since_last_audit: bool = False
+    reserved_model_calls: int = 0
+    reserved_input_tokens: int = 0
+    reserved_output_tokens: int = 0
+    max_model_calls: int | None = None
+    max_input_tokens_total: int | None = None
+    max_output_tokens_total: int | None = None
     model_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
+
+
+ExplorationRequestScope = ChildRequestScope
+
+
+@dataclass
+class _StreamProgress:
+    chunks: int = 0
+    output_bytes: int = 0
 
 
 def stable_arguments(raw: str) -> Any:
@@ -251,6 +283,7 @@ class Agent:
         context_config: ContextConfig | None = None,
         preflight: Preflight | None = None,
         completion_check: CompletionCheck | None = None,
+        completion_critic: CompletionCritic | None = None,
         system_prompt: str | None = None,
         project_context: bool = True,
         enable_web_search: bool = False,
@@ -302,6 +335,7 @@ class Agent:
         self.context_config = context_config or ContextConfig()
         self.preflight = preflight or empty_preflight
         self.completion_check = completion_check
+        self.completion_critic = completion_critic
         self._context = ContextManager(
             adaptive_round_retention=adaptive_round_retention,
             smart_tool_truncation=self.harness_config.smart_tool_truncation,
@@ -353,6 +387,9 @@ class Agent:
         self._stream_output_bytes = 0
         self._soft_reminder_sent = False
         self._completion_evidence_reminded = False
+        self._critic_rounds = 0
+        self._critic_handoff_injected = False
+        self._critic_prior_findings: list[JSONDict] = []
         self._length_continuations = 0
         self._task_evidence = (
             TaskEvidence()
@@ -854,19 +891,62 @@ class Agent:
             stop = ("failed", "execution state unknown; do not rerun automatically")
         return stop
 
-    def _checked_request(self, request: ModelRequest, input_estimate: int) -> ModelRequest:
+    def _checked_request(
+        self,
+        request: ModelRequest,
+        input_estimate: int,
+        *,
+        exploration: ChildRequestScope | None = None,
+    ) -> ModelRequest:
         self._remaining()
         model_limit = self.limits.max_model_calls
-        if self.enforce_run_budget and model_limit is not None and self._model_calls >= model_limit:
-            raise BudgetExceeded("max_model_calls")
-        available = self._output_limit()
-        if available <= 0:
-            raise BudgetExceeded("max_output_tokens_total")
+        reserve_models = exploration.reserved_model_calls if exploration is not None else 0
         if (
             self.enforce_run_budget
-            and self._input_tokens + input_estimate > self.limits.max_input_tokens_total
+            and model_limit is not None
+            and self._model_calls >= model_limit - reserve_models
+        ):
+            raise BudgetExceeded(
+                "parent_reserve_model_calls" if reserve_models > 0 else "max_model_calls"
+            )
+        if (
+            exploration is not None
+            and exploration.max_model_calls is not None
+            and exploration.model_calls >= exploration.max_model_calls
+        ):
+            raise BudgetExceeded("critic_max_model_calls")
+        available = self._output_limit()
+        if (
+            exploration is not None
+            and self.enforce_run_budget
+            and exploration.reserved_output_tokens > 0
+        ):
+            available = min(
+                available,
+                self.limits.max_output_tokens_total
+                - self._output_tokens
+                - exploration.reserved_output_tokens,
+            )
+        if exploration is not None and exploration.max_output_tokens_total is not None:
+            child_out_left = exploration.max_output_tokens_total - exploration.output_tokens
+            if child_out_left <= 0:
+                raise BudgetExceeded("critic_max_output_tokens_total")
+            available = min(available, child_out_left)
+        if available <= 0:
+            raise BudgetExceeded("max_output_tokens_total")
+        reserve_input = exploration.reserved_input_tokens if exploration is not None else 0
+        if (
+            self.enforce_run_budget
+            and self._input_tokens + input_estimate
+            > self.limits.max_input_tokens_total - reserve_input
         ):
             raise BudgetExceeded("max_input_tokens_total (estimated reservation)")
+        if (
+            exploration is not None
+            and exploration.max_input_tokens_total is not None
+            and exploration.input_tokens + input_estimate > exploration.max_input_tokens_total
+        ):
+            raise BudgetExceeded("critic_max_input_tokens_total")
         checked = replace(request, max_output_tokens=min(request.max_output_tokens, available))
         window = self.provider.capabilities().context_window_tokens
         if window is None or input_estimate + checked.max_output_tokens > window:
@@ -880,7 +960,7 @@ class Agent:
         output_estimate: int,
         *,
         incomplete: bool = False,
-        exploration: ExplorationRequestScope | None = None,
+        exploration: ChildRequestScope | None = None,
     ) -> JSONDict:
         data = usage or {}
         prompt = data.get("prompt_tokens", data.get("input_tokens"))
@@ -899,6 +979,9 @@ class Agent:
         if exploration is not None:
             exploration.input_tokens += prompt
             exploration.output_tokens += completion
+            cache_hit = data.get("prompt_cache_hit_tokens")
+            if type(cache_hit) is int and cache_hit >= 0:
+                exploration.cached_input_tokens += cache_hit
         self._estimated |= estimated
         self._usage_incomplete |= incomplete and estimated
         breakdown = {
@@ -917,7 +1000,11 @@ class Agent:
         }
 
     async def _consume_stream(
-        self, request: ModelRequest, *, emit_deltas: bool = True
+        self,
+        request: ModelRequest,
+        *,
+        emit_deltas: bool = True,
+        progress: _StreamProgress | None = None,
     ) -> AssistantReply:
         response: AssistantReply | None = None
         stream = self.provider.stream(request)
@@ -926,8 +1013,12 @@ class Agent:
                 if response is not None:
                     raise ProviderError("Stream emitted content after the final response")
                 if event.type == "text.delta":
-                    self._stream_output_bytes += len(event.text.encode("utf-8"))
+                    delta_bytes = len(event.text.encode("utf-8"))
+                    if progress is not None:
+                        progress.chunks += 1
+                        progress.output_bytes += delta_bytes
                     if emit_deltas:
+                        self._stream_output_bytes += delta_bytes
                         await self._delta(event.text)
                 elif event.type == "response.completed":
                     if event.reply is None:
@@ -979,15 +1070,20 @@ class Agent:
         streaming: bool,
         request: ModelRequest,
         error: ProviderError | None = None,
+        progress: _StreamProgress | None = None,
     ) -> int:
         """Estimate output tokens consumed by a failed request without phantom full reservations."""
         if error is not None and error.partial_output_tokens is not None:
             return min(request.max_output_tokens, max(0, error.partial_output_tokens))
         if streaming:
-            has_partial = self._chunk_index > 0 or (error is not None and error.partial_stream)
+            chunks = progress.chunks if progress is not None else self._chunk_index
+            output_bytes = (
+                progress.output_bytes if progress is not None else self._stream_output_bytes
+            )
+            has_partial = chunks > 0 or (error is not None and error.partial_stream)
             if not has_partial:
                 return 0
-            return min(request.max_output_tokens, max(1, (self._stream_output_bytes + 3) // 4))
+            return min(request.max_output_tokens, max(1, (output_bytes + 3) // 4))
         return request.max_output_tokens
 
     async def _request_model(
@@ -995,7 +1091,7 @@ class Agent:
         initial_request: ModelRequest,
         input_size: ContextSize,
         *,
-        exploration: ExplorationRequestScope | None = None,
+        exploration: ChildRequestScope | None = None,
     ) -> AssistantReply:
         request = initial_request
         input_estimate = input_size.tokens
@@ -1013,15 +1109,23 @@ class Agent:
         stream_requested = self.stream and not request.web_search
         streaming = stream_requested and capabilities.streaming
         settings = dict(capabilities.request_settings)
-        trace = (
-            {
+        if exploration is None:
+            trace: JSONDict = {}
+        elif exploration.purpose == "fresh_critic":
+            trace = {
+                "purpose": "fresh_critic",
+                "scope_id": exploration.identity,
+                "critic_id": exploration.identity,
+                "critic_round": exploration.round_index,
+                "critic_phase": exploration.phase
+                or ("finalize" if exploration.finalizing else "audit"),
+            }
+        else:
+            trace = {
                 "purpose": "delegate_exploration",
                 "exploration_id": exploration.identity,
                 "exploration_phase": "finalize" if exploration.finalizing else "gather",
             }
-            if exploration is not None
-            else {}
-        )
         if request.web_search or request.disable_thinking:
             settings["thinking"] = "disabled"
             settings.pop("reasoning_effort", None)
@@ -1030,9 +1134,10 @@ class Agent:
         retries = min(1, self.max_retries) if exploration is not None else self.max_retries
         repetition_retries = 0
         for retry_index in range(retries + 1):
-            request = self._checked_request(request, input_estimate)
+            request = self._checked_request(request, input_estimate, exploration=exploration)
             self._request_sequence += 1
             request_index = self._request_sequence
+            stream_progress = _StreamProgress()
             if exploration is None:
                 self._chunk_index = 0
                 self._stream_output_bytes = 0
@@ -1046,6 +1151,20 @@ class Agent:
                     self._compacted_since_last_audit = False
                     if divergence is not None:
                         await self._emit("cache.prefix_diverged", divergence)
+            elif (
+                exploration.cache_auditor is not None
+                and retry_index == 0
+                and not request.web_search
+            ):
+                divergence = exploration.cache_auditor.audit(
+                    request,
+                    model_key=json.dumps(settings, sort_keys=True, ensure_ascii=False),
+                    compacted=exploration.compacted_since_last_audit,
+                    request_index=request_index,
+                )
+                exploration.compacted_since_last_audit = False
+                if divergence is not None:
+                    await self._emit("critic.prefix_diverged", {**divergence, **trace})
             await self._emit(
                 "model.started",
                 {
@@ -1073,25 +1192,41 @@ class Agent:
             try:
                 async with request_timeout:
                     reply = (
-                        await self._consume_stream(request, emit_deltas=exploration is None)
+                        await self._consume_stream(
+                            request,
+                            emit_deltas=exploration is None,
+                            progress=stream_progress,
+                        )
                         if streaming
                         else await self.provider.complete(request)
                     )
             except asyncio.CancelledError:
-                self._account_usage(
+                accounting = self._account_usage(
                     None,
                     input_estimate,
-                    self._failed_output_estimate(streaming=streaming, request=request),
+                    self._failed_output_estimate(
+                        streaming=streaming, request=request, progress=stream_progress
+                    ),
                     incomplete=True,
                     exploration=exploration,
                 )
+                if exploration is not None and exploration.purpose == "fresh_critic":
+                    self.store.append_event(
+                        "critic.model_cancelled",
+                        {
+                            "request_index": request_index,
+                            "reason": "cancelled",
+                            **accounting,
+                            **trace,
+                        },
+                    )
                 if streaming and exploration is None:
                     await self._emit(
                         "model.interrupted",
                         {
                             "request_index": request_index,
                             "discarded": True,
-                            "chunk_count": self._chunk_index,
+                            "chunk_count": stream_progress.chunks,
                             "reason": "cancelled",
                         },
                     )
@@ -1103,7 +1238,9 @@ class Agent:
                 accounting = self._account_usage(
                     None,
                     input_estimate,
-                    self._failed_output_estimate(streaming=streaming, request=request),
+                    self._failed_output_estimate(
+                        streaming=streaming, request=request, progress=stream_progress
+                    ),
                     incomplete=True,
                     exploration=exploration,
                 )
@@ -1122,7 +1259,7 @@ class Agent:
                         {
                             "request_index": request_index,
                             "discarded": True,
-                            "chunk_count": self._chunk_index,
+                            "chunk_count": stream_progress.chunks,
                             "reason": reason,
                         },
                     )
@@ -1139,7 +1276,7 @@ class Agent:
                     error.usage,
                     input_estimate,
                     self._failed_output_estimate(
-                        streaming=streaming, request=request, error=error
+                        streaming=streaming, request=request, error=error, progress=stream_progress
                     ),
                     incomplete=True,
                     exploration=exploration,
@@ -1156,13 +1293,13 @@ class Agent:
                         **trace,
                     },
                 )
-                if streaming and exploration is None and (self._chunk_index or error.partial_stream):
+                if streaming and exploration is None and (stream_progress.chunks or error.partial_stream):
                     await self._emit(
                         "model.interrupted",
                         {
                             "request_index": request_index,
                             "discarded": True,
-                            "chunk_count": self._chunk_index,
+                            "chunk_count": stream_progress.chunks,
                             "reason": "provider failure",
                         },
                     )
@@ -1179,7 +1316,7 @@ class Agent:
                 ):
                     raise error from None
                 # A retry is another full request, never a tool replay.
-                self._checked_request(request, input_estimate)
+                request = self._checked_request(request, input_estimate, exploration=exploration)
                 jitter = random.uniform(0, self.retry_base_seconds)
                 delay = min(
                     self.retry_base_seconds * (2**retry_index) + jitter,
@@ -1338,7 +1475,10 @@ class Agent:
         sticky = self.harness_config.sticky_context_checkpoint
         if schemas and self.provider.capabilities().requires_reasoning_history:
             history = thinking_history(history, stable_evidence=sticky)
-        goal = next((item.content for item in reversed(history) if item.role == "user"), "")
+        if self._critic_handoff_injected or self._completion_evidence_reminded:
+            goal = next((item.content for item in history if item.role == "user"), "")
+        else:
+            goal = next((item.content for item in reversed(history) if item.role == "user"), "")
         evidence = guidance = None
         if self.project_context and self._task_evidence is not None:
             if self.harness_config.task_evidence and not shrink:
@@ -1462,8 +1602,12 @@ class Agent:
                 current_instructions=derived if sticky else (),
                 current_evidence=extra if sticky else (),
                 shrink_from=shrink_from,
-                # Keep the public task available after the reminder becomes the latest user message.
-                protect_initial_user=self._completion_evidence_reminded or preview_message is not None,
+                # Keep the public task available after the reminder or critic handoff becomes the latest user message.
+                protect_initial_user=(
+                    self._completion_evidence_reminded
+                    or self._critic_handoff_injected
+                    or preview_message is not None
+                ),
             )
 
         # On a server context-length error shrink once; no old tool dispatch is involved.
@@ -1897,6 +2041,64 @@ class Agent:
         await self._emit("convergence.reminder", {"unresolved_failures": failures})
         return True
 
+    async def _maybe_run_completion_critic(self, schemas: tuple[JSONDict, ...]) -> bool:
+        if (
+            self.completion_critic is None
+            or not self.harness_config.fresh_context_critic
+            or self.harness_config.profile != "terminal-minimal"
+            or self._critic_rounds >= self.harness_config.fresh_context_critic_max_rounds
+            or self._pending_calls
+            or self._time_exhausted()
+            or self._tools_exhausted()
+        ):
+            return False
+        round_index = self._critic_rounds + 1
+        self._critic_rounds = round_index
+        handoff = await self.completion_critic(self, round_index, tuple(self._critic_prior_findings))
+        findings = handoff.metadata.get("findings")
+        if isinstance(findings, list):
+            self._critic_prior_findings = [item for item in findings if isinstance(item, dict)]
+        if handoff.status != "fail" or not handoff.handoff_message:
+            return False
+
+        model_limit = self.limits.max_model_calls
+        if self.enforce_run_budget and (
+            (model_limit is not None and self._model_calls >= model_limit)
+            or self._input_tokens >= self.limits.max_input_tokens_total
+            or self._output_limit() <= 0
+            or self._time_exhausted()
+            or self._tools_exhausted()
+        ):
+            await self._emit(
+                "critic.handoff_skipped",
+                {"round": round_index, "reason": "parent_budget_exhausted", **handoff.metadata},
+            )
+            return False
+
+        message = Message("user", handoff.handoff_message)
+        try:
+            request, projection = await self._prepare_context(schemas, preview_message=message)
+            self._checked_request(request, projection.estimated_tokens)
+        except (BudgetExceeded, ContextBudgetExceeded) as exc:
+            await self._emit(
+                "critic.handoff_skipped",
+                {"round": round_index, "reason": str(exc), **handoff.metadata},
+            )
+            return False
+
+        self._critic_handoff_injected = True
+        self.store.append_message(message)
+        self.messages.append(message)
+        await self._emit(
+            "critic.handoff_injected",
+            {
+                "round": round_index,
+                "monotonic_ns": time.monotonic_ns(),
+                **handoff.metadata,
+            },
+        )
+        return True
+
     async def _maybe_remind_completion_evidence(self, schemas: tuple[JSONDict, ...]) -> bool:
         reminder_version, reminder_text = resolve_completion_evidence_reminder(self.harness_config)
         if (
@@ -2127,6 +2329,8 @@ class Agent:
             if reply.stop_reason == "tool_calls":
                 return self._completion("failed", "tool_calls stop without calls")
             if self.completion_check is None:
+                if await self._maybe_run_completion_critic(schemas):
+                    continue
                 if not self._completion_evidence_reminded:
                     if await self._maybe_remind_completion_evidence(schemas):
                         continue

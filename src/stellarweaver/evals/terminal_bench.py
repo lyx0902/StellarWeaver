@@ -12,6 +12,7 @@ import contextlib
 import importlib
 import importlib.metadata
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ from stellarweaver.cli import build_provider
 from stellarweaver.config import (
     AppConfig,
     CompletionEvidenceReminderVersion,
+    FreshContextCriticMode,
+    HarnessConfig,
     get_api_key,
     long_horizon_deepseek_flash,
     terminal_minimal_harness,
@@ -39,9 +42,15 @@ from stellarweaver.evals.swebench_pilot import digest
 from stellarweaver.policy import PolicyEngine
 from stellarweaver.providers.base import ModelProvider
 from stellarweaver.providers.openai_compatible import OpenAICompatibleChatProvider
+from stellarweaver.runtime.critic import (
+    fresh_context_critic_fingerprints,
+    run_fresh_context_critic,
+)
 from stellarweaver.runtime.loop import (
     COMPLETION_EVIDENCE_REMINDERS,
     Agent,
+    CompletionCritic,
+    CriticHandoff,
     DeltaSink,
     EventSink,
     resolve_completion_evidence_reminder,
@@ -169,6 +178,7 @@ def build_terminal_agent(
     command_boundary: str = "harbor-container-exec",
     system_prompt: str | None = None,
     enforce_run_budget: bool = True,
+    completion_critic: CompletionCritic | None = None,
 ) -> Agent:
     """Compose a `terminal-minimal` Agent with ONLY the container `bash` tool."""
     harness = (
@@ -205,6 +215,7 @@ def build_terminal_agent(
         retry_base_seconds=config.retry.base_delay_seconds,
         max_retry_delay_seconds=config.retry.max_delay_seconds,
         max_output_tokens=config.model.max_output_tokens,
+        completion_critic=completion_critic,
         system_prompt=(
             system_prompt if system_prompt is not None else TERMINAL_MINIMAL_SYSTEM_PROMPT
         ),
@@ -225,6 +236,26 @@ def _parse_bool_flag(value: bool | str) -> bool:
     if lowered in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid boolean flag value: {value!r}")
+
+
+def _parse_int_flag(value: int | str, name: str) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"Invalid integer value for {name}: {value!r}") from exc
+    raise ValueError(f"Invalid integer value for {name}: {value!r}")
+
+
+def _parse_critic_mode(value: str) -> FreshContextCriticMode:
+    normalized = value.strip().lower()
+    if normalized not in {"active", "shadow"}:
+        raise ValueError(
+            f"Invalid fresh_context_critic_mode: {value!r} (expected 'active' or 'shadow')"
+        )
+    return cast(FreshContextCriticMode, normalized)
 
 
 def _parse_reminder_version(value: str) -> CompletionEvidenceReminderVersion:
@@ -337,16 +368,23 @@ def _summarize_usage_events(
     awaiting_post_compaction = False
     response_models: set[str] = set()
     system_fingerprints: set[str] = set()
+    seen_failed_requests: set[int] = set()
 
     for event in events:
         if event.type == "context.compacted":
             awaiting_post_compaction = True
             continue
-        if event.type not in {"model.completed", "model.failed"}:
+        if event.type not in {"model.completed", "model.failed", "critic.model_cancelled"}:
             continue
         payload = event.payload
-        is_failed = event.type == "model.failed"
+        is_failed = event.type in {"model.failed", "critic.model_cancelled"}
+        is_parent_request = payload.get("purpose") is None
         if is_failed:
+            req_idx = payload.get("request_index")
+            if type(req_idx) is int:
+                if req_idx in seen_failed_requests:
+                    continue
+                seen_failed_requests.add(req_idx)
             failed_calls += 1
         else:
             completed_calls += 1
@@ -365,7 +403,7 @@ def _summarize_usage_events(
             if type(cache_hit) is int and cache_hit >= 0:
                 reported_cached_input_tokens += cache_hit
                 reported_cache_requests += 1
-            if not is_failed and awaiting_post_compaction:
+            if not is_failed and awaiting_post_compaction and is_parent_request:
                 if type(cache_hit) is int and cache_hit >= 0:
                     post_compaction_uncached_inputs.append(max(0, inp_val - cache_hit))
                 awaiting_post_compaction = False
@@ -376,14 +414,16 @@ def _summarize_usage_events(
                 failed_estimated_input_tokens += inp_val
             else:
                 completed_estimated_input_requests += 1
-                awaiting_post_compaction = False
+                if is_parent_request:
+                    awaiting_post_compaction = False
         else:
             if inp_val is not None:
                 unknown_input_tokens += inp_val
             unknown_input_requests += 1
             if not is_failed:
                 completed_unknown_input_requests += 1
-                awaiting_post_compaction = False
+                if is_parent_request:
+                    awaiting_post_compaction = False
 
         out = payload.get("output_tokens")
         out_val = out if type(out) is int and out >= 0 else None
@@ -508,6 +548,15 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         stream: bool | str = True,
         completion_evidence_reminder: bool | str | None = None,
         completion_evidence_reminder_version: str | None = None,
+        fresh_context_critic: bool | str | None = None,
+        fresh_context_critic_mode: str | None = None,
+        fresh_context_critic_max_rounds: int | str | None = None,
+        fresh_context_critic_max_model_calls: int | str | None = None,
+        fresh_context_critic_max_tool_calls: int | str | None = None,
+        fresh_context_critic_timeout_seconds: int | str | None = None,
+        fresh_context_critic_max_input_tokens_total: int | str | None = None,
+        fresh_context_critic_max_output_tokens_total: int | str | None = None,
+        fresh_context_critic_stall_rounds: int | str | None = None,
         **kwargs: Any,
     ) -> None:
         init_kwargs = dict(kwargs)
@@ -548,10 +597,34 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             harness_updates["completion_evidence_reminder_version"] = _parse_reminder_version(
                 completion_evidence_reminder_version
             )
-        if harness_updates:
-            base_config = base_config.model_copy(
-                update={"harness": base_config.harness.model_copy(update=harness_updates)}
+        if fresh_context_critic is not None:
+            harness_updates["fresh_context_critic"] = _parse_bool_flag(fresh_context_critic)
+        if fresh_context_critic_mode is not None:
+            harness_updates["fresh_context_critic_mode"] = _parse_critic_mode(
+                fresh_context_critic_mode
             )
+        for field_name, raw_val in (
+            ("fresh_context_critic_max_rounds", fresh_context_critic_max_rounds),
+            ("fresh_context_critic_max_model_calls", fresh_context_critic_max_model_calls),
+            ("fresh_context_critic_max_tool_calls", fresh_context_critic_max_tool_calls),
+            ("fresh_context_critic_timeout_seconds", fresh_context_critic_timeout_seconds),
+            (
+                "fresh_context_critic_max_input_tokens_total",
+                fresh_context_critic_max_input_tokens_total,
+            ),
+            (
+                "fresh_context_critic_max_output_tokens_total",
+                fresh_context_critic_max_output_tokens_total,
+            ),
+            ("fresh_context_critic_stall_rounds", fresh_context_critic_stall_rounds),
+        ):
+            if raw_val is not None:
+                harness_updates[field_name] = _parse_int_flag(raw_val, field_name)
+        if harness_updates:
+            validated_harness = HarnessConfig.model_validate(
+                {**base_config.harness.model_dump(), **harness_updates}
+            )
+            base_config = base_config.model_copy(update={"harness": validated_harness})
         self.config = base_config
 
     @staticmethod
@@ -694,6 +767,165 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             store.append_event(
                 "completion_evidence.finished", {**reminder_usage, "reminder_seq": reminder.seq}
             )
+
+        critic_started_events = [e for e in run_events if e.type == "critic.started"]
+        critic_completed_events = [e for e in run_events if e.type == "critic.completed"]
+        critic_skipped_events = [e for e in run_events if e.type == "critic.skipped"]
+        critic_cancelled_events = [e for e in run_events if e.type == "critic.cancelled"]
+        critic_cleanup_failed_events = [e for e in run_events if e.type == "critic.cleanup_failed"]
+        critic_handoffs = [e for e in run_events if e.type == "critic.handoff_injected"]
+        critic_model_events = [
+            e
+            for e in run_events
+            if e.type in {"model.completed", "model.failed", "critic.model_cancelled"}
+            and e.payload.get("purpose") == "fresh_critic"
+        ]
+        critic_usage = _summarize_usage_events(critic_model_events, source="events")
+        first_handoff = critic_handoffs[0] if critic_handoffs else None
+        after_handoff = (
+            [event for event in run_events if event.seq > first_handoff.seq]
+            if first_handoff is not None
+            else []
+        )
+
+        if critic_cancelled_events:
+            critic_run_state = "cancelled"
+        elif len(critic_started_events) > len(critic_completed_events):
+            critic_run_state = "interrupted"
+        elif critic_completed_events:
+            critic_run_state = "completed"
+        elif critic_skipped_events:
+            critic_run_state = "skipped"
+        else:
+            critic_run_state = "not_run"
+
+        raw_audit_statuses = [
+            str(e.payload.get("workspace_audit_status") or "unverified")
+            for e in critic_completed_events
+        ]
+        if critic_cancelled_events or len(critic_started_events) > len(critic_completed_events):
+            raw_audit_statuses.append("unverified")
+        if not raw_audit_statuses:
+            critic_audit_status = "not_run"
+            critic_workspace_mutated: bool | None = None
+        elif "mutated" in raw_audit_statuses:
+            critic_audit_status = "mutated"
+            critic_workspace_mutated = True
+        elif "unverified" in raw_audit_statuses:
+            critic_audit_status = "unverified"
+            critic_workspace_mutated = None
+        else:
+            critic_audit_status = "unchanged"
+            critic_workspace_mutated = False
+
+        if critic_cleanup_failed_events:
+            critic_cleanup_ok: bool | None = False
+        elif critic_cancelled_events:
+            critic_cleanup_ok = all(
+                bool(e.payload.get("cleanup_ok")) for e in critic_cancelled_events
+            )
+        elif critic_completed_events:
+            critic_cleanup_ok = all(
+                bool(e.payload.get("cleanup_ok")) for e in critic_completed_events
+            )
+        else:
+            critic_cleanup_ok = None
+
+        critic_audited_cleanly = (
+            critic_run_state == "completed"
+            and critic_audit_status == "unchanged"
+            and critic_cleanup_ok is True
+        )
+        if critic_run_state in {"not_run", "skipped"}:
+            critic_comparison_valid: bool | None = None
+        else:
+            critic_comparison_valid = critic_audited_cleanly
+
+        critic_blocked_reasons = [
+            str(reason)
+            for e in critic_completed_events
+            if isinstance(reason := e.payload.get("handoff_blocked_reason"), str) and reason
+        ]
+        critic_snapshot_hashes = [
+            str(sha)
+            for e in critic_completed_events
+            if isinstance(sha := e.payload.get("candidate_snapshot_sha256"), str) and sha
+        ]
+
+        critic_usage_fields: JSONDict = {
+            "critic_enabled": bool(agent.harness_config.fresh_context_critic),
+            "critic_mode": (
+                agent.harness_config.fresh_context_critic_mode
+                if agent.harness_config.fresh_context_critic
+                else None
+            ),
+            "critic_run_state": critic_run_state,
+            "critic_rounds": len(critic_completed_events),
+            "critic_verdicts": [e.payload.get("status") for e in critic_completed_events],
+            "critic_blocking_findings": sum(
+                int(e.payload.get("blocking_findings", 0) or 0)
+                for e in critic_completed_events
+            ),
+            "critic_skipped_reasons": [
+                str(e.payload.get("reason", "")) for e in critic_skipped_events
+            ],
+            "critic_workspace_audit_status": critic_audit_status,
+            "critic_workspace_audit_statuses": raw_audit_statuses,
+            "critic_workspace_mutated": critic_workspace_mutated,
+            "critic_cleanup_ok": critic_cleanup_ok,
+            "critic_audited_cleanly": critic_audited_cleanly,
+            "critic_comparison_valid": critic_comparison_valid,
+            "critic_handoff_blocked_reasons": critic_blocked_reasons,
+            "critic_candidate_snapshot_sha256s": critic_snapshot_hashes,
+            "critic_prefix_divergences": sum(
+                1 for e in run_events if e.type == "critic.prefix_diverged"
+            ),
+            "critic_compactions": sum(
+                1 for e in run_events if e.type == "critic.compacted"
+            ),
+            "critic_model_calls": int(critic_usage["completed_model_calls"]),
+            "critic_failed_model_calls": int(critic_usage["failed_model_calls"]),
+            "critic_tool_calls": sum(
+                1
+                for e in run_events
+                if e.type == "critic.tool" and e.payload.get("event") == "tool.completed"
+            ),
+            "critic_reported_input_tokens": int(critic_usage["reported_input_tokens"]),
+            "critic_reported_cached_input_tokens": critic_usage["reported_cached_input_tokens"],
+            "critic_reported_output_tokens": int(critic_usage["reported_output_tokens"]),
+            "critic_failed_estimated_input_tokens": int(
+                critic_usage["failed_estimated_input_tokens"]
+            ),
+            "critic_failed_estimated_output_tokens": int(
+                critic_usage["failed_estimated_output_tokens"]
+            ),
+            "critic_estimated_cost_usd": critic_usage["reported_estimated_cost_usd"],
+            "critic_wall_seconds": round(
+                sum(float(e.payload.get("wall_seconds", 0.0) or 0.0) for e in critic_completed_events),
+                3,
+            ),
+            "post_critic_parent_model_calls": sum(
+                1
+                for event in after_handoff
+                if event.type in {"model.completed", "model.failed"}
+                and event.payload.get("purpose") != "fresh_critic"
+            ),
+            "post_critic_parent_tool_calls": sum(
+                1
+                for event in after_handoff
+                if event.type == "tool.completed"
+                and event.payload.get("purpose") != "fresh_critic"
+            ),
+            "post_critic_parent_compactions": sum(
+                1 for event in after_handoff if event.type == "context.compacted"
+            ),
+            "post_critic_parent_wall_seconds": (
+                round((ended_ns - int(first_handoff.payload["monotonic_ns"])) / 1_000_000_000, 3)
+                if first_handoff is not None
+                else 0.0
+            ),
+        }
+
         report: JSONDict = {
             "agent": self.name(),
             "version": self.version(),
@@ -712,6 +944,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
             "tools_invoked": [asdict(tool) for tool in agent.results],
             **usage_summary,
             **reminder_usage,
+            **critic_usage_fields,
             "compactions": compactions,
             "length_continuations": length_continuations,
             "truncated_thinking": truncated_thinking,
@@ -744,6 +977,24 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
         started = time.monotonic()
         try:
             with SessionStore(session_dir, data_dir=session_dir) as store:
+                completion_critic: CompletionCritic | None = None
+                if self.config.harness.fresh_context_critic:
+
+                    async def _critic_callback(
+                        parent_agent: Agent,
+                        round_index: int,
+                        prior_findings: tuple[JSONDict, ...],
+                    ) -> CriticHandoff:
+                        return await run_fresh_context_critic(
+                            parent_agent,
+                            environment,
+                            logs_dir=session_dir,
+                            round_index=round_index,
+                            prior_findings=prior_findings,
+                        )
+
+                    completion_critic = _critic_callback
+
                 agent = build_terminal_agent(
                     self.config,
                     model,
@@ -751,6 +1002,7 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                     environment,
                     stream=self._stream and self.config.model.supports_streaming,
                     command_boundary=f"harbor:{type(environment).__name__}",
+                    completion_critic=completion_critic,
                 )
                 schemas = agent.registry.schemas()
                 tool_names = [schema["function"]["name"] for schema in schemas]
@@ -760,6 +1012,11 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                 )
                 reminder_version, reminder_text = resolve_completion_evidence_reminder(
                     agent.harness_config
+                )
+                critic_fp = (
+                    fresh_context_critic_fingerprints()
+                    if agent.harness_config.fresh_context_critic
+                    else None
                 )
                 manifest_core: JSONDict = {
                     "agent": self.name(),
@@ -786,6 +1043,15 @@ class StellarWeaverHarborAgent(_HarborBaseAgent):
                         digest(reminder_text.encode("utf-8"))
                         if reminder_text is not None
                         else None
+                    ),
+                    "fresh_context_critic_schema_version": (
+                        critic_fp["schema_version"] if critic_fp else None
+                    ),
+                    "fresh_context_critic_prompt_sha256": (
+                        critic_fp["prompt_sha256"] if critic_fp else None
+                    ),
+                    "fresh_context_critic_handoff_template_sha256": (
+                        critic_fp["handoff_template_sha256"] if critic_fp else None
                     ),
                 }
                 config_sha256 = digest(canonical_json(manifest_core))
@@ -1225,6 +1491,45 @@ def _extract_fields_from_disk_trial(
     )
 
 
+@dataclass(frozen=True)
+class _CriticSettings:
+    enabled: bool | None
+    mode: FreshContextCriticMode | None = None
+
+    def conflicts_with(self, other: _CriticSettings) -> bool:
+        if self.enabled is None or other.enabled is None:
+            return False
+        return self.enabled != other.enabled or (
+            self.enabled
+            and self.mode is not None
+            and other.mode is not None
+            and self.mode != other.mode
+        )
+
+
+def _critic_settings(enabled: Any, mode: Any) -> _CriticSettings:
+    if not isinstance(enabled, (bool, str)):
+        return _CriticSettings(None)
+    try:
+        is_enabled = _parse_bool_flag(enabled)
+    except ValueError:
+        return _CriticSettings(None)
+    if is_enabled and isinstance(mode, str):
+        try:
+            return _CriticSettings(True, _parse_critic_mode(mode))
+        except ValueError:
+            return _CriticSettings(True)
+    return _CriticSettings(is_enabled)
+
+
+def _locked_critic_settings(entry: JSONDict) -> _CriticSettings:
+    kwargs = _as_dict(_as_dict(entry.get("agent")).get("kwargs"))
+    return _critic_settings(
+        kwargs.get("fresh_context_critic", False),
+        kwargs.get("fresh_context_critic_mode", HarnessConfig().fresh_context_critic_mode),
+    )
+
+
 def merge_harbor_trial(trial_dir: Path) -> JSONDict:
     """Merge Harbor's `<trial_dir>/result.json` with StellarWeaver's `agent/trial-report.json`."""
     trial_path = Path(trial_dir)
@@ -1253,6 +1558,20 @@ def merge_harbor_trial(trial_dir: Path) -> JSONDict:
     result_present = result_path.is_file()
     report_present = agent_report_path.is_file()
     receipt_status = "present" if result_present and report_present else "partial"
+    harness = _as_dict(agent_manifest.get("harness"))
+    manifest_critic = _critic_settings(
+        harness.get("fresh_context_critic"), harness.get("fresh_context_critic_mode")
+    )
+    report_critic = _critic_settings(agent_report.get("critic_enabled"), agent_report.get("critic_mode"))
+    actual_enabled = (
+        report_critic.enabled if report_critic.enabled is not None else manifest_critic.enabled
+    )
+    actual_mode = (report_critic.mode or manifest_critic.mode) if actual_enabled else None
+    result_config = _as_dict(result_data.get("config"))
+    result_critic = (
+        _locked_critic_settings(result_config) if result_config.get("agent") else _CriticSettings(None)
+    )
+    trial_critic = _locked_critic_settings(trial_lock) if trial_lock else _CriticSettings(None)
     merged: JSONDict = {
         **agent_report,
         "trial_dir": trial_path.name,
@@ -1278,6 +1597,13 @@ def merge_harbor_trial(trial_dir: Path) -> JSONDict:
         "harbor_result_present": result_present,
         "agent_report_present": report_present,
         "receipt_status": receipt_status,
+        "critic_enabled": actual_enabled,
+        "critic_mode": actual_mode,
+        "critic_requested": result_critic.enabled is True or trial_critic.enabled is True,
+        "critic_config_mismatch": (
+            manifest_critic.conflicts_with(report_critic)
+            or result_critic.conflicts_with(_CriticSettings(actual_enabled, actual_mode))
+        ),
     }
     if agent_manifest and "code_sha" not in merged:
         merged["code_sha"] = agent_manifest.get("code_sha")
@@ -1300,6 +1626,7 @@ def _build_missing_planned_report(
     planned_index: int,
     fields: _TrialMatchFields,
     job_pending_trials: int | None,
+    critic_plan: _CriticSettings,
 ) -> JSONDict:
     return {
         "planned": True,
@@ -1326,6 +1653,8 @@ def _build_missing_planned_report(
         "harbor_result_present": False,
         "agent_report_present": False,
         "receipt_status": "missing_receipt",
+        "critic_expected": critic_plan.enabled,
+        "critic_expected_mode": critic_plan.mode,
         "job_pending_trials": job_pending_trials,
         "outcome": {"input_tokens": 0, "output_tokens": 0},
         "usage_accounting_version": 2,
@@ -1448,8 +1777,18 @@ def _read_optional_lock_dict(lock_path: Path) -> tuple[bool, bool, JSONDict]:
 def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
     """Discover Harbor trial directories under `job_dir`, strictly anchored to `lock.json`."""
     root = Path(job_dir)
-    if (root / "result.json").is_file() and (root / "agent").is_dir():
-        return [merge_harbor_trial(root)]
+    agent_dir = root / "agent"
+    if agent_dir.is_dir() and (
+        (root / "result.json").is_file() or (agent_dir / "trial-report.json").is_file()
+    ):
+        return [
+            {
+                **merge_harbor_trial(root),
+                "lock_status": "absent",
+                "lock_reason": "single trial selected; use the Harbor job directory to verify the batch",
+                "planned": None,
+            }
+        ]
 
     job_result = _read_json_dict(root / "result.json")
     stats = _as_dict(job_result.get("stats"))
@@ -1580,7 +1919,8 @@ def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
                 used_disk.add(d_idx)
 
     reports: list[JSONDict] = []
-    for p_idx, (_, _, p_fields) in enumerate(planned_items):
+    for p_idx, (p_entry, _, p_fields) in enumerate(planned_items):
+        critic_plan = _locked_critic_settings(p_entry)
         matched_idx = matched_disk[p_idx]
         if matched_idx is not None:
             report = dict(disk_items[matched_idx][5])
@@ -1588,12 +1928,23 @@ def collect_harbor_job_reports(job_dir: Path) -> list[JSONDict]:
             report["planned"] = True
             report["planned_index"] = p_idx
             report["job_pending_trials"] = job_pending_trials
+            report["critic_expected"] = critic_plan.enabled
+            report["critic_expected_mode"] = critic_plan.mode
+            observed = _critic_settings(report.get("critic_enabled"), report.get("critic_mode"))
+            report["critic_config_mismatch"] = (
+                report.get("critic_config_mismatch") is True or critic_plan.conflicts_with(observed)
+            )
+            report["critic_config_unverified"] = critic_plan.enabled is True and (
+                observed.enabled is None
+                or (observed.enabled is True and (critic_plan.mode is None or observed.mode is None))
+            )
             reports.append(report)
             continue
         missing = _build_missing_planned_report(
             planned_index=p_idx,
             fields=p_fields,
             job_pending_trials=job_pending_trials,
+            critic_plan=critic_plan,
         )
         missing["lock_status"] = "valid"
         reports.append(missing)
@@ -1714,6 +2065,22 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     total_legacy_mixed_cached = 0
     legacy_cached_complete = True
     total_legacy_mixed_cost = 0.0
+    critic_expected_trials = 0
+    critic_requested_or_enabled = False
+    critic_audited_trials = 0
+    critic_audited_clean_trials = 0
+    critic_skipped_trials = 0
+    critic_cancelled_trials = 0
+    raw_critic_not_run_trials = 0
+    raw_critic_missing_agent_report_trials = 0
+    missing_verifier_results = 0
+    invalid_verifier_results = 0
+    critic_config_mismatch_trials = 0
+    critic_config_unverified_trials = 0
+    critic_comparison_invalid_trials = 0
+    critic_mutated_trials = 0
+    critic_unverified_audit_trials = 0
+    critic_cleanup_failed_trials = 0
 
     all_input_complete = True
     all_output_complete = True
@@ -1722,6 +2089,47 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
     has_executed_verified = False
 
     for item in planned_reports:
+        if item.get("critic_expected") is True:
+            critic_expected_trials += 1
+        critic_requested_or_enabled |= (
+            item.get("critic_requested") is True or item.get("critic_enabled") is True
+        )
+        reward = _float_or_none(item.get("reward"))
+        if item.get("harbor_result_present") is not True:
+            missing_verifier_results += 1
+        elif item.get("reward_valid") is not True or reward is None or not math.isfinite(reward):
+            invalid_verifier_results += 1
+        if item.get("critic_config_mismatch") is True:
+            critic_config_mismatch_trials += 1
+        if item.get("critic_config_unverified") is True:
+            critic_config_unverified_trials += 1
+        has_agent_report = (
+            item.get("receipt_status") not in {"missing_receipt", "not_started"}
+            and item.get("agent_report_present") is not False
+            and item.get("critic_run_state") is not None
+        )
+        if not has_agent_report:
+            raw_critic_missing_agent_report_trials += 1
+        else:
+            c_state = item.get("critic_run_state")
+            if c_state in {"completed", "cancelled", "interrupted"}:
+                critic_audited_trials += 1
+            elif c_state == "skipped":
+                critic_skipped_trials += 1
+            elif c_state == "not_run":
+                raw_critic_not_run_trials += 1
+            if c_state in {"cancelled", "interrupted"}:
+                critic_cancelled_trials += 1
+            if item.get("critic_audited_cleanly") is True:
+                critic_audited_clean_trials += 1
+            if item.get("critic_workspace_audit_status") == "mutated":
+                critic_mutated_trials += 1
+            elif item.get("critic_workspace_audit_status") == "unverified":
+                critic_unverified_audit_trials += 1
+            if item.get("critic_cleanup_ok") is False:
+                critic_cleanup_failed_trials += 1
+            if item.get("critic_comparison_valid") is False:
+                critic_comparison_invalid_trials += 1
         if item.get("receipt_status") in {"missing_receipt", "not_started"}:
             continue
         is_legacy_mixed = item.get("usage_accounting_source") == "legacy_mixed_unverified" or (
@@ -1818,6 +2226,38 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
         round(total_legacy_mixed_cost, 4) if legacy_only else reported_cost_out
     )
 
+    is_critic_batch = (
+        critic_expected_trials > 0
+        or critic_requested_or_enabled
+        or critic_audited_trials > 0
+        or critic_skipped_trials > 0
+    )
+    critic_not_run_trials = raw_critic_not_run_trials if is_critic_batch else 0
+    critic_missing_agent_report_trials = (
+        raw_critic_missing_agent_report_trials if is_critic_batch else 0
+    )
+    critic_batch_comparison_valid: bool | None
+    if not is_critic_batch:
+        critic_batch_comparison_valid = None
+    else:
+        critic_batch_comparison_valid = (
+            planned_denominator_verifiable
+            and all(item.get("lock_status") == "valid" for item in planned_reports)
+            and batch_complete
+            and total_planned is not None
+            and total_planned > 0
+            and critic_expected_trials == total_planned
+            and critic_audited_clean_trials == total_planned
+            and missing_verifier_results == 0
+            and invalid_verifier_results == 0
+            and critic_config_mismatch_trials == 0
+            and critic_config_unverified_trials == 0
+            and critic_comparison_invalid_trials == 0
+            and critic_skipped_trials == 0
+            and critic_not_run_trials == 0
+            and critic_missing_agent_report_trials == 0
+        )
+
     return {
         "tasks": total_planned,
         "observed_receipts": observed_receipts,
@@ -1862,6 +2302,22 @@ def aggregate_trial_reports(reports: Sequence[JSONDict]) -> JSONDict:
         "cache_hit_ratio": alias_cache_ratio,
         "total_output_tokens": alias_output,
         "total_estimated_cost_usd": alias_cost,
+        "critic_batch_comparison_valid": critic_batch_comparison_valid,
+        "critic_expected_trials": critic_expected_trials,
+        "critic_audited_trials": critic_audited_trials,
+        "critic_audited_clean_trials": critic_audited_clean_trials,
+        "critic_skipped_trials": critic_skipped_trials,
+        "critic_cancelled_trials": critic_cancelled_trials,
+        "critic_not_run_trials": critic_not_run_trials,
+        "critic_missing_agent_report_trials": critic_missing_agent_report_trials,
+        "critic_missing_verifier_result_trials": missing_verifier_results if is_critic_batch else 0,
+        "critic_invalid_verifier_result_trials": invalid_verifier_results if is_critic_batch else 0,
+        "critic_config_mismatch_trials": critic_config_mismatch_trials if is_critic_batch else 0,
+        "critic_config_unverified_trials": critic_config_unverified_trials if is_critic_batch else 0,
+        "critic_comparison_invalid_trials": critic_comparison_invalid_trials,
+        "critic_mutated_trials": critic_mutated_trials,
+        "critic_unverified_audit_trials": critic_unverified_audit_trials,
+        "critic_cleanup_failed_trials": critic_cleanup_failed_trials,
     }
 
 
@@ -1957,6 +2413,41 @@ def render_markdown_summary(reports: Sequence[JSONDict], *, agg: JSONDict | None
     if summary["total_post_compaction_uncached_input_tokens"] > 0:
         lines.append(
             f"| Post-Compaction Uncached Input Tokens | {summary['total_post_compaction_uncached_input_tokens']:,} |"
+        )
+    if summary.get("critic_batch_comparison_valid") is not None:
+        lines.append(
+            f"| Critic Batch Comparison | valid={summary['critic_batch_comparison_valid']} "
+            f"(expected={summary.get('critic_expected_trials', 0)}, "
+            f"audited={summary.get('critic_audited_trials', 0)}, "
+            f"clean={summary.get('critic_audited_clean_trials', 0)}, "
+            f"skipped={summary.get('critic_skipped_trials', 0)}, "
+            f"cancelled={summary.get('critic_cancelled_trials', 0)}, "
+            f"not_run={summary.get('critic_not_run_trials', 0)}, "
+            f"missing_agent_report={summary.get('critic_missing_agent_report_trials', 0)}, "
+            f"invalid={summary.get('critic_comparison_invalid_trials', 0)}) |"
+        )
+        if any(
+            summary.get(field)
+            for field in (
+                "critic_missing_verifier_result_trials",
+                "critic_invalid_verifier_result_trials",
+                "critic_config_mismatch_trials",
+                "critic_config_unverified_trials",
+            )
+        ):
+            lines.append(
+                "| Critic Comparison Blockers | "
+                f"missing_verifier_result={summary.get('critic_missing_verifier_result_trials', 0)}, "
+                f"invalid_verifier_result={summary.get('critic_invalid_verifier_result_trials', 0)}, "
+                f"config_mismatch={summary.get('critic_config_mismatch_trials', 0)}, "
+                f"config_unverified={summary.get('critic_config_unverified_trials', 0)} |"
+            )
+    if summary.get("critic_comparison_invalid_trials", 0) > 0:
+        lines.append(
+            f"| Critic Comparison-Invalid Trials | {summary['critic_comparison_invalid_trials']} "
+            f"(mutated={summary.get('critic_mutated_trials', 0)}, "
+            f"unverified={summary.get('critic_unverified_audit_trials', 0)}, "
+            f"cleanup_failed={summary.get('critic_cleanup_failed_trials', 0)}) |"
         )
     return "\n".join(lines) + "\n"
 

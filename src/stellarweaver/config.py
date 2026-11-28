@@ -108,6 +108,7 @@ class RetryConfig(StrictConfig):
 
 HarnessProfile = Literal["custom", "swe-python", "terminal-minimal"]
 CompletionEvidenceReminderVersion = Literal["v1", "v2"]
+FreshContextCriticMode = Literal["active", "shadow"]
 
 
 class HarnessConfig(StrictConfig):
@@ -140,6 +141,15 @@ class HarnessConfig(StrictConfig):
     soft_test_failure_reminder: bool = False
     completion_evidence_reminder: bool = False
     completion_evidence_reminder_version: CompletionEvidenceReminderVersion = "v1"
+    fresh_context_critic: bool = False
+    fresh_context_critic_mode: FreshContextCriticMode = "shadow"
+    fresh_context_critic_max_rounds: int = Field(default=1, ge=1, le=2)
+    fresh_context_critic_max_model_calls: int = Field(default=12, ge=2, le=40)
+    fresh_context_critic_max_tool_calls: int = Field(default=18, ge=1, le=60)
+    fresh_context_critic_timeout_seconds: int = Field(default=300, ge=30, le=900)
+    fresh_context_critic_max_input_tokens_total: int = Field(default=2_000_000, ge=10_000)
+    fresh_context_critic_max_output_tokens_total: int = Field(default=120_000, ge=4096)
+    fresh_context_critic_stall_rounds: int = Field(default=3, ge=2, le=6)
     max_length_continuations: int = Field(default=0, ge=0, le=10)
     repeated_failure_soft_threshold: int = Field(default=3, ge=1, le=20)
     repeated_failure_hard_threshold: int = Field(default=3, ge=1, le=20)
@@ -152,6 +162,10 @@ class HarnessConfig(StrictConfig):
         if self.repeated_failure_hard_threshold < self.repeated_failure_soft_threshold:
             raise ValueError(
                 "repeated_failure_hard_threshold must not be smaller than repeated_failure_soft_threshold"
+            )
+        if self.fresh_context_critic and self.completion_evidence_reminder:
+            raise ValueError(
+                "fresh_context_critic and completion_evidence_reminder are mutually exclusive"
             )
         return self
 
