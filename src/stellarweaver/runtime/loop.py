@@ -89,13 +89,20 @@ a representative check, fix the implementation, and retest. When you finish,
 state any important requirement you could not verify."""
 
 COMPLETION_EVIDENCE_REMINDER_V2 = """\
-Before submitting, pick the most critical verifiable public requirements from the
-original task (formulas, scaling factors, invariants, edge conditions, or output
-contracts) and cross-check your final deliverable with an independent input,
-boundary counterexample, or simple reference check rather than only re-running
-your earlier happy-path check. If you modify a critical path, rerun that check
-before finishing. When you finish, clearly state any measurable discrepancy or
-important requirement you could not verify."""
+Before submitting, identify the most important verifiable requirements in the
+public task, such as formulas, scaling factors, invariants, boundary conditions,
+or output contracts. Derive the expected result from the task before running
+each check, including any stated threshold or tolerance. Use an independent
+input, a boundary case that could expose an error, or a simple reference check.
+Compare the actual result from the current deliverable with that expectation.
+
+If a check exposes a mismatch, use the remaining task budget to diagnose the
+cause and fix the deliverable. Rerun the same check after the fix and run a
+focused regression check for related behavior the change could affect. If the
+mismatch persists, use the new evidence to guide the next repair while budget
+remains. Rerun any affected checks after your final changes. Report what you
+verified on the final deliverable, any remaining measurable discrepancy, and
+any important requirement you could not verify."""
 
 COMPLETION_EVIDENCE_REMINDERS: dict[str, str] = {
     "v1": COMPLETION_EVIDENCE_REMINDER,
